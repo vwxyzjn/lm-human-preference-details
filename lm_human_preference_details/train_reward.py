@@ -72,7 +72,7 @@ class Args:
     local_batch_size: int = 32
     lr: float = 0.00005
 
-    local_rollout_batch_size: int = 512 # per rank (8 total ranks)
+    local_rollout_batch_size: int = 128 # per rank (8 total ranks)
     normalize_samples: int = 256  # Samples used to estimate reward mean and std
     debug_normalize: int = 0  # Samples used to check that normalization worked
 
@@ -286,20 +286,15 @@ if __name__ == "__main__":
         mb_data = label[b_inds]
         mb_query = torch.from_numpy(np.stack(mb_data["query"])).pin_memory().to(device, non_blocking=True)
         mb_best = torch.from_numpy(np.stack(mb_data["best"])).pin_memory().to(device, non_blocking=True)
+        mb_responses = [torch.from_numpy(np.stack(mb_data[f"sample{i}"])).pin_memory().to(device, non_blocking=True) for i in range(args.labels.num_labels)]
         predicted_rewards = []
         for i in range(args.labels.num_labels):
-            with torch.no_grad():
-                mb_response = reward_model.pretrained_model.generate(
-                    input_ids=mb_query,
-                    max_new_tokens=args.task.response_length,
-                    pad_token_id=tokenizer.pad_token_id,
-                )
-                mb_query_response = torch.cat([mb_query, mb_response], dim=1)
+            mb_query_response = torch.cat([mb_query, mb_responses[i]], dim=1)
             reward = reward_model(
                 mb_query_response,
                 attention_mask=mb_query_response!=tokenizer.pad_token_id,
             ) # reward has shape (batch_size, sequence_length, 1)
-            predicted_rewards.append(reward[:, -1].squeeze()) # but we only care about the reward of the last token
+            predicted_rewards.append(reward[:, -1].squeeze()) # but we only care about the reward of the last token, resulting in shape (batch_size, 1)
         
         predicted_rewards = torch.stack(predicted_rewards, dim=1) # shape (batch_size, num_labels), basically a reward prediction for each label
         loss = torch.nn.functional.cross_entropy(predicted_rewards, mb_best)
