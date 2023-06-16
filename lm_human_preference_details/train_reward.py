@@ -48,8 +48,7 @@ class LMHParams:
     penalty_reward_value: int = -1
 
     # LM params
-    temperature: float = 1.0
-    initial_model: str = None
+    temperature: float = 0.7
 
 
 @dataclass
@@ -73,7 +72,7 @@ class Args:
     local_batch_size: int = 32
     lr: float = 0.00005
 
-    local_rollout_batch_size: int = 64 # per rank (8 total ranks)
+    local_rollout_batch_size: int = 512 # per rank (8 total ranks)
     normalize_samples: int = 256  # Samples used to estimate reward mean and std
     debug_normalize: int = 0  # Samples used to check that normalization worked
 
@@ -85,37 +84,31 @@ class Args:
     """Whether to use cuda if available."""
 
 
+def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
+    torch.nn.init.normal_(layer.weight, std)
+    torch.nn.init.constant_(layer.bias, bias_const)
+    return layer
+
 
 OPENAI_PAD_TOKEN_ID= 50259
-OUR_PAD_TOKEN_ID = 50257
-class ValueHead(nn.Module):
+class ScalarHead(nn.Module):
     def __init__(self, config, **kwargs):
         super().__init__()
         if not hasattr(config, "summary_dropout_prob"):
             summary_dropout_prob = kwargs.pop("summary_dropout_prob", 0.1)
         else:
             summary_dropout_prob = config.summary_dropout_prob
-
         self.dropout = nn.Dropout(summary_dropout_prob) if summary_dropout_prob else nn.Identity()
-
         # some models such as OPT have a projection layer before the word embeddings - e.g. OPT-350m
         if hasattr(config, "word_embed_proj_dim"):
             hidden_size = config.word_embed_proj_dim
         else:
             hidden_size = config.hidden_size
-
-        self.summary = nn.Linear(hidden_size, 1)
-
+        self.summary = layer_init(nn.Linear(hidden_size, 1), std=1 / np.sqrt(hidden_size + 1))
         self.flatten = nn.Flatten()
 
     def forward(self, hidden_states):
         output = self.dropout(hidden_states)
-
-        # For now force upcast in fp32 if needed. Let's keep the
-        # output in fp32 for numerical stability.
-        if output.dtype != self.summary.weight.dtype:
-            output = output.to(self.summary.weight.dtype)
-
         output = self.summary(output)
         return output
 
@@ -124,12 +117,16 @@ class AutoModelForCausalLMWithValueHead(nn.Module):
     def __init__(self, pretrained_model):
         super().__init__()
         self.pretrained_model = pretrained_model
-        self.value_head = ValueHead(self.pretrained_model.config)
+        self.reward_head = ScalarHead(self.pretrained_model.config)
+        self.reward_gain = torch.nn.Parameter(torch.tensor(1.), requires_grad=True)
+        self.reward_bias = torch.nn.Parameter(torch.tensor(0.), requires_grad=True)
 
-    def forward(self, input_ids):
-        output = self.pretrained_model(input_ids, output_hidden_states=True)
-        value = self.value_head(output.hidden_states[-1])
-        return value
+
+    def forward(self, input_ids, attention_mask=None):
+        output = self.pretrained_model(input_ids, attention_mask=attention_mask, output_hidden_states=True)
+        reward = self.reward_head(output.hidden_states[-1])
+        reward = self.reward_gain * reward + self.reward_bias
+        return reward
 
 
 # a pytorch dataset
@@ -204,7 +201,7 @@ if __name__ == "__main__":
     torch.backends.cudnn.deterministic = True
     tokenizer = AutoTokenizer.from_pretrained(
         args.base_model, 
-        padding_side="right", # TODO: What is this? It avoids `A decoder-only architecture is being used, but right-padding was detected! For correct generation results, please set `padding_side='left'` when initializing the tokenizer.`
+        padding_side="right",
     )
     tokenizer.add_special_tokens({'pad_token': '[PAD]'})
     pretrained_model = AutoModelForCausalLM.from_pretrained(args.base_model).to(device)
@@ -241,39 +238,76 @@ if __name__ == "__main__":
     print("training on", args.labels.num_train, "in batches of", args.local_batch_size)
 
     if args.normalize_before:
-        pass
+        n_batches = ceil_div(args.normalize_samples, args.local_rollout_batch_size)
+        sample_queries_responses = []
+        for i in range(n_batches):
+            queries = next(iter_dataloader)
+            input_ids = queries['input_ids'].to(device)
+            responses = pretrained_model.generate(
+                input_ids=input_ids,
+                attention_mask=queries['attention_mask'].to(device),
+                max_new_tokens=args.task.response_length,
+                temperature=args.task.temperature,
+                pad_token_id=tokenizer.pad_token_id,
+            )
+            sample_queries_responses.append((input_ids, responses))
+        rewards = []
+        for (mb_input_ids, mb_response) in sample_queries_responses:
+            query_response = torch.cat([mb_input_ids, mb_response], dim=1)
+            reward = reward_model(
+                input_ids=query_response.to(device),
+                attention_mask=query_response!=tokenizer.pad_token_id,
+            )[:, -1]
+            rewards.append(reward)
+        rewards = torch.cat(rewards)
+        mean, std = rewards.mean(), rewards.std()
+
+        # reward normalization
+        target_mean, target_std = torch.tensor(0., device=device), torch.tensor(1., device=device)
+        old_gain, old_bias = reward_model.reward_gain, reward_model.reward_bias
+        # gain * N(old_mean,old_std) + bias = N(gain * old_mean, gain * old_std) + bias
+        #                                   = N(gain * old_mean + bias, gain * old_std)
+        # gain * old_std = new_std, gain = new_std / old_std
+        # gain * old_mean + bias = new_mean, bias = new_mean - gain * old_mean
+        gain = target_std / std
+        bias = target_mean - gain * mean
+        reward_model.reward_gain.data = gain
+        reward_model.reward_bias.data = bias
 
     all_inds = np.arange(args.labels.num_train)
     np.random.shuffle(all_inds)
     global_step = 0
-    for epoch in range(2):
-        for start in range(0, args.labels.num_train, args.local_batch_size):
-            global_step += 1
-            end = start + args.local_batch_size
-            b_inds = all_inds[start:end]
-            # our_indices = b_inds[rank::self.num_ranks] # TODO: only needed for multi-GPU
-            lr = (1 - start / args.labels.num_train) * args.lr
-            mb_data = label[b_inds]
-            mb_query = torch.from_numpy(np.stack(mb_data["query"])).pin_memory().to(device, non_blocking=True)
-            mb_best = torch.from_numpy(np.stack(mb_data["best"])).pin_memory().to(device, non_blocking=True)
-            values = []
-            for i in range(args.labels.num_labels):
-                with torch.no_grad():
-                    mb_response = reward_model.pretrained_model.generate(
-                        input_ids=mb_query,
-                        max_new_tokens=args.task.response_length,
-                        pad_token_id=tokenizer.pad_token_id,
-                    )
-                value = reward_model(torch.cat([mb_query, mb_response], dim=1)) # value has shape (batch_size, sequence_length, 1)
-                values.append(value[:, -1].squeeze()) # but we only care about the value of the last token
-            
-            values = torch.stack(values, dim=1) # shape (batch_size, num_labels), basically a value prediction for each label
-            loss = torch.nn.functional.cross_entropy(values, mb_best)
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-            
-            writer.add_scalar("loss", loss.item(), global_step)
+    for start in range(0, args.labels.num_train, args.local_batch_size):
+        global_step += 1
+        end = start + args.local_batch_size
+        b_inds = all_inds[start:end]
+        # our_indices = b_inds[rank::self.num_ranks] # TODO: only needed for multi-GPU
+        lr = (1 - start / args.labels.num_train) * args.lr
+        mb_data = label[b_inds]
+        mb_query = torch.from_numpy(np.stack(mb_data["query"])).pin_memory().to(device, non_blocking=True)
+        mb_best = torch.from_numpy(np.stack(mb_data["best"])).pin_memory().to(device, non_blocking=True)
+        predicted_rewards = []
+        for i in range(args.labels.num_labels):
+            with torch.no_grad():
+                mb_response = reward_model.pretrained_model.generate(
+                    input_ids=mb_query,
+                    max_new_tokens=args.task.response_length,
+                    pad_token_id=tokenizer.pad_token_id,
+                )
+                mb_query_response = torch.cat([mb_query, mb_response], dim=1)
+            reward = reward_model(
+                mb_query_response,
+                attention_mask=mb_query_response!=tokenizer.pad_token_id,
+            ) # reward has shape (batch_size, sequence_length, 1)
+            predicted_rewards.append(reward[:, -1].squeeze()) # but we only care about the reward of the last token
+        
+        predicted_rewards = torch.stack(predicted_rewards, dim=1) # shape (batch_size, num_labels), basically a reward prediction for each label
+        loss = torch.nn.functional.cross_entropy(predicted_rewards, mb_best)
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+        
+        writer.add_scalar("loss", loss.item(), global_step)
 
     # raise
     if args.normalize_after:
