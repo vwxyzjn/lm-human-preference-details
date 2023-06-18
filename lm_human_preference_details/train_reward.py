@@ -11,7 +11,6 @@ import torch.optim as optim
 import torch.nn as nn
 from datasets import load_dataset
 
-
 from torch.utils.tensorboard import SummaryWriter
 from rich.pretty import pprint
 from transformers import (
@@ -76,6 +75,8 @@ class Args:
     normalize_samples: int = 256  # Samples used to estimate reward mean and std
     debug_normalize: int = 0  # Samples used to check that normalization worked
 
+    label_dataset: str = "sentiment/offline_5k.json"
+    """the name of the dataset to use for labels in `https://huggingface.co/datasets/vwxyzjn/lm-human-preferences`"""
     normalize_before: bool = True
     """Whether, before training, to normalize the rewards on the policy to the scales on the training buffer. (For comparisons, just use mean 0, var 1.)"""
     normalize_after: bool = True
@@ -221,7 +222,7 @@ if __name__ == "__main__":
 
     label = load_dataset(
         "vwxyzjn/lm-human-preferences",
-        data_files=["sentiment/offline_5k.json"]
+        data_files=[args.label_dataset],
     )["train"]
     # `label` has keys `['sample0', 'query', 'best', 'sample3', 'sample1', 'sample2']`
     def replace_pad_with_eos(data):
@@ -304,7 +305,6 @@ if __name__ == "__main__":
         
         writer.add_scalar("loss", loss.item(), global_step)
 
-    # raise
     if args.normalize_after:
         pass
 
