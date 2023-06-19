@@ -1,24 +1,21 @@
-from dataclasses import asdict, dataclass, field
 import os
-import subprocess
 import time
+from dataclasses import asdict, dataclass, field
 from typing import Optional
+
 import numpy as np
-
-import tyro
 import torch
-import torch.optim as optim
 import torch.nn as nn
+import torch.optim as optim
+import tyro
 from datasets import load_dataset
-
-from torch.utils.tensorboard import SummaryWriter
 from rich.pretty import pprint
-from transformers import (
-    AutoModelForCausalLM,
-    AutoTokenizer,
-)
-from torch.utils.data import IterableDataset, DataLoader
+from torch.utils.data import DataLoader, IterableDataset
+from torch.utils.tensorboard import SummaryWriter
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
 from lm_human_preference_details.data import DATASET
+
 
 @dataclass
 class LabelHParams:
@@ -33,8 +30,8 @@ class LMHParams:
     # Query params
     query_length: int = 64
     query_dataset: str = "books"
-    query_prefix: str = ''
-    query_suffix: str = ''
+    query_prefix: str = ""
+    query_suffix: str = ""
     start_text: Optional[str] = None
     end_text: Optional[str] = None
 
@@ -71,7 +68,7 @@ class Args:
     local_batch_size: int = 32
     lr: float = 0.00005
 
-    local_rollout_batch_size: int = 128 # per rank (8 total ranks)
+    local_rollout_batch_size: int = 128  # per rank (8 total ranks)
     normalize_samples: int = 256  # Samples used to estimate reward mean and std
     debug_normalize: int = 0  # Samples used to check that normalization worked
 
@@ -91,7 +88,9 @@ def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
     return layer
 
 
-OPENAI_PAD_TOKEN_ID= 50259
+OPENAI_PAD_TOKEN_ID = 50259
+
+
 class ScalarHead(nn.Module):
     def __init__(self, config, **kwargs):
         super().__init__()
@@ -119,9 +118,8 @@ class AutoModelForCausalLMWithValueHead(nn.Module):
         super().__init__()
         self.pretrained_model = pretrained_model
         self.reward_head = ScalarHead(self.pretrained_model.config)
-        self.reward_gain = torch.nn.Parameter(torch.tensor(1.), requires_grad=True)
-        self.reward_bias = torch.nn.Parameter(torch.tensor(0.), requires_grad=True)
-
+        self.reward_gain = torch.nn.Parameter(torch.tensor(1.0), requires_grad=True)
+        self.reward_bias = torch.nn.Parameter(torch.tensor(0.0), requires_grad=True)
 
     def forward(self, input_ids, attention_mask=None):
         output = self.pretrained_model(input_ids, attention_mask=attention_mask, output_hidden_states=True)
@@ -143,21 +141,20 @@ class MyDataset(IterableDataset):
         self.end_token = token_to_index[end_text] if self.end_text else None
         self.pad_token = token_to_index[tokenizer.pad_token]
 
-
     def __iter__(self):
         for text in self.generator("train", args.seed):
             tokens = self.tokenizer.encode(text)
             if self.start_token is not None:
                 try:
-                    first_index = tokens.index(self.start_token)+1
+                    first_index = tokens.index(self.start_token) + 1
                     if first_index < len(tokens):
                         tokens = tokens[first_index:]
                 except:
                     continue
-            tokens = tokens[:self.query_length]
+            tokens = tokens[: self.query_length]
             if self.end_token is not None:
                 try:
-                    last_index = len(tokens)-tokens[::-1].index(self.end_token)
+                    last_index = len(tokens) - tokens[::-1].index(self.end_token)
                     tokens = tokens[:last_index]
                 except:
                     continue
@@ -169,6 +166,7 @@ class MyDataset(IterableDataset):
                 return_attention_mask=True,
             )
             yield output
+
 
 def ceil_div(a, b):
     return (a - 1) // b + 1
@@ -201,10 +199,10 @@ if __name__ == "__main__":
     torch.manual_seed(args.seed)
     torch.backends.cudnn.deterministic = True
     tokenizer = AutoTokenizer.from_pretrained(
-        args.base_model, 
+        args.base_model,
         padding_side="right",
     )
-    tokenizer.add_special_tokens({'pad_token': '[PAD]'})
+    tokenizer.add_special_tokens({"pad_token": "[PAD]"})
     pretrained_model = AutoModelForCausalLM.from_pretrained(args.base_model).to(device)
     pretrained_model.resize_token_embeddings(len(tokenizer))
     # tokenizer.pad_token = tokenizer.eos_token
@@ -228,14 +226,15 @@ if __name__ == "__main__":
     def replace_pad_with_eos(data):
         # openai lm-human-preferences uses 50259 for <pad>
         # https://github.com/openai/lm-human-preferences/blob/cbfd210bb8b08f6bc5c26878c10984b90f516c66/lm_human_preferences/language/encodings.py#L56
-        for key in ['sample0', 'query', 'sample3', 'sample1', 'sample2']:
+        for key in ["sample0", "query", "sample3", "sample1", "sample2"]:
             for i in range(len(data[key])):
                 if data[key][i] == OPENAI_PAD_TOKEN_ID:
                     data[key][i] = tokenizer.pad_token_id
         return data
+
     label = label.map(replace_pad_with_eos)
     assert np.array(label["query"]).max() != OPENAI_PAD_TOKEN_ID
-    print('Num labels found in source:', len(label))
+    print("Num labels found in source:", len(label))
     print("training on", args.labels.num_train, "in batches of", args.local_batch_size)
 
     if args.normalize_before:
@@ -243,10 +242,10 @@ if __name__ == "__main__":
         sample_queries_responses = []
         for i in range(n_batches):
             queries = next(iter_dataloader)
-            input_ids = queries['input_ids'].to(device)
+            input_ids = queries["input_ids"].to(device)
             responses = pretrained_model.generate(
                 input_ids=input_ids,
-                attention_mask=queries['attention_mask'].to(device),
+                attention_mask=queries["attention_mask"].to(device),
                 max_new_tokens=args.task.response_length,
                 temperature=args.task.temperature,
                 pad_token_id=tokenizer.pad_token_id,
@@ -257,14 +256,14 @@ if __name__ == "__main__":
             query_response = torch.cat([mb_input_ids, mb_response], dim=1)
             reward = reward_model(
                 input_ids=query_response.to(device),
-                attention_mask=query_response!=tokenizer.pad_token_id,
+                attention_mask=query_response != tokenizer.pad_token_id,
             )[:, -1]
             rewards.append(reward)
         rewards = torch.cat(rewards)
         mean, std = rewards.mean(), rewards.std()
 
         # reward normalization
-        target_mean, target_std = torch.tensor(0., device=device), torch.tensor(1., device=device)
+        target_mean, target_std = torch.tensor(0.0, device=device), torch.tensor(1.0, device=device)
         old_gain, old_bias = reward_model.reward_gain, reward_model.reward_bias
         # gain * N(old_mean,old_std) + bias = N(gain * old_mean, gain * old_std) + bias
         #                                   = N(gain * old_mean + bias, gain * old_std)
@@ -287,22 +286,29 @@ if __name__ == "__main__":
         mb_data = label[b_inds]
         mb_query = torch.from_numpy(np.stack(mb_data["query"])).pin_memory().to(device, non_blocking=True)
         mb_best = torch.from_numpy(np.stack(mb_data["best"])).pin_memory().to(device, non_blocking=True)
-        mb_responses = [torch.from_numpy(np.stack(mb_data[f"sample{i}"])).pin_memory().to(device, non_blocking=True) for i in range(args.labels.num_labels)]
+        mb_responses = [
+            torch.from_numpy(np.stack(mb_data[f"sample{i}"])).pin_memory().to(device, non_blocking=True)
+            for i in range(args.labels.num_labels)
+        ]
         predicted_rewards = []
         for i in range(args.labels.num_labels):
             mb_query_response = torch.cat([mb_query, mb_responses[i]], dim=1)
             reward = reward_model(
                 mb_query_response,
-                attention_mask=mb_query_response!=tokenizer.pad_token_id,
-            ) # reward has shape (batch_size, sequence_length, 1)
-            predicted_rewards.append(reward[:, -1].squeeze()) # but we only care about the reward of the last token, resulting in shape (batch_size, 1)
-        
-        predicted_rewards = torch.stack(predicted_rewards, dim=1) # shape (batch_size, num_labels), basically a reward prediction for each label
+                attention_mask=mb_query_response != tokenizer.pad_token_id,
+            )  # reward has shape (batch_size, sequence_length, 1)
+            predicted_rewards.append(
+                reward[:, -1].squeeze()
+            )  # but we only care about the reward of the last token, resulting in shape (batch_size, 1)
+
+        predicted_rewards = torch.stack(
+            predicted_rewards, dim=1
+        )  # shape (batch_size, num_labels), basically a reward prediction for each label
         loss = torch.nn.functional.cross_entropy(predicted_rewards, mb_best)
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
-        
+
         writer.add_scalar("loss", loss.item(), global_step)
 
     if args.normalize_after:
