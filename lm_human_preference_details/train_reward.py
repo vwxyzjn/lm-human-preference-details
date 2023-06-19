@@ -66,11 +66,16 @@ class Args:
     base_model: str = "gpt2"
 
     local_batch_size: int = 32
+    """per rank batch size"""
     lr: float = 0.00005
+    """the learning rate"""
 
-    local_rollout_batch_size: int = 128  # per rank (8 total ranks)
-    normalize_samples: int = 256  # Samples used to estimate reward mean and std
-    debug_normalize: int = 0  # Samples used to check that normalization worked
+    local_rollout_batch_size: int = 128
+    """per rank rollot batch size"""
+    normalize_samples: int = 256
+    """Samples used to estimate reward mean and std"""
+    debug_normalize: int = 0
+    """Samples used to check that normalization worked"""
 
     label_dataset: str = "sentiment/offline_5k.json"
     """the name of the dataset to use for labels in `https://huggingface.co/datasets/vwxyzjn/lm-human-preferences`"""

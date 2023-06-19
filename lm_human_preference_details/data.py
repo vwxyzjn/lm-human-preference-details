@@ -13,7 +13,7 @@ def books_generator(mode, seed=0, shuffle=False):
     if shuffle:
         random.seed(seed)
         dataset = dataset.shuffle(seed)
-    
+
     while True:
         for _, data in enumerate(dataset):
             text = data["text"]
