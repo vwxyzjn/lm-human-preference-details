@@ -8,6 +8,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import torch.nn.functional as F
 import tyro
 from datasets import load_dataset
 from rich.pretty import pprint
@@ -17,6 +18,42 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from lm_human_preference_details.data import DATASET
 
+
+@dataclass
+class AdaptiveKLParams:
+    target: float = None
+    horizon: int = 10000  # in episodes
+
+
+@dataclass
+class RewardHParams:
+    kl_coef: float = 0.2
+    adaptive_kl: Optional[AdaptiveKLParams] = None
+
+    trained_model: Optional[str] = "models/reward.pt"
+
+    # def validate(self, *, prefix=''):
+    #     super().validate(prefix=prefix)
+    #     assert self.trained_model is None or self.train_new_model is None, 'Cannot use trained_model and train new model'
+    #     assert self.trained_model is not None or self.train_new_model is not None, 'Need either trained_model or to train a new model'
+
+
+@dataclass
+class PpoHParams:
+    total_episodes: int = 1000000
+    local_batch_size: int = 512
+    local_mini_batch_size: tyro.conf.Suppress[int] = None
+    batch_size: tyro.conf.Suppress[int] = None
+    mini_batch_size: tyro.conf.Suppress[int] = None
+    nminibatches: int = 1
+    noptepochs: int = 4
+    lr: float = 5e-6
+    vf_coef: float = .1
+    cliprange: float = .2
+    cliprange_value: float = .2
+    gamma: float = 1
+    lam: float = 0.95
+    whiten_rewards: bool = True
 
 @dataclass
 class LabelHParams:
@@ -84,11 +121,12 @@ class Args:
     """Whether, after training, to normalize the rewards on the ref policy to mean 0, var 1 (so the KL coefficient always has the same meaning)."""
     print_sample_output_freq: int = 0
     """How often to print sample output"""
-    save_path: str = "models/reward.pt"
+    save_path: str = "models/policy.pt"
     """Where to save the model"""
 
     task: TaskHParams = field(default_factory=TaskHParams)
-    labels: LabelHParams = field(default_factory=LabelHParams)
+    rewards: RewardHParams = field(default_factory=RewardHParams)
+    ppo: PpoHParams = field(default_factory=PpoHParams)
 
 
 def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
@@ -120,6 +158,10 @@ class ScalarHead(nn.Module):
         output = self.dropout(hidden_states)
         output = self.summary(output)
         return output
+
+
+
+
 class AutoModelForCausalLMWithScalarHead(nn.Module):
     def __init__(self, pretrained_model):
         super().__init__()
@@ -143,6 +185,8 @@ class AutoModelForCausalLMWithRewardHead(AutoModelForCausalLMWithScalarHead):
         reward = self.scalar_head(output.hidden_states[-1])
         reward = self.reward_gain * reward + self.reward_bias
         return reward
+
+
 
 
 # a pytorch dataset
@@ -188,8 +232,24 @@ def ceil_div(a, b):
     return (a - 1) // b + 1
 
 
+def exact_div(a, b):
+    q = a // b
+    if a != q * b:
+        raise ValueError('Inexact division: %s / %s = %s' % (a, b, a / b))
+    return q
+
+
 if __name__ == "__main__":
     args = tyro.cli(Args)
+    # calculation
+    args.ppo.local_mini_batch_size = exact_div(args.ppo.local_batch_size, args.ppo.nminibatches)
+    if args.ppo.whiten_rewards:
+        assert args.ppo.local_mini_batch_size >= 8, \
+            f"Per-rank minibatch size {args.ppo.local_mini_batch_size} is insufficient for whitening"
+    args.ppo.batch_size = args.ppo.local_batch_size # * NUM_RANKS
+    args.ppo.mini_batch_size = args.ppo.local_mini_batch_size # * NUM_RANKS
+
+
     run_name = f"{args.exp_name}__{args.seed}__{int(time.time())}"
 
     if args.track:
@@ -220,8 +280,14 @@ if __name__ == "__main__":
     )
     tokenizer.pad_token = tokenizer.eos_token
     pretrained_model = AutoModelForCausalLM.from_pretrained(args.base_model).to(device)
-    reward_model = AutoModelForCausalLMWithRewardHead(AutoModelForCausalLM.from_pretrained(args.base_model)).to(device)
-    optimizer = optim.Adam(reward_model.parameters(), lr=args.lr, eps=1e-5)
+    # reward_model = AutoModelForCausalLMWithRewardHead(pretrained_model).to(device)
+    # if args.rewards.trained_model:
+    #     reward_model.load_state_dict(torch.load(args.rewards.trained_model))
+    #     print("loaded pretrained reward model")
+    # each class should have a sepatate pretrained model that do not share weights
+    ref_policy = AutoModelForCausalLMWithScalarHead(AutoModelForCausalLM.from_pretrained(args.base_model)).to(device)
+    policy = AutoModelForCausalLMWithScalarHead(AutoModelForCausalLM.from_pretrained(args.base_model)).to(device)
+    optimizer = optim.Adam(policy.parameters(), lr=args.lr, eps=1e-5)
     dataset = MyDataset(
         DATASET[args.task.query_dataset],
         tokenizer,
@@ -229,114 +295,111 @@ if __name__ == "__main__":
         start_text=args.task.start_text,
         end_text=args.task.end_text,
     )
-    dataloader = DataLoader(dataset, batch_size=args.local_rollout_batch_size)
+    dataloader = DataLoader(dataset, batch_size=args.ppo.local_batch_size)
     iter_dataloader = iter(dataloader)
 
-    # `label` has keys `['sample0', 'query', 'best', 'sample3', 'sample1', 'sample2']`
-    label = load_dataset(
-        "vwxyzjn/lm-human-preferences",
-        data_files=[args.label_dataset],
-    )["train"]
-    print("Num labels found in source:", len(label))
-    print("training on", args.labels.num_train, "in batches of", args.local_batch_size)
-
-    if args.normalize_before:
-        n_batches = ceil_div(args.normalize_samples, args.local_rollout_batch_size)
-        sample_queries_responses = []
-        for i in range(n_batches):
-            queries = next(iter_dataloader)
-            input_ids = queries["input_ids"].to(device)
-            query_response = pretrained_model.generate(
-                input_ids=input_ids,
-                attention_mask=queries["attention_mask"].to(device),
-                max_new_tokens=args.task.response_length,
-                temperature=args.task.temperature,
-                pad_token_id=tokenizer.pad_token_id, # ? should I do this?
-            )
-            sample_queries_responses.append(query_response)
-        rewards = []
-        for query_response in sample_queries_responses:
-            reward = reward_model(
-                input_ids=query_response.to(device),
-                attention_mask=query_response != tokenizer.pad_token_id,
-            )[:, -1]
-            rewards.append(reward)
-        rewards = torch.cat(rewards)
-        mean, std = rewards.mean(), rewards.std()
-
-        # reward normalization
-        target_mean, target_std = torch.tensor(0.0, device=device), torch.tensor(1.0, device=device)
-        old_gain, old_bias = reward_model.reward_gain, reward_model.reward_bias
-        # gain * N(old_mean,old_std) + bias = N(gain * old_mean, gain * old_std) + bias
-        #                                   = N(gain * old_mean + bias, gain * old_std)
-        # gain * old_std = new_std, gain = new_std / old_std
-        # gain * old_mean + bias = new_mean, bias = new_mean - gain * old_mean
-        gain = target_std / std
-        bias = target_mean - gain * mean
-        reward_model.reward_gain.data = gain
-        reward_model.reward_bias.data = bias
-
-    print("===training reward model===")
-    all_inds = np.arange(args.labels.num_train)
-    np.random.shuffle(all_inds)
+    print("===training policy===")
     global_step = 0
-    for start in range(0, args.labels.num_train, args.local_batch_size):
-        global_step += 1
-        end = start + args.local_batch_size
-        b_inds = all_inds[start:end]
-        # our_indices = b_inds[rank::self.num_ranks] # TODO: only needed for multi-GPU
-        lr = (1 - start / args.labels.num_train) * args.lr
-        mb_data = label[b_inds]
-        mb_query = torch.from_numpy(np.stack(mb_data["query"])).pin_memory().to(device, non_blocking=True)
-        mb_best = torch.from_numpy(np.stack(mb_data["best"])).pin_memory().to(device, non_blocking=True)
-        mb_responses = [
-            torch.from_numpy(np.stack(mb_data[f"sample{i}"])).pin_memory().to(device, non_blocking=True)
-            for i in range(args.labels.num_labels)
-        ]
-        predicted_rewards = []
-        for i in range(args.labels.num_labels):
-            mb_query_response = torch.cat([mb_query, mb_responses[i]], dim=1)
-            # hack: deal with openai's padding token
-            mb_attention_mask = mb_query_response != OPENAI_PAD_TOKEN_ID
-            mb_query_response[mb_query_response==OPENAI_PAD_TOKEN_ID] = tokenizer.pad_token_id
-            reward = reward_model(
-                mb_query_response,
-                attention_mask=mb_attention_mask,
-            )  # reward has shape (batch_size, sequence_length, 1)
-            predicted_rewards.append(
-                reward[:, -1].squeeze()
-            )  # but we only care about the reward of the last token, resulting in shape (batch_size, 1)
+    num_updates = args.ppo.total_episodes // args.ppo.batch_size
+    for update in range(1, num_updates + 1):
+        global_step += 1 * args.ppo.batch_size
 
-        predicted_rewards = torch.stack(
-            predicted_rewards, dim=1
-        )  # shape (batch_size, num_labels), basically a reward prediction for each label
-        loss = torch.nn.functional.cross_entropy(predicted_rewards, mb_best)
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
-        writer.add_scalar("loss", loss.item(), global_step)
+        responses = []
+        logprobs = []
+        values = []
+        
+        data = next(iter_dataloader)
+        queries = data["input_ids"].to(device)
+        attention_mask = data["attention_mask"].to(device)
+        output = policy.pretrained_model.generate(
+            input_ids=queries,
+            attention_mask=attention_mask,
+            max_new_tokens=args.task.response_length,
+            temperature=1.0, # TODO: change it back to args.task.temperature
+            pad_token_id=tokenizer.pad_token_id, # ? should I do this?
+            return_dict_in_generate=True,
+            output_hidden_states=True,
+            output_scores=True,
+        )
+        # extract logprobs and values from `output.hidden_states`
+        responses = torch.stack([sequence[len(queries[0]):] for sequence in output.sequences])
+        all_logprobs = torch.stack(output.scores, 1)
+        # responses have shape (batch_size, response_length)
+        # all_logprobs have shape (batch_size, response_length, vocab_size)
+        logprobs = torch.gather(all_logprobs, 2, responses.unsqueeze(-1)).squeeze(-1)
+        # len(output.hidden_states) = args.task.response_length
+        # len(output.hidden_states[-1]) = num of layers
+        # value is computed based on the last layer and last token
+        values = policy.scalar_head(output.hidden_states[-1][-1]).squeeze(-1)
 
-        if args.print_sample_output_freq > 0 and global_step % args.print_sample_output_freq == 0:
-            queries = next(iter_dataloader)
-            input_ids = queries["input_ids"][0:1].to(device)
-            query_response = pretrained_model.generate(
-                input_ids=input_ids,
-                attention_mask=queries["attention_mask"][0:1].to(device),
-                max_new_tokens=args.task.response_length,
-                temperature=args.task.temperature,
-                pad_token_id=tokenizer.pad_token_id, # ? should I do this?
+        # the attention mask should be the same as the one used in the policy
+        assert ((output.sequences != tokenizer.pad_token_id)[:,:len(queries[0])] == attention_mask).all()
+        with torch.no_grad():
+            ref_output = ref_policy.pretrained_model(
+                input_ids=output.sequences,
+                return_dict=True,
+                output_hidden_states=True,
             )
-            reward = reward_model(
-                input_ids=query_response,
-                attention_mask=query_response != tokenizer.pad_token_id,
-            )[:, -1]
-            print(f"global_step {global_step}:")
-            print("sample input:", tokenizer.decode(query_response[0][:len(input_ids[0])]).replace("<|endoftext|>", ""))
-            print("sample output:", tokenizer.decode(query_response[0][len(input_ids[0]):]).replace("<|endoftext|>", ""))
-            print("sample reward:", reward[0].item())
+            # NOTE: len(ref_output.hidden_states) = num of layers, which is a different behavior from `output_hidden_states` in `generate`
+            ref_logits = ref_output.logits[:,len(queries[0]):]
+            ref_logits_calculated = ref_policy.pretrained_model.lm_head(ref_output.hidden_states[-1][:,len(queries[0]):])
+            assert (ref_logits_calculated != ref_logits).sum() == 0
+            ref_all_logprobs = F.log_softmax(ref_logits, dim=-1)
+            ref_logprobs = torch.gather(ref_all_logprobs, 2, responses.unsqueeze(-1)).squeeze(-1)
 
-    if args.normalize_after:
-        pass
+        # ref_logprobs = ref_policy.analyze_responses(queries, responses)['logprobs']
+        # scores, postprocessed_responses, score_stats = self.score_fn(queries, responses)
+        raise
+        # sample_queries_responses.append(query_response)
+        # def respond_op(self, queries, length):
+        #     contexts = self.embed_queries(queries)
+        #     context_length = tf.shape(contexts)[1]
+        #     result = sample.sample_sequence(
+        #         step=self.step_core,
+        #         context=contexts,
+        #         length=length,
+        #         model_hparams=self.model_hparams,
+        #         temperature=self.temperature,
+        #         extra_outputs={'values':tf.float32},
+        #     )
+        #     return dict(
+        #         responses=result['tokens'][:, context_length:],
+        #         logprobs=result['logprobs'],
+        #         values=result['values'],
+        #     )
+        # rollouts = self.policy.respond(queries, length=args.task.response_length)
+
+        # responses = rollouts['responses']
+        # logprobs = rollouts['logprobs']
+        # rollouts['queries'] = queries
+        # ref_logprobs = self.ref_policy.analyze_responses(queries, responses)['logprobs']
+        # scores, postprocessed_responses, score_stats = self.score_fn(queries, responses)
+
+        # rewards, non_score_reward, kl_coef = self.compute_rewards(
+        #     scores=scores,
+        #     logprobs=logprobs,
+        #     ref_logprobs=ref_logprobs)
+        # rollouts['rewards'] = rewards
+
+        # train_stats = self.train(rollouts=rollouts)
+
+        # _, stats = self.record_step_stats(
+        #     scores=scores, logprobs=logprobs, ref_logprobs=ref_logprobs, non_score_reward=non_score_reward,
+        #     train_stats=train_stats, score_stats=score_stats, kl_coef=kl_coef)
+
+        # self.kl_ctl.update(stats['objective/kl'], args.ppo.batch_size)
+
+        # self.print_samples(queries=queries, responses=postprocessed_responses,
+        #                    scores=scores, logprobs=logprobs, ref_logprobs=ref_logprobs)
+
+        # # Record profiles of the step times
+        # step = tf.get_default_session().run(tf.train.get_global_step())
+        # step_time = time.time() - step_started_at
+        # eps_per_second = float(args.ppo.batch_size) / step_time
+        # if self.comm.Get_rank() == 0:
+        #     print(f"[ppo_step {step}] step_time={step_time:.2f}s, "
+        #           f"eps/s={eps_per_second:.2f}")
+
 
     # save model
     if args.save_path:
