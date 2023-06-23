@@ -14,21 +14,21 @@ from datasets import load_dataset
 from rich.pretty import pprint
 from torch.utils.data import DataLoader, IterableDataset
 from torch.utils.tensorboard import SummaryWriter
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer, GenerationConfig
 
 from lm_human_preference_details.data import DATASET
 
 
 @dataclass
 class AdaptiveKLParams:
-    target: float = None
+    target: float = 6.0
     horizon: int = 10000  # in episodes
 
 
 @dataclass
 class RewardHParams:
     kl_coef: float = 0.2
-    adaptive_kl: Optional[AdaptiveKLParams] = None
+    adaptive_kl: Optional[AdaptiveKLParams] = field(default_factory=AdaptiveKLParams)
 
     trained_model: Optional[str] = "models/reward.pt"
 
@@ -41,7 +41,7 @@ class RewardHParams:
 @dataclass
 class PpoHParams:
     total_episodes: int = 1000000
-    local_batch_size: int = 512
+    local_batch_size: int = int(512 / 8)
     local_mini_batch_size: tyro.conf.Suppress[int] = None
     batch_size: tyro.conf.Suppress[int] = None
     mini_batch_size: tyro.conf.Suppress[int] = None
@@ -77,8 +77,8 @@ class TaskHParams:
     response_length: int = 24
 
     # Truncate response after the first occurrence of this token at or after index after when sampling.
-    truncate_token: Optional[int] = None
-    truncate_after: int = 0
+    truncate_token: int = 13
+    truncate_after: int = 16
     penalty_reward_value: int = -1
 
     # LM params
@@ -129,10 +129,29 @@ class Args:
     ppo: PpoHParams = field(default_factory=PpoHParams)
 
 
+class AdaptiveKLController:
+    def __init__(self, init_kl_coef: float, hparams: AdaptiveKLParams):
+        self.value = init_kl_coef
+        self.hparams = hparams
+
+    def update(self, current, n_steps):
+        target = self.hparams.target
+        proportional_error = np.clip(current / target - 1, -0.2, 0.2)
+        mult = 1 + proportional_error * n_steps / self.hparams.horizon
+        self.value *= mult
+
+
 def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
     torch.nn.init.normal_(layer.weight, std)
     torch.nn.init.constant_(layer.bias, bias_const)
     return layer
+
+def whiten(values, shift_mean=True):
+    mean, var = torch.mean(values), torch.var(values)
+    whitened = (values - mean) * torch.rsqrt(var + 1e-8)
+    if not shift_mean:
+        whitened += mean
+    return whitened
 
 
 OPENAI_PAD_TOKEN_ID = 50259
@@ -185,8 +204,6 @@ class AutoModelForCausalLMWithRewardHead(AutoModelForCausalLMWithScalarHead):
         reward = self.scalar_head(output.hidden_states[-1])
         reward = self.reward_gain * reward + self.reward_bias
         return reward
-
-
 
 
 # a pytorch dataset
@@ -248,7 +265,8 @@ if __name__ == "__main__":
             f"Per-rank minibatch size {args.ppo.local_mini_batch_size} is insufficient for whitening"
     args.ppo.batch_size = args.ppo.local_batch_size # * NUM_RANKS
     args.ppo.mini_batch_size = args.ppo.local_mini_batch_size # * NUM_RANKS
-
+    # `per_rank_rollout_batch_size` is our `args.ppo.local_batch_size`
+    # `per_rank_minibatch_size` is our `args.ppo.local_mini_batch_size`
 
     run_name = f"{args.exp_name}__{args.seed}__{int(time.time())}"
 
@@ -280,10 +298,10 @@ if __name__ == "__main__":
     )
     tokenizer.pad_token = tokenizer.eos_token
     pretrained_model = AutoModelForCausalLM.from_pretrained(args.base_model).to(device)
-    # reward_model = AutoModelForCausalLMWithRewardHead(pretrained_model).to(device)
-    # if args.rewards.trained_model:
-    #     reward_model.load_state_dict(torch.load(args.rewards.trained_model))
-    #     print("loaded pretrained reward model")
+    reward_model = AutoModelForCausalLMWithRewardHead(pretrained_model).to(device)
+    if args.rewards.trained_model:
+        reward_model.load_state_dict(torch.load(args.rewards.trained_model))
+        print("loaded pretrained reward model")
     # each class should have a sepatate pretrained model that do not share weights
     ref_policy = AutoModelForCausalLMWithScalarHead(AutoModelForCausalLM.from_pretrained(args.base_model)).to(device)
     policy = AutoModelForCausalLMWithScalarHead(AutoModelForCausalLM.from_pretrained(args.base_model)).to(device)
@@ -297,89 +315,259 @@ if __name__ == "__main__":
     )
     dataloader = DataLoader(dataset, batch_size=args.ppo.local_batch_size)
     iter_dataloader = iter(dataloader)
+    kl_ctl = AdaptiveKLController(args.rewards.kl_coef, hparams=args.rewards.adaptive_kl)
+    generation_config = GenerationConfig(
+        max_new_tokens=args.task.response_length,
+        temperature=args.task.temperature,
+        top_k=0.0,
+        top_p=1.0,
+        do_sample=True,
+    )
+
 
     print("===training policy===")
     global_step = 0
     num_updates = args.ppo.total_episodes // args.ppo.batch_size
     for update in range(1, num_updates + 1):
         global_step += 1 * args.ppo.batch_size
+        frac = 1.0 - (update - 1.0) / num_updates
+        lrnow = frac * args.ppo.lr
+        optimizer.param_groups[0]["lr"] = lrnow
 
-        responses = []
-        logprobs = []
-        values = []
+
         
         data = next(iter_dataloader)
         queries = data["input_ids"].to(device)
         attention_mask = data["attention_mask"].to(device)
-        output = policy.pretrained_model.generate(
-            input_ids=queries,
-            attention_mask=attention_mask,
-            max_new_tokens=args.task.response_length,
-            temperature=1.0, # TODO: change it back to args.task.temperature
-            pad_token_id=tokenizer.pad_token_id, # ? should I do this?
-            return_dict_in_generate=True,
-            output_hidden_states=True,
-            output_scores=True,
-        )
-        # extract logprobs and values from `output.hidden_states`
-        responses = torch.stack([sequence[len(queries[0]):] for sequence in output.sequences])
-        all_logprobs = torch.stack(output.scores, 1)
-        # responses have shape (batch_size, response_length)
-        # all_logprobs have shape (batch_size, response_length, vocab_size)
-        logprobs = torch.gather(all_logprobs, 2, responses.unsqueeze(-1)).squeeze(-1)
-        # len(output.hidden_states) = args.task.response_length
-        # len(output.hidden_states[-1]) = num of layers
-        # value is computed based on the last layer and last token
-        values = policy.scalar_head(output.hidden_states[-1][-1]).squeeze(-1)
-
-        # the attention mask should be the same as the one used in the policy
-        assert ((output.sequences != tokenizer.pad_token_id)[:,:len(queries[0])] == attention_mask).all()
         with torch.no_grad():
+            # TODO: this can be inefficient; if we implement our own `generate` we can generate the logprobs and values at the same time
+            output = policy.pretrained_model.generate(
+                input_ids=queries,
+                attention_mask=attention_mask,
+                generation_config=generation_config,
+                pad_token_id=tokenizer.pad_token_id, # ? should I do this?
+                return_dict_in_generate=True,
+                output_hidden_states=True,
+                output_scores=True,
+            )
+            query_responses = output.sequences
+            responses = query_responses[:,len(queries[0]):]
+
+            output = policy.pretrained_model(
+                input_ids=query_responses,
+                attention_mask=(query_responses != tokenizer.pad_token_id),
+                return_dict=True,
+                output_hidden_states=True,
+            )
+            logits = output.logits[:,len(queries[0]):]
+            all_logprobs = F.log_softmax(logits, dim=-1)
+            logprobs = torch.gather(all_logprobs, 2, responses.unsqueeze(-1)).squeeze(-1)
+            values = policy.scalar_head(output.hidden_states[-1])[:,len(queries[0]):].squeeze(-1)
+
             ref_output = ref_policy.pretrained_model(
-                input_ids=output.sequences,
+                input_ids=query_responses,
+                attention_mask=(query_responses != tokenizer.pad_token_id),
                 return_dict=True,
                 output_hidden_states=True,
             )
             # NOTE: len(ref_output.hidden_states) = num of layers, which is a different behavior from `output_hidden_states` in `generate`
             ref_logits = ref_output.logits[:,len(queries[0]):]
-            ref_logits_calculated = ref_policy.pretrained_model.lm_head(ref_output.hidden_states[-1][:,len(queries[0]):])
-            assert (ref_logits_calculated != ref_logits).sum() == 0
+            # ref_logits_calculated = ref_policy.pretrained_model.lm_head(ref_output.hidden_states[-1][:,len(queries[0]):])
+            # assert (ref_logits_calculated != ref_logits).sum() == 0
             ref_all_logprobs = F.log_softmax(ref_logits, dim=-1)
             ref_logprobs = torch.gather(ref_all_logprobs, 2, responses.unsqueeze(-1)).squeeze(-1)
 
-        # ref_logprobs = ref_policy.analyze_responses(queries, responses)['logprobs']
-        # scores, postprocessed_responses, score_stats = self.score_fn(queries, responses)
-        raise
-        # sample_queries_responses.append(query_response)
-        # def respond_op(self, queries, length):
-        #     contexts = self.embed_queries(queries)
-        #     context_length = tf.shape(contexts)[1]
-        #     result = sample.sample_sequence(
-        #         step=self.step_core,
-        #         context=contexts,
-        #         length=length,
-        #         model_hparams=self.model_hparams,
-        #         temperature=self.temperature,
-        #         extra_outputs={'values':tf.float32},
-        #     )
-        #     return dict(
-        #         responses=result['tokens'][:, context_length:],
-        #         logprobs=result['logprobs'],
-        #         values=result['values'],
-        #     )
-        # rollouts = self.policy.respond(queries, length=args.task.response_length)
+        # torch.testing.assert_close(logprobs, ref_logprobs)
 
-        # responses = rollouts['responses']
-        # logprobs = rollouts['logprobs']
-        # rollouts['queries'] = queries
-        # ref_logprobs = self.ref_policy.analyze_responses(queries, responses)['logprobs']
-        # scores, postprocessed_responses, score_stats = self.score_fn(queries, responses)
 
-        # rewards, non_score_reward, kl_coef = self.compute_rewards(
-        #     scores=scores,
-        #     logprobs=logprobs,
-        #     ref_logprobs=ref_logprobs)
-        # rollouts['rewards'] = rewards
+        # response processing
+        # 1. truncate at the first occurrence of `truncate_token` that appears at or after
+        # position truncate_after in the responses
+        # https://github.com/openai/lm-human-preferences/blob/cbfd210bb8b08f6bc5c26878c10984b90f516c66/lm_human_preferences/train_policy.py#L378
+        truncate_token_mask = (responses == args.task.truncate_token)
+        truncate_after_or_token_mask = torch.cat([torch.zeros_like(truncate_token_mask)[:,:args.task.truncate_after], truncate_token_mask[:,args.task.truncate_after:]], dim=1)
+        truncate_mask = (torch.cumsum(truncate_after_or_token_mask, dim=1) - truncate_after_or_token_mask.long()).bool()
+        postprocessed_responses = torch.where(truncate_mask, torch.full_like(responses, tokenizer.pad_token_id), responses)
+
+        # 2. run reward model on the truncated responses
+        postprocessed_query_responses = torch.cat((queries, postprocessed_responses), 1)
+        scores = reward_model(
+            postprocessed_query_responses,
+            attention_mask=(postprocessed_query_responses != tokenizer.pad_token_id),
+        )[:, -1].flatten()
+
+        # 3. filter response. Ensure that the sample contains truncate_token
+        # responses not passing that filter will receive a low (fixed) score
+        # only query humans on responses that pass that filter
+        matches_token = (postprocessed_responses[:, args.task.truncate_after:] == args.task.truncate_token)
+        filter_mask = torch.any(matches_token, dim=-1)
+        scores = torch.where(filter_mask, scores, torch.full_like(scores, args.task.penalty_reward_value))
+
+
+        # 4. compute rewards
+        kl = logprobs - ref_logprobs
+        non_score_reward = -kl_ctl.value * kl
+        rewards = non_score_reward.clone()
+        rewards[:, -1] += scores
+
+        stat_list = []
+        # Do multiple epochs of PPO training, with a fresh random shuffle in each epoch
+        for ppo_epoch_idx in range(args.ppo.noptepochs):
+            order = np.random.permutation(args.ppo.local_batch_size)
+            for mb_start in range(0, args.ppo.local_batch_size, args.ppo.local_mini_batch_size):
+                # mb_data = {k: v[order[mb_start:mb_start+args.ppo.local_mini_batch_size]]
+                #             for k, v in rollouts.items()}
+                # TODO: implmenet mini batch size
+
+
+
+                if args.ppo.whiten_rewards:
+                    rewards = whiten(rewards, shift_mean=False)
+
+                with torch.no_grad():
+                    lastgaelam = 0
+                    advantages_reversed = []
+                    gen_length = args.task.response_length
+                    for t in reversed(range(gen_length)):
+                        nextvalues = values[:, t + 1] if t < gen_length - 1 else 0.0
+                        delta = rewards[:, t] + args.ppo.gamma * nextvalues - values[:, t]
+                        lastgaelam = delta + args.ppo.gamma * args.ppo.lam * lastgaelam
+                        advantages_reversed.append(lastgaelam)
+                    advantages = torch.stack(advantages_reversed[::-1], axis=1)
+                    returns = advantages + values
+                    advantages = whiten(advantages)
+
+                # outputs = self.policy.analyze_responses_op(rollouts['queries'], rollouts['responses'])
+
+                output = policy.pretrained_model(
+                    input_ids=query_responses,
+                    attention_mask=(query_responses != tokenizer.pad_token_id),
+                    return_dict=True,
+                    output_hidden_states=True,
+                )
+                logits = output.logits[:,len(queries[0]):]
+                new_all_logprobs = F.log_softmax(logits, dim=-1)
+                new_logprobs = torch.gather(new_all_logprobs, 2, responses.unsqueeze(-1)).squeeze(-1)
+                vpred = policy.scalar_head(output.hidden_states[-1])[:,len(queries[0]):].squeeze(-1)
+
+                vpredclipped = torch.clamp(vpred, values - args.ppo.cliprange_value, values + args.ppo.cliprange_value)
+                vf_losses1 = torch.square(vpred - returns)
+                vf_losses2 = torch.square(vpredclipped - returns)
+                vf_loss = 0.5 * torch.max(vf_losses1, vf_losses2).mean()
+                vf_clipfrac = (vf_losses2 > vf_losses1).float().mean()
+
+                logprobs_diff = new_logprobs - logprobs
+                ratio = torch.exp(logprobs_diff)
+                pg_losses = -advantages * ratio
+                pg_losses2 = -advantages * torch.clamp(ratio, 1.0 - args.ppo.cliprange, 1.0 + args.ppo.cliprange)
+                
+                pg_loss = torch.max(pg_losses, pg_losses2).mean()
+                pg_clipfrac = (pg_losses2 > pg_losses).float().mean()
+
+                loss = pg_loss + args.ppo.vf_coef * vf_loss
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+
+                # def entropy_from_logits(logits):
+                #     pd = tf.nn.softmax(logits, axis=-1)
+                #     return tf.math.reduce_logsumexp(logits, axis=-1) - tf.reduce_sum(pd*logits, axis=-1)
+                # translate above to pytorch
+                pd = torch.nn.functional.softmax(logits, dim=-1)
+                entropy = torch.logsumexp(logits, dim=-1) - torch.sum(pd * logits, dim=-1)
+                approxkl = .5 * (logprobs_diff ** 2).mean()
+
+                return_mean, return_var = returns.mean(), returns.var()
+                value_mean, value_var = values.mean(), values.var()
+
+
+                # loss, utils.flatten_dict(stats, sep='/')
+
+
+                # ppo_loss, stats = self.loss(rollouts)
+                # ppo_train_op = utils.minimize(
+                #     loss=ppo_loss, lr=lrnow, params=policy.get_params(), name='ppo_opt', comm=self.comm)
+                # return ppo_train_op, stats
+        
+        # def record_step_stats(*, kl_coef, **data):
+        #     ppo_summary_writer = utils.get_summary_writer(self.hparams.run.save_dir, subdir='ppo', comm=self.comm)
+
+        #     kl = data['logprobs'] - data['ref_logprobs']
+        #     mean_kl = tf.reduce_mean(tf.reduce_sum(kl, axis=1))
+        #     mean_entropy = tf.reduce_mean(tf.reduce_sum(-data['logprobs'], axis=1))
+        #     mean_non_score_reward = tf.reduce_mean(tf.reduce_sum(data['non_score_reward'], axis=1))
+        #     stats = {
+        #         'objective/kl': mean_kl,
+        #         'objective/kl_coef': kl_coef,
+        #         'objective/entropy': mean_entropy,
+        #     }
+        #     for k, v in data['train_stats'].items():
+        #         stats[f'ppo/{k}'] = tf.reduce_mean(v, axis=0)
+        #     for k, v in data['score_stats'].items():
+        #         mean = tf.reduce_mean(v, axis=0)
+        #         stats[f'objective/{k}'] = mean
+        #         stats[f'objective/{k}_total'] = mean + mean_non_score_reward
+
+        #     stats = utils.FlatStats.from_dict(stats).map_flat(
+        #         partial(utils.mpi_allreduce_mean, comm=self.comm)).as_dict()
+
+        #     # Add more statistics
+        #     step = tf.train.get_global_step().read_value()
+        #     stats['ppo/val/var_explained'] = 1 - stats['ppo/val/error'] / stats['ppo/returns/var']
+        #     steps = step + 1
+        #     stats.update({
+        #         'elapsed/updates': steps,
+        #         'elapsed/steps/serial': steps * hparams.task.response_length,
+        #         'elapsed/steps/total': steps * hparams.ppo.batch_size * hparams.task.response_length,
+        #         'elapsed/episodes': steps * hparams.ppo.batch_size,
+        #     })
+
+        #     # Time statistics
+        #     total, delta = tf_times()
+        #     stats.update({
+        #         'elapsed/fps': tf.cast(hparams.ppo.batch_size * hparams.task.response_length / delta, tf.int32),
+        #         'elapsed/time': total,
+        #     })
+        #     if ppo_summary_writer:
+        #         record_op = utils.record_stats(
+        #             stats=stats, summary_writer=ppo_summary_writer, step=step, log_interval=hparams.run.log_interval, name='ppo_stats', comm=self.comm)
+        #     else:
+        #         record_op = tf.no_op()
+        #     return record_op, stats
+
+
+        kl = logprobs - ref_logprobs
+        mean_kl = kl.sum(1).mean()
+        mean_entropy = (-logprobs).sum(1).mean()
+        mean_non_score_reward = non_score_reward.sum(1).mean()
+        stats = {
+            'objective/kl': mean_kl,
+            'objective/kl_coef': kl_ctl.value,
+            'objective/entropy': mean_entropy,
+        }
+        writer.add_scalar("objective/kl", mean_kl.item(), update)
+        writer.add_scalar("objective/kl_coef", kl_ctl.value, update)
+        writer.add_scalar("objective/entropy", mean_entropy.item(), update)
+        writer.add_scalar("objective/non_score_reward", mean_non_score_reward.item(), update)
+        writer.add_scalar("objective/scores", scores.mean().item(), update)
+
+        writer.add_scalar("ppo/loss/policy", pg_loss.item(), update)
+        writer.add_scalar("ppo/loss/value", vf_loss.item(), update)
+        writer.add_scalar("ppo/loss/total", loss.item(), update)
+        writer.add_scalar("ppo/policy/entropy", entropy.mean().item(), update)
+        writer.add_scalar("ppo/policy/approxkl", approxkl.item(), update)
+        writer.add_scalar("ppo/policy/clipfrac", pg_clipfrac.item(), update)
+        writer.add_scalar("ppo/returns/mean", return_mean.item(), update)
+        writer.add_scalar("ppo/returns/var", return_var.item(), update)
+        writer.add_scalar("ppo/val/vpred", vpred.mean().item(), update)
+        writer.add_scalar("ppo/val/error", vf_losses1.mean().item(), update)
+        writer.add_scalar("ppo/val/clipfrac", vf_clipfrac.item(), update)
+        writer.add_scalar("ppo/val/mean", value_mean.item(), update)
+        writer.add_scalar("ppo/val/var", value_var.item(), update)
+        
+
+        kl_ctl.update(mean_kl.item(), args.ppo.batch_size)
+        # TODO: metrics: scores, rewards,
 
         # train_stats = self.train(rollouts=rollouts)
 
@@ -387,7 +575,6 @@ if __name__ == "__main__":
         #     scores=scores, logprobs=logprobs, ref_logprobs=ref_logprobs, non_score_reward=non_score_reward,
         #     train_stats=train_stats, score_stats=score_stats, kl_coef=kl_coef)
 
-        # self.kl_ctl.update(stats['objective/kl'], args.ppo.batch_size)
 
         # self.print_samples(queries=queries, responses=postprocessed_responses,
         #                    scores=scores, logprobs=logprobs, ref_logprobs=ref_logprobs)
