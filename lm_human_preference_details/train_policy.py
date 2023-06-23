@@ -142,8 +142,8 @@ class AdaptiveKLController:
 
 
 def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
-    torch.nn.init.normal_(layer.weight, std)
-    torch.nn.init.constant_(layer.bias, bias_const)
+    torch.nn.init.normal_(layer.weight, std=std)
+    torch.nn.init.constant_(layer.bias, val=bias_const)
     return layer
 
 def whiten(values, shift_mean=True):
@@ -158,7 +158,7 @@ OPENAI_PAD_TOKEN_ID = 50259
 
 
 class ScalarHead(nn.Module):
-    def __init__(self, config, **kwargs):
+    def __init__(self, config, scale=None, **kwargs):
         super().__init__()
         if not hasattr(config, "summary_dropout_prob"):
             summary_dropout_prob = kwargs.pop("summary_dropout_prob", 0.1)
@@ -170,7 +170,9 @@ class ScalarHead(nn.Module):
             hidden_size = config.word_embed_proj_dim
         else:
             hidden_size = config.hidden_size
-        self.summary = layer_init(nn.Linear(hidden_size, 1), std=1 / np.sqrt(hidden_size + 1))
+        if scale is None:
+            scale = 1 / np.sqrt(hidden_size + 1)
+        self.summary = layer_init(nn.Linear(hidden_size, 1), std=scale)
         self.flatten = nn.Flatten()
 
     def forward(self, hidden_states):
@@ -179,13 +181,11 @@ class ScalarHead(nn.Module):
         return output
 
 
-
-
 class AutoModelForCausalLMWithScalarHead(nn.Module):
     def __init__(self, pretrained_model):
         super().__init__()
         self.pretrained_model = pretrained_model
-        self.scalar_head = ScalarHead(self.pretrained_model.config)
+        self.scalar_head = ScalarHead(self.pretrained_model.config, scale=0.0)
 
     def forward(self, input_ids, attention_mask=None):
         output = self.pretrained_model(input_ids, attention_mask=attention_mask, output_hidden_states=True)
@@ -193,9 +193,11 @@ class AutoModelForCausalLMWithScalarHead(nn.Module):
         return reward
 
 
-class AutoModelForCausalLMWithRewardHead(AutoModelForCausalLMWithScalarHead):
+class AutoModelForCausalLMWithRewardHead(nn.Module):
     def __init__(self, pretrained_model):
-        super().__init__(pretrained_model)
+        super().__init__()
+        self.pretrained_model = pretrained_model
+        self.scalar_head = ScalarHead(self.pretrained_model.config)
         self.reward_gain = torch.nn.Parameter(torch.tensor(1.0), requires_grad=True)
         self.reward_bias = torch.nn.Parameter(torch.tensor(0.0), requires_grad=True)
 
@@ -324,7 +326,6 @@ if __name__ == "__main__":
         do_sample=True,
     )
 
-
     print("===training policy===")
     global_step = 0
     num_updates = args.ppo.total_episodes // args.ppo.batch_size
@@ -333,9 +334,6 @@ if __name__ == "__main__":
         frac = 1.0 - (update - 1.0) / num_updates
         lrnow = frac * args.ppo.lr
         optimizer.param_groups[0]["lr"] = lrnow
-
-
-        
         data = next(iter_dataloader)
         queries = data["input_ids"].to(device)
         attention_mask = data["attention_mask"].to(device)
@@ -362,7 +360,7 @@ if __name__ == "__main__":
             logits = output.logits[:,len(queries[0]):]
             all_logprobs = F.log_softmax(logits, dim=-1)
             logprobs = torch.gather(all_logprobs, 2, responses.unsqueeze(-1)).squeeze(-1)
-            values = policy.scalar_head(output.hidden_states[-1])[:,len(queries[0]):].squeeze(-1)
+            values = policy.scalar_head(output.hidden_states[-1][:,len(queries[0]):]).squeeze(-1)
 
             ref_output = ref_policy.pretrained_model(
                 input_ids=query_responses,
@@ -409,18 +407,12 @@ if __name__ == "__main__":
         non_score_reward = -kl_ctl.value * kl
         rewards = non_score_reward.clone()
         rewards[:, -1] += scores
-
         stat_list = []
         # Do multiple epochs of PPO training, with a fresh random shuffle in each epoch
         for ppo_epoch_idx in range(args.ppo.noptepochs):
             order = np.random.permutation(args.ppo.local_batch_size)
             for mb_start in range(0, args.ppo.local_batch_size, args.ppo.local_mini_batch_size):
-                # mb_data = {k: v[order[mb_start:mb_start+args.ppo.local_mini_batch_size]]
-                #             for k, v in rollouts.items()}
                 # TODO: implmenet mini batch size
-
-
-
                 if args.ppo.whiten_rewards:
                     rewards = whiten(rewards, shift_mean=False)
 
@@ -438,7 +430,7 @@ if __name__ == "__main__":
                     advantages = whiten(advantages)
 
                 # outputs = self.policy.analyze_responses_op(rollouts['queries'], rollouts['responses'])
-
+                
                 output = policy.pretrained_model(
                     input_ids=query_responses,
                     attention_mask=(query_responses != tokenizer.pad_token_id),
@@ -468,6 +460,7 @@ if __name__ == "__main__":
                 optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
+                # breakpoint()
 
                 # def entropy_from_logits(logits):
                 #     pd = tf.nn.softmax(logits, axis=-1)
@@ -564,7 +557,7 @@ if __name__ == "__main__":
         writer.add_scalar("ppo/val/clipfrac", vf_clipfrac.item(), update)
         writer.add_scalar("ppo/val/mean", value_mean.item(), update)
         writer.add_scalar("ppo/val/var", value_var.item(), update)
-        
+        writer.add_scalar("ppo/lr", lrnow, update)
 
         kl_ctl.update(mean_kl.item(), args.ppo.batch_size)
         # TODO: metrics: scores, rewards,
