@@ -13,7 +13,7 @@ from datasets import load_dataset
 from rich.pretty import pprint
 from torch.utils.data import DataLoader, IterableDataset
 from torch.utils.tensorboard import SummaryWriter
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer, GenerationConfig
 
 from lm_human_preference_details.data import DATASET
 
@@ -38,11 +38,6 @@ class TaskHParams:
 
     # Response params
     response_length: int = 24
-
-    # Truncate response after the first occurrence of this token at or after index after when sampling.
-    truncate_token: Optional[int] = None
-    truncate_after: int = 0
-    penalty_reward_value: int = -1
 
     # LM params
     temperature: float = 0.7
@@ -86,14 +81,13 @@ class Args:
     """How often to print sample output"""
     save_path: str = "models/reward.pt"
     """Where to save the model"""
-
     task: TaskHParams = field(default_factory=TaskHParams)
     labels: LabelHParams = field(default_factory=LabelHParams)
 
 
 def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
-    torch.nn.init.normal_(layer.weight, std)
-    torch.nn.init.constant_(layer.bias, bias_const)
+    torch.nn.init.normal_(layer.weight, std=std)
+    torch.nn.init.constant_(layer.bias, val=bias_const)
     return layer
 
 
@@ -101,7 +95,7 @@ OPENAI_PAD_TOKEN_ID = 50259
 
 
 class ScalarHead(nn.Module):
-    def __init__(self, config, **kwargs):
+    def __init__(self, config, scale=None, **kwargs):
         super().__init__()
         if not hasattr(config, "summary_dropout_prob"):
             summary_dropout_prob = kwargs.pop("summary_dropout_prob", 0.1)
@@ -113,18 +107,22 @@ class ScalarHead(nn.Module):
             hidden_size = config.word_embed_proj_dim
         else:
             hidden_size = config.hidden_size
-        self.summary = layer_init(nn.Linear(hidden_size, 1), std=1 / np.sqrt(hidden_size + 1))
+        if scale is None:
+            scale = 1 / np.sqrt(hidden_size + 1)
+        self.summary = layer_init(nn.Linear(hidden_size, 1), std=scale)
         self.flatten = nn.Flatten()
 
     def forward(self, hidden_states):
         output = self.dropout(hidden_states)
         output = self.summary(output)
         return output
+
+
 class AutoModelForCausalLMWithScalarHead(nn.Module):
     def __init__(self, pretrained_model):
         super().__init__()
         self.pretrained_model = pretrained_model
-        self.scalar_head = ScalarHead(self.pretrained_model.config)
+        self.scalar_head = ScalarHead(self.pretrained_model.config, scale=0.0)
 
     def forward(self, input_ids, attention_mask=None):
         output = self.pretrained_model(input_ids, attention_mask=attention_mask, output_hidden_states=True)
@@ -132,9 +130,11 @@ class AutoModelForCausalLMWithScalarHead(nn.Module):
         return reward
 
 
-class AutoModelForCausalLMWithRewardHead(AutoModelForCausalLMWithScalarHead):
+class AutoModelForCausalLMWithRewardHead(nn.Module):
     def __init__(self, pretrained_model):
-        super().__init__(pretrained_model)
+        super().__init__()
+        self.pretrained_model = pretrained_model
+        self.scalar_head = ScalarHead(self.pretrained_model.config)
         self.reward_gain = torch.nn.Parameter(torch.tensor(1.0), requires_grad=True)
         self.reward_bias = torch.nn.Parameter(torch.tensor(0.0), requires_grad=True)
 
@@ -184,6 +184,15 @@ class MyDataset(IterableDataset):
             yield output
 
 
+def left_padding_to_right_padding(query, pad_id):
+    # got to convert to right padding, otherwise `transformers` has weird issues
+    # even with `position_ids`
+    return torch.tensor([
+        [pad_id]*(row==pad_id).sum() + [x for x in row if x != pad_id]
+        for row in query
+    ])
+
+
 def ceil_div(a, b):
     return (a - 1) // b + 1
 
@@ -191,7 +200,6 @@ def ceil_div(a, b):
 if __name__ == "__main__":
     args = tyro.cli(Args)
     run_name = f"{args.exp_name}__{args.seed}__{int(time.time())}"
-
     if args.track:
         import wandb
 
@@ -232,6 +240,15 @@ if __name__ == "__main__":
     dataloader = DataLoader(dataset, batch_size=args.local_rollout_batch_size)
     iter_dataloader = iter(dataloader)
 
+    generation_config = GenerationConfig(
+        max_new_tokens=args.task.response_length,
+        min_new_tokens=args.task.response_length,
+        temperature=args.task.temperature,
+        top_k=0.0,
+        top_p=1.0,
+        do_sample=True,
+    )
+
     # `label` has keys `['sample0', 'query', 'best', 'sample3', 'sample1', 'sample2']`
     label = load_dataset(
         "vwxyzjn/lm-human-preferences",
@@ -244,22 +261,39 @@ if __name__ == "__main__":
         n_batches = ceil_div(args.normalize_samples, args.local_rollout_batch_size)
         sample_queries_responses = []
         for i in range(n_batches):
-            queries = next(iter_dataloader)
-            input_ids = queries["input_ids"].to(device)
-            query_response = pretrained_model.generate(
-                input_ids=input_ids,
-                attention_mask=queries["attention_mask"].to(device),
-                max_new_tokens=args.task.response_length,
-                temperature=args.task.temperature,
-                pad_token_id=tokenizer.pad_token_id, # ? should I do this?
+            data = next(iter_dataloader)
+            queries = data["input_ids"].to(device)
+            queries = left_padding_to_right_padding(data["input_ids"], tokenizer.pad_token_id).to(device)
+            attention_mask = queries != tokenizer.pad_token_id
+            position_ids = attention_mask.cumsum(1) - attention_mask.long() # exclusive cumsum
+            output = pretrained_model.generate(
+                input_ids=queries,
+                attention_mask=attention_mask,
+                # position_ids=position_ids, # generation collapsed if this was turned on. TODO: why does generation collapse with this?
+                generation_config=generation_config,
+                pad_token_id=-1, # disable `pad_token_id` and `eos_token_id` because we just want to
+                eos_token_id=-1, # generate tokens without truncation / padding
+                return_dict_in_generate=True,
             )
-            sample_queries_responses.append(query_response)
+            query_responses = output.sequences
+            sample_queries_responses.append(query_responses)
+
         rewards = []
-        for query_response in sample_queries_responses:
-            reward = reward_model(
-                input_ids=query_response.to(device),
-                attention_mask=query_response != tokenizer.pad_token_id,
-            )[:, -1]
+        for query_responses in sample_queries_responses:
+            context_length = queries.shape[1]
+            responses = query_responses[:,context_length:]
+            attention_mask = query_responses != tokenizer.pad_token_id
+            position_ids = attention_mask.cumsum(1) - attention_mask.long() # exclusive cumsum
+            output = reward_model.pretrained_model(
+                input_ids=query_responses,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                return_dict=True,
+                output_hidden_states=True,
+            )
+            reward = reward_model.scalar_head(output.hidden_states[-1])
+            reward = reward_model.reward_gain * reward + reward_model.reward_bias
+            reward = reward[:, -1]
             rewards.append(reward)
         rewards = torch.cat(rewards)
         mean, std = rewards.mean(), rewards.std()
@@ -267,10 +301,6 @@ if __name__ == "__main__":
         # reward normalization
         target_mean, target_std = torch.tensor(0.0, device=device), torch.tensor(1.0, device=device)
         old_gain, old_bias = reward_model.reward_gain, reward_model.reward_bias
-        # gain * N(old_mean,old_std) + bias = N(gain * old_mean, gain * old_std) + bias
-        #                                   = N(gain * old_mean + bias, gain * old_std)
-        # gain * old_std = new_std, gain = new_std / old_std
-        # gain * old_mean + bias = new_mean, bias = new_mean - gain * old_mean
         gain = target_std / std
         bias = target_mean - gain * mean
         reward_model.reward_gain.data = gain
@@ -336,7 +366,53 @@ if __name__ == "__main__":
             print("sample reward:", reward[0].item())
 
     if args.normalize_after:
-        pass
+        n_batches = ceil_div(args.normalize_samples, args.local_rollout_batch_size)
+        sample_queries_responses = []
+        for i in range(n_batches):
+            data = next(iter_dataloader)
+            queries = data["input_ids"].to(device)
+            queries = left_padding_to_right_padding(data["input_ids"], tokenizer.pad_token_id).to(device)
+            attention_mask = queries != tokenizer.pad_token_id
+            position_ids = attention_mask.cumsum(1) - attention_mask.long() # exclusive cumsum
+            output = pretrained_model.generate(
+                input_ids=queries,
+                attention_mask=attention_mask,
+                # position_ids=position_ids, # generation collapsed if this was turned on. TODO: why does generation collapse with this?
+                generation_config=generation_config,
+                pad_token_id=-1, # disable `pad_token_id` and `eos_token_id` because we just want to
+                eos_token_id=-1, # generate tokens without truncation / padding
+                return_dict_in_generate=True,
+            )
+            query_responses = output.sequences
+            sample_queries_responses.append(query_responses)
+
+        rewards = []
+        for query_responses in sample_queries_responses:
+            context_length = queries.shape[1]
+            responses = query_responses[:,context_length:]
+            attention_mask = query_responses != tokenizer.pad_token_id
+            position_ids = attention_mask.cumsum(1) - attention_mask.long() # exclusive cumsum
+            output = reward_model.pretrained_model(
+                input_ids=query_responses,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                return_dict=True,
+                output_hidden_states=True,
+            )
+            reward = reward_model.scalar_head(output.hidden_states[-1])
+            reward = reward_model.reward_gain * reward + reward_model.reward_bias
+            reward = reward[:, -1]
+            rewards.append(reward)
+        rewards = torch.cat(rewards)
+        mean, std = rewards.mean(), rewards.std()
+
+        # reward normalization
+        target_mean, target_std = torch.tensor(0.0, device=device), torch.tensor(1.0, device=device)
+        old_gain, old_bias = reward_model.reward_gain, reward_model.reward_bias
+        gain = target_std / std
+        bias = target_mean - gain * mean
+        reward_model.reward_gain.data = gain
+        reward_model.reward_bias.data = bias
 
     # save model
     if args.save_path:
