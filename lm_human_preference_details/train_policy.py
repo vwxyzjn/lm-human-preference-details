@@ -219,6 +219,15 @@ class MyDataset(IterableDataset):
             yield output
 
 
+def left_padding_to_right_padding(query, pad_id):
+    # got to convert to right padding, otherwise `transformers` has weird issues
+    # even with `position_ids`
+    return torch.tensor([
+        [pad_id]*(row==pad_id).sum() + [x for x in row if x != pad_id]
+        for row in query
+    ])
+
+
 def ceil_div(a, b):
     return (a - 1) // b + 1
 
@@ -228,15 +237,6 @@ def exact_div(a, b):
     if a != q * b:
         raise ValueError('Inexact division: %s / %s = %s' % (a, b, a / b))
     return q
-
-
-def left_padding_to_right_padding(query, pad_id):
-    # got to convert to right padding, otherwise `transformers` has weird issues
-    # even with `position_ids`
-    return torch.tensor([
-        [pad_id]*(row==pad_id).sum() + [x for x in row if x != pad_id]
-        for row in query
-    ])
 
 
 if __name__ == "__main__":
@@ -341,7 +341,6 @@ if __name__ == "__main__":
             query_responses = output.sequences
             context_length = queries.shape[1]
             responses = query_responses[:,context_length:]
-            query_responses = torch.cat([queries, responses], dim=1)
             attention_mask = query_responses != tokenizer.pad_token_id
             position_ids = attention_mask.cumsum(1) - attention_mask.long() # exclusive cumsum
             output = policy.pretrained_model(
