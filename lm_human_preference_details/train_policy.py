@@ -76,7 +76,7 @@ class TaskHParams:
 @dataclass
 class Args:
     # common args
-    exp_name: str = os.path.basename(__file__).rstrip(".py")
+    exp_name: str = os.path.basename(__file__)[:-len(".py")]
     """the name of this experiment"""
     seed: int = 1
     """seed of the experiment"""
@@ -88,6 +88,8 @@ class Args:
     """the entity (team) of wandb's project"""
     cuda: bool = True
     """Whether to use cuda if available."""
+    run_name: tyro.conf.Suppress[str] = None
+    """TO BE FILLED: a unique name of this run"""
 
     base_model: str = "gpt2"
     """the name of the pretrained model to use"""
@@ -182,18 +184,19 @@ class AutoModelForCausalLMWithRewardHead(nn.Module):
 
 # a pytorch dataset
 class MyDataset(IterableDataset):
-    def __init__(self, generator, tokenizer, query_length, start_text=None, end_text=None):
+    def __init__(self, generator, tokenizer, query_length, start_text=None, end_text=None, seed=None):
         self.generator = generator
         self.tokenizer = tokenizer
         self.query_length = query_length
         self.start_text = start_text
         self.end_text = end_text
+        self.seed = seed
         token_to_index = tokenizer.get_vocab()
         self.start_token = token_to_index[start_text] if self.start_text else None
         self.end_token = token_to_index[end_text] if self.end_text else None
 
     def __iter__(self):
-        for text in self.generator("train", args.seed):
+        for text in self.generator("train", self.seed):
             tokens = self.tokenizer.encode(text)
             if self.start_token is not None:
                 try:
@@ -239,9 +242,59 @@ def exact_div(a, b):
     return q
 
 
-if __name__ == "__main__":
-    args = tyro.cli(Args)
-    # calculation
+def generate(pretrained_model, queries, tokenizer, generation_config):
+    """generate in a way that does not affect padding tokens"""
+    context_length = queries.shape[1]
+    attention_mask = queries != tokenizer.pad_token_id
+    input_ids = queries.clone()
+    input_ids[~attention_mask] = 0 # set padding tokens to 0
+    output = pretrained_model.generate(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        # position_ids=attention_mask.cumsum(1) - attention_mask.long(), # generation collapsed if this was turned on. TODO: why does generation collapse with this?
+        generation_config=generation_config,
+        pad_token_id=-1, # disable `pad_token_id` and `eos_token_id` because we just want to
+        eos_token_id=[-1], # generate tokens without truncation / padding
+        return_dict_in_generate=True,
+    )
+    # restore padding tokens    
+    return torch.cat((queries, output.sequences[:, context_length:]), dim=1)
+
+
+def get_reward(reward_model, query_responses, tokenizer):
+    attention_mask = query_responses != tokenizer.pad_token_id
+    position_ids = attention_mask.cumsum(1) - attention_mask.long() # exclusive cumsum
+    input_ids = query_responses.clone()
+    input_ids[~attention_mask] = 0
+    output = reward_model.pretrained_model(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        position_ids=position_ids,
+        return_dict=True,
+        output_hidden_states=True,
+    )
+    reward = reward_model.scalar_head(output.hidden_states[-1])
+    reward = reward_model.reward_gain * reward + reward_model.reward_bias
+    # but we only care about the reward of the last token
+    reward = reward[:, -1]
+    return reward
+
+def forward(policy, query_responses, tokenizer):
+    attention_mask = query_responses != tokenizer.pad_token_id
+    position_ids = attention_mask.cumsum(1) - attention_mask.long() # exclusive cumsum
+    input_ids = query_responses.clone()
+    input_ids[~attention_mask] = 0
+    return policy.pretrained_model(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        position_ids=position_ids,
+        return_dict=True,
+        output_hidden_states=True,
+    )
+
+# if __name__ == "__main__":
+#     args = tyro.cli(Args)
+def train(args: Args):
     args.ppo.local_mini_batch_size = exact_div(args.ppo.local_batch_size, args.ppo.nminibatches)
     if args.ppo.whiten_rewards:
         assert args.ppo.local_mini_batch_size >= 8, \
@@ -264,6 +317,7 @@ if __name__ == "__main__":
             name=run_name,
             save_code=True,
         )
+        wandb.run.log_code(".")
     writer = SummaryWriter(f"runs/{run_name}")
     writer.add_text(
         "hyperparameters",
@@ -279,11 +333,12 @@ if __name__ == "__main__":
         args.base_model,
         padding_side="right",
     )
-    tokenizer.pad_token = tokenizer.eos_token
+    # we use the padding token manually but do not resize the token embedding of the model
+    tokenizer.add_special_tokens({"pad_token": "[PAD]"})
     reward_model = AutoModelForCausalLMWithRewardHead(AutoModelForCausalLM.from_pretrained(args.base_model)).to(device)
     if args.rewards.trained_model:
         reward_model.load_state_dict(torch.load(args.rewards.trained_model))
-        print("loaded pretrained reward model")
+        print(f"loaded pretrained reward model from {args.rewards.trained_model}")
     # each class should have a sepatate pretrained model that do not share weights
     ref_policy = AutoModelForCausalLMWithScalarHead(AutoModelForCausalLM.from_pretrained(args.base_model)).to(device)
     policy = AutoModelForCausalLMWithScalarHead(AutoModelForCausalLM.from_pretrained(args.base_model)).to(device)
@@ -323,52 +378,24 @@ if __name__ == "__main__":
         with torch.no_grad():
             queries = data["input_ids"].to(device)
             queries = left_padding_to_right_padding(data["input_ids"], tokenizer.pad_token_id).to(device)
-            attention_mask = queries != tokenizer.pad_token_id
-            position_ids = attention_mask.cumsum(1) - attention_mask.long() # exclusive cumsum
-            # TODO: this can be inefficient; if we implement our own `generate` we can generate the logprobs and values at the same time
-            output = policy.pretrained_model.generate(
-                input_ids=queries,
-                attention_mask=attention_mask,
-                # position_ids=position_ids, # generation collapsed if this was turned on. TODO: why does generation collapse with this?
-                generation_config=generation_config,
-                pad_token_id=-1, # disable `pad_token_id` and `eos_token_id` because we just want to
-                eos_token_id=-1, # generate tokens without truncation / padding
-                return_dict_in_generate=True,
-                output_hidden_states=True,
-                output_scores=True,
-            )
-
-            query_responses = output.sequences
+            query_responses = generate(policy.pretrained_model, queries, tokenizer, generation_config)
             context_length = queries.shape[1]
             responses = query_responses[:,context_length:]
-            attention_mask = query_responses != tokenizer.pad_token_id
-            position_ids = attention_mask.cumsum(1) - attention_mask.long() # exclusive cumsum
-            output = policy.pretrained_model(
-                input_ids=query_responses,
-                attention_mask=attention_mask,
-                position_ids=position_ids,
-                return_dict=True,
-                output_hidden_states=True,
-            )
+
+            output = forward(policy, query_responses, tokenizer)
             logits = output.logits[:,context_length-1:-1]
             logits /= args.task.temperature
             all_logprobs = F.log_softmax(logits, dim=-1)
             logprobs = torch.gather(all_logprobs, 2, responses.unsqueeze(-1)).squeeze(-1)
             values = policy.scalar_head(output.hidden_states[-1][:,context_length-1:-1]).squeeze(-1)
 
-            ref_output = ref_policy.pretrained_model(
-                input_ids=query_responses,
-                attention_mask=attention_mask,
-                position_ids=position_ids,
-                return_dict=True,
-                output_hidden_states=True,
-            )
+            ref_output = forward(ref_policy, query_responses, tokenizer)
             ref_logits = ref_output.logits[:,context_length-1:-1]
             ref_logits /= args.task.temperature
             ref_all_logprobs = F.log_softmax(ref_logits, dim=-1)
             ref_logprobs = torch.gather(ref_all_logprobs, 2, responses.unsqueeze(-1)).squeeze(-1)
 
-            # response processing
+            # **Response Processing**
             # 1. truncate at the first occurrence of `truncate_token` that appears at or after
             # position truncate_after in the responses
             # https://github.com/openai/lm-human-preferences/blob/cbfd210bb8b08f6bc5c26878c10984b90f516c66/lm_human_preferences/train_policy.py#L378
@@ -380,10 +407,7 @@ if __name__ == "__main__":
             # 2. run reward model on the truncated responses
             # TODO: fix position ids
             postprocessed_query_responses = torch.cat((queries, postprocessed_responses), 1)
-            scores = reward_model(
-                postprocessed_query_responses,
-                attention_mask=(postprocessed_query_responses != tokenizer.pad_token_id),
-            )[:, -1].flatten()
+            scores = get_reward(reward_model, postprocessed_query_responses, tokenizer).flatten()
 
             # 3. filter response. Ensure that the sample contains truncate_token
             # responses not passing that filter will receive a low (fixed) score
@@ -391,7 +415,6 @@ if __name__ == "__main__":
             matches_token = (postprocessed_responses[:, args.task.truncate_after:] == args.task.truncate_token)
             filter_mask = torch.any(matches_token, dim=-1)
             scores = torch.where(filter_mask, scores, torch.full_like(scores, args.task.penalty_reward_value))
-
 
             # 4. compute rewards
             kl = logprobs - ref_logprobs
@@ -423,13 +446,7 @@ if __name__ == "__main__":
                     returns = advantages + values
                     advantages = whiten(advantages)
 
-                output = policy.pretrained_model(
-                    input_ids=query_responses,
-                    attention_mask=attention_mask,
-                    position_ids=position_ids,
-                    return_dict=True,
-                    output_hidden_states=True,
-                )
+                output = forward(policy, query_responses, tokenizer)
                 logits = output.logits[:,context_length-1:-1]
                 logits /= args.task.temperature
                 new_all_logprobs = F.log_softmax(logits, dim=-1)
@@ -498,3 +515,6 @@ if __name__ == "__main__":
     if args.save_path:
         os.makedirs(os.path.dirname(args.save_path), exist_ok=True)
         torch.save(reward_model.state_dict(), args.save_path)
+
+if __name__ == "__main__":
+    tyro.cli(train)
