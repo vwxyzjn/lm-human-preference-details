@@ -40,6 +40,7 @@ class PpoHParams:
     local_mini_batch_size: tyro.conf.Suppress[int] = None
     batch_size: tyro.conf.Suppress[int] = None
     mini_batch_size: tyro.conf.Suppress[int] = None
+    num_updates: tyro.conf.Suppress[int] = None
     nminibatches: int = 1
     noptepochs: int = 4
     lr: float = 0.00001
@@ -303,6 +304,8 @@ def train(args: Args):
     args.ppo.mini_batch_size = args.ppo.local_mini_batch_size # * NUM_RANKS
     # `per_rank_rollout_batch_size` is our `args.ppo.local_batch_size`
     # `per_rank_minibatch_size` is our `args.ppo.local_mini_batch_size`
+    args.ppo.num_updates = args.ppo.total_episodes // args.ppo.batch_size
+
 
     console = Console()
     run_name = f"{args.exp_name}__{args.seed}__{int(time.time())}"
@@ -368,10 +371,9 @@ def train(args: Args):
 
     print("===training policy===")
     global_step = 0
-    num_updates = args.ppo.total_episodes // args.ppo.batch_size
-    for update in range(1, num_updates + 1):
+    for update in range(1, args.ppo.num_updates + 1):
         global_step += 1 * args.ppo.batch_size
-        frac = 1.0 - (update - 1.0) / num_updates
+        frac = 1.0 - (update - 1.0) / args.ppo.num_updates
         lrnow = frac * args.ppo.lr
         optimizer.param_groups[0]["lr"] = lrnow
         data = next(iter_dataloader)
@@ -507,8 +509,9 @@ def train(args: Args):
         writer.add_scalar("ppo/val/ratio_var", ratio.var().item(), update)
         writer.add_scalar("ppo/val/advantage", advantages.mean().item(), update)
         writer.add_scalar("ppo/val/advantage_var", advantages.var().item(), update)
-        writer.add_scalar("ppo/val/num_eos_tokens", (responses == tokenizer.eos_token_id).sum().item())
+        writer.add_scalar("ppo/val/num_eos_tokens", (responses == tokenizer.eos_token_id).sum().item(), update)
         writer.add_scalar("ppo/lr", lrnow, update)
+        writer.add_scalar("ppo/episode", global_step, update)
         kl_ctl.update(mean_kl.item(), args.ppo.batch_size)
 
     # save model
