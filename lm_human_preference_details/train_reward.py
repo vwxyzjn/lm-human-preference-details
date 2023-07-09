@@ -239,6 +239,37 @@ def get_reward(reward_model, query_responses, tokenizer):
     return reward
 
 def normalize(args, device, tokenizer, pretrained_model, reward_model, iter_dataloader, generation_config):
+    # reset reward scales
+    reward_model.reward_gain.data = torch.tensor(1.0, device=device)
+    reward_model.reward_bias.data = torch.tensor(0.0, device=device)
+
+    # sample queries and responses
+    n_batches = ceil_div(args.normalize_samples, args.local_rollout_batch_size)
+    sample_queries_responses = []
+    for _ in range(n_batches):
+        data = next(iter_dataloader)
+        queries = data["input_ids"].to(device)
+        queries = left_padding_to_right_padding(data["input_ids"], tokenizer.pad_token_id).to(device)
+        query_responses = generate(pretrained_model, queries, tokenizer, generation_config)
+        sample_queries_responses.append(query_responses)
+    
+    # compute reward statistics
+    rewards = []
+    for query_responses in sample_queries_responses:
+        rewards.append(get_reward(reward_model, query_responses, tokenizer))
+    rewards = torch.cat(rewards)
+    mean, std = rewards.mean(), rewards.std()
+    print(f"mean: {mean}, std: {std}")
+
+    # reward normalization
+    target_mean, target_std = torch.tensor(0.0, device=device), torch.tensor(1.0, device=device)
+    gain = target_std / std
+    bias = target_mean - gain * mean
+    print(f"gain: {gain}, bias: {bias}")
+    reward_model.reward_gain.data = gain
+    reward_model.reward_bias.data = bias
+
+    # after normalization statistics
     n_batches = ceil_div(args.normalize_samples, args.local_rollout_batch_size)
     sample_queries_responses = []
     for _ in range(n_batches):
@@ -252,12 +283,7 @@ def normalize(args, device, tokenizer, pretrained_model, reward_model, iter_data
         rewards.append(get_reward(reward_model, query_responses, tokenizer))
     rewards = torch.cat(rewards)
     mean, std = rewards.mean(), rewards.std()
-    # reward normalization
-    target_mean, target_std = torch.tensor(0.0, device=device), torch.tensor(1.0, device=device)
-    gain = target_std / std
-    bias = target_mean - gain * mean
-    reward_model.reward_gain.data = gain
-    reward_model.reward_bias.data = bias
+    print(f"after mean: {mean}, after std: {std}")
 
 
 # if __name__ == "__main__":
@@ -379,8 +405,8 @@ def train(args: Args):
             print(f"global_step {global_step}:")
             console.print(f"[green]{tokenizer.decode(queries[0], skip_special_tokens=True)}[/]\n[purple]{tokenizer.decode(responses[0], skip_special_tokens=True)}[/]\n[red]reward: {reward[0].item()}[/] ")
 
-    # if args.normalize_after:
-    #     normalize(args, device, tokenizer, pretrained_model, reward_model, iter_dataloader, generation_config)
+    if args.normalize_after:
+        normalize(args, device, tokenizer, pretrained_model, reward_model, iter_dataloader, generation_config)
 
     # save model
     if args.save_path:
