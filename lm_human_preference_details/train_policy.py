@@ -11,7 +11,6 @@ import torch.optim as optim
 import torch.nn.functional as F
 import tyro
 from rich.console import Console
-from datasets import load_dataset
 from rich.pretty import pprint
 from torch.utils.data import DataLoader, IterableDataset
 from torch.utils.tensorboard import SummaryWriter
@@ -30,7 +29,7 @@ class AdaptiveKLParams:
 class RewardHParams:
     kl_coef: float = 0.15
     adaptive_kl: Optional[AdaptiveKLParams] = field(default_factory=AdaptiveKLParams)
-    trained_model: Optional[str] = "models/reward.pt"
+    trained_model: Optional[str] = "models/reward_that_works.pt"
 
 
 @dataclass
@@ -197,7 +196,7 @@ class MyDataset(IterableDataset):
         self.end_token = token_to_index[end_text] if self.end_text else None
 
     def __iter__(self):
-        for text in self.generator("train", self.seed):
+        for text in self.generator("train", self.seed, shuffle=True):
             tokens = self.tokenizer.encode(text)
             if self.start_token is not None:
                 try:
@@ -347,7 +346,7 @@ def train(args: Args):
     policy = AutoModelForCausalLMWithScalarHead(AutoModelForCausalLM.from_pretrained(args.base_model)).to(device)
     # IMPORTANT: Layer norm produces weird gradients, which affects Adam optimizer to impact all the parameters systematically
     # In comparison, SGD does not appear to have this issue. TODO: add a link to the issue
-    optimizer = optim.SGD(policy.parameters(), lr=args.ppo.lr)
+    optimizer = optim.Adam(policy.parameters(), lr=args.ppo.lr, eps=5e-4, betas=(0.9, 0.999))
     dataset = MyDataset(
         DATASET[args.task.query_dataset],
         tokenizer,
