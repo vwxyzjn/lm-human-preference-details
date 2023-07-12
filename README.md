@@ -6,7 +6,9 @@ This repo aims to make a blog post similar to [*The 37 Implementation Details of
 >**Warning** This repo is a **WIP** made public because it's easier for me to share pointers with collaborators. I'll remove this warning when the repo is ready for public consumption.
 
 
-The goal of the repo is 1) to provide a simple-to-ready and minimal reference implementation of RLHF and 2) to create rigorous benchmarks and to match the learning curves of `openai/lm-human-preferences`.
+The goal of the repo is 1) to provide a simple-to-read and minimal reference implementation of RLHF and 2) to create rigorous benchmarks and to match the learning curves of `openai/lm-human-preferences`.
+
+This repo is just for educational / learning purposes. For more advanced users, https://github.com/lvwerra/trl would be a great choice.
 
 ## Get started
 
