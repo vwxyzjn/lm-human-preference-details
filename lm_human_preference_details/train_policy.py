@@ -29,7 +29,7 @@ class AdaptiveKLParams:
 class RewardHParams:
     kl_coef: float = 0.15
     adaptive_kl: Optional[AdaptiveKLParams] = field(default_factory=AdaptiveKLParams)
-    trained_model: Optional[str] = "models/reward_that_works.pt"
+    trained_model: Optional[str] = "models/reward.pt"
 
 
 @dataclass
