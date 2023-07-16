@@ -30,7 +30,7 @@ You can also run stuff individually. For example, to train the reward model, run
 ```
 accelerate launch \
     --num_processes 8 \
-    lm_human_preference_details/train_reward.py \
+    lm_human_preference_details/train_reward_accelerate.py \
     --track
 ```
 
@@ -38,7 +38,7 @@ to train the policy model, run
 ```
 accelerate launch \
     --num_processes 8 \
-    lm_human_preference_details/train_policy.py \
+    lm_human_preference_details/train_policy_accelerate.py \
     --track
 ```
 
