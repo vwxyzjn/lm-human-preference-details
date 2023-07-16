@@ -32,6 +32,7 @@ class RewardHParams:
     kl_coef: float = 0.25
     adaptive_kl: Optional[AdaptiveKLParams] = field(default_factory=AdaptiveKLParams)
     trained_model: Optional[str] = "models/reward.pt"
+    label_dataset: tyro.conf.Suppress[Optional[str]] = None
 
 
 @dataclass

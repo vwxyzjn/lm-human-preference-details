@@ -22,5 +22,6 @@ if __name__ == "__main__":
     args.reward.save_path = f"models/{run_name}/reward.pt"
     args.policy.save_path = f"models/{run_name}/policy.pt"
     args.policy.rewards.trained_model = args.reward.save_path
+    args.policy.rewards.label_dataset = args.reward.label_dataset
     train_reward(args.reward)
     train_policy(args.policy)
