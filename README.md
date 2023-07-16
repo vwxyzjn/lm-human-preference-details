@@ -48,7 +48,12 @@ accelerate launch \
 
 Currently for a reproduction, I used the same dataset, same data processing pipeline, same initial model architecture and weights (`gpt2` 124M pretrained model). Hyperparameters are exactly the same except for the adam optimizer's `eps` which I used `5e-4` instead of `1e-5` for better stability
 
-In the following chart out of 10 random seeds
+The following charts shows the learning curves of various metrics for `sentiment` and `descriptiveness` tasks, each with 10 random seeds.
+
+
+>**Warning** Notice how my reproduction in `sentiment` has lower `entropy` and has lower `score` in `descriptiveness`. It may be related to subtle issues with the optimizer's setting. See https://github.com/pytorch/pytorch/issues/104857#issuecomment-1635068659
+
+
 ```
 pip install openrlbenchmark==0.2.1a4
 python -m openrlbenchmark.rlops_multi_metrics \
@@ -70,6 +75,9 @@ python -m openrlbenchmark.rlops_multi_metrics \
 Wandb report is availible at https://wandb.ai/costa-huang/cleanrl/reports/Regression-Report-train_policy_accelerate--Vmlldzo0ODk0MjM2. Feel free to check out the logs of the runs for sample outputs.
 
 ![](static/wandb.png)
+
+
+### Sentiment
 
 * https://wandb.ai/openrlbenchmark/lm-human-preferences/runs/ckg9d00z/logs
     * 
@@ -107,6 +115,49 @@ Wandb report is availible at https://wandb.ai/costa-huang/cleanrl/reports/Regres
     query: she offered a tense shrug before reaching for the door handle.
     response: "We're going to be fine," he said, "and we're going to be okay.
     score: 0.9820655584335327, kl: 7.899775505065918, total reward: -0.15402913093566895
+    ```
+
+
+
+### Descriptiveness
+
+* https://wandb.ai/openrlbenchmark/lm-human-preferences/runs/vx0cjya8/logs
+    * 
+    ```
+    then peter and gracie hoffman about their daughter , kelly .
+    The blonde girl made a hideous looking face, rubbing her lips with her hands, and motioned them.
+    score = +3.29
+    kl = +11.87
+    total = +1.51
+    it was n't remarkable ; it was awful .
+    He was dressed in a black coat with the sleeves rolled up and his eyes were black with blood.
+    score = +2.98
+    kl = +12.40
+    total = +1.12
+    eyes that only warmed when they were on her .
+    The chestnut-brown eyes were almost white, their dull yellow pupils half-closed.
+    score = +3.11
+    kl = +9.55
+    total = +1.68
+    ```
+* https://wandb.ai/costa-huang/cleanRL/runs/e75dhls2/logs
+    * 
+    ```
+    query: `` you really don't think i can do it, '' i said, trying not to sound stung.
+    response: had to kneel down to take a deep breath, her hand wrapped around her waist. her
+    face was red with tears
+    score: -1.0, kl: 8.85654354095459, total reward: -2.0279948711395264
+
+    query: it's ridiculous for someone with your pedigree to go to art school.
+    response:  And if Mikan has any problems with this, he has to be kidding himselfWhat's in
+    the Water at Su
+    score: -1.0, kl: -4.508945465087891, total reward: -0.47910648584365845
+    
+    query: jimmy was on the back seat of his truck.
+    response:  His lips were furrowed and his lips were still furrowed. He was dressed in a
+    white coat.
+    score: 1.3276370763778687, kl: 7.90595006942749, total reward:
+    0.41623085737228394
     ```
 
 ## Learning curves of `openai/lm-human-preferences`
