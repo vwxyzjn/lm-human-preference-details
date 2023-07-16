@@ -342,7 +342,7 @@ def train(args: Args):
     tokenizer.add_special_tokens({"pad_token": "[PAD]"})
     reward_model = AutoModelForCausalLMWithRewardHead(AutoModelForCausalLM.from_pretrained(args.base_model)).to(device)
     if args.rewards.trained_model:
-        reward_model.load_state_dict(torch.load(args.rewards.trained_model))
+        reward_model.load_state_dict(torch.load(args.rewards.trained_model, map_location=device))
         print(f"loaded pretrained reward model from {args.rewards.trained_model}")
     # each class should have a sepatate pretrained model that do not share weights
     ref_policy = AutoModelForCausalLMWithScalarHead(AutoModelForCausalLM.from_pretrained(args.base_model)).to(device)
@@ -532,4 +532,5 @@ def train(args: Args):
         torch.save(reward_model.state_dict(), args.save_path)
 
 if __name__ == "__main__":
-    tyro.cli(train)
+    args = tyro.cli(Args)
+    train(args)

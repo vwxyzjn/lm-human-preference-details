@@ -437,4 +437,5 @@ def train(args: Args):
 
 
 if __name__ == "__main__":
-    tyro.cli(train)
+    args = tyro.cli(Args)
+    train(args)
