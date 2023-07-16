@@ -251,8 +251,6 @@ def generate(pretrained_model, queries, tokenizer, generation_config):
         attention_mask=attention_mask,
         # position_ids=attention_mask.cumsum(1) - attention_mask.long(), # generation collapsed if this was turned on. TODO: why does generation collapse with this?
         generation_config=generation_config,
-        pad_token_id=-1, # disable `pad_token_id` and `eos_token_id` because we just want to
-        eos_token_id=[-1], # generate tokens without truncation / padding
         return_dict_in_generate=True,
     )
     # restore padding tokens    
@@ -348,6 +346,8 @@ def train(args: Args):
     # each class should have a sepatate pretrained model that do not share weights
     ref_policy = AutoModelForCausalLMWithScalarHead(AutoModelForCausalLM.from_pretrained(args.base_model)).to(device)
     policy = AutoModelForCausalLMWithScalarHead(AutoModelForCausalLM.from_pretrained(args.base_model)).to(device)
+    policy.pretrained_model.generation_config.eos_token_id = None  # disable `pad_token_id` and `eos_token_id` because we just want to
+    policy.pretrained_model.generation_config.pad_token_id = None  # generate tokens without truncation / padding
     # IMPORTANT: Layer norm produces weird gradients, which affects Adam optimizer to impact all the parameters systematically
     # In comparison, SGD does not appear to have this issue. TODO: add a link to the issue
     optimizer = optim.Adam(policy.parameters(), lr=args.ppo.lr, eps=5e-4, betas=(0.9, 0.999))

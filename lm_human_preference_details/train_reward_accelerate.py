@@ -219,8 +219,6 @@ def generate(pretrained_model, queries, tokenizer, generation_config):
         attention_mask=attention_mask,
         # position_ids=attention_mask.cumsum(1) - attention_mask.long(), # generation collapsed if this was turned on. TODO: why does generation collapse with this?
         generation_config=generation_config,
-        pad_token_id=-1, # disable `pad_token_id` and `eos_token_id` because we just want to
-        eos_token_id=[-1], # generate tokens without truncation / padding
         return_dict_in_generate=True,
     )
     # restore padding tokens    
@@ -334,8 +332,9 @@ def train(args: Args):
     )
     # we use the padding token manually but do not resize the token embedding of the model
     tokenizer.add_special_tokens({"pad_token": "[PAD]"})
-    pretrained_model = AutoModelForCausalLM.from_pretrained(args.base_model).to(device)
     reward_model = AutoModelForCausalLMWithRewardHead(AutoModelForCausalLM.from_pretrained(args.base_model)).to(device)
+    reward_model.pretrained_model.generation_config.eos_token_id = None  # disable `pad_token_id` and `eos_token_id` because we just want to
+    reward_model.pretrained_model.generation_config.pad_token_id = None  # generate tokens without truncation / padding
     optimizer = optim.Adam(reward_model.parameters(), lr=args.lr, eps=1e-5)
     dataset = MyDataset(
         DATASET[args.task.query_dataset],
@@ -345,7 +344,6 @@ def train(args: Args):
         end_text=args.task.end_text,
     )
     dataloader = DataLoader(dataset, batch_size=args.local_rollout_batch_size)
-    reward_model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(reward_model)
     reward_model, optimizer, dataloader = accelerator.prepare(reward_model, optimizer, dataloader)
     print(reward_model)
     iter_dataloader = iter(dataloader)
@@ -368,7 +366,7 @@ def train(args: Args):
     print("training on", args.labels.num_train, "in batches of", args.local_batch_size)
 
     if args.normalize_before:
-        normalize(args, accelerator, device, tokenizer, pretrained_model, reward_model, iter_dataloader, generation_config)
+        normalize(args, accelerator, device, tokenizer, accelerator.unwrap_model(reward_model).pretrained_model, reward_model, iter_dataloader, generation_config)
 
     print("===training reward model===")
     all_inds = np.arange(args.labels.num_train)
@@ -420,14 +418,14 @@ def train(args: Args):
             data = next(iter_dataloader)
             queries = data["input_ids"].to(device)
             queries = left_padding_to_right_padding(data["input_ids"], tokenizer.pad_token_id).to(device)
-            query_responses = generate(pretrained_model, queries, tokenizer, generation_config)
+            query_responses = generate(accelerator.unwrap_model(reward_model).pretrained_model, queries, tokenizer, generation_config)
             responses = query_responses[:, queries.shape[1]:]
             reward = get_reward(reward_model, query_responses, tokenizer)[1]
             print(f"global_step {global_step}:")
-            console.print(f"[green]{tokenizer.decode(queries[0], skip_special_tokens=True)}[/]\n[purple]{tokenizer.decode(responses[0], skip_special_tokens=True)}[/]\n[red]reward: {reward[0].item()}[/] ")
+            console.print(f"[green]{tokenizer.decode(queries[0], skip_special_tokens=True)}[/]\n[blue]{tokenizer.decode(responses[0], skip_special_tokens=True)}[/]\n[red]reward: {reward[0].item()}[/] ")
 
     if args.normalize_after:
-        normalize(args, accelerator, device, tokenizer, pretrained_model, reward_model, iter_dataloader, generation_config)
+        normalize(args, accelerator, device, tokenizer, accelerator.unwrap_model(reward_model).pretrained_model, reward_model, iter_dataloader, generation_config)
 
     # save model
     if args.save_path:
