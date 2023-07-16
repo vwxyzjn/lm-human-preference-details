@@ -431,7 +431,11 @@ def train(args: Args):
             # 5. whiten rewards
             if args.ppo.whiten_rewards:
                 rewards = whiten(rewards, shift_mean=False)
-            console.print(f"[green]{tokenizer.decode(queries[0], skip_special_tokens=True)}[/]\n[purple]{tokenizer.decode(responses[0], skip_special_tokens=True)}[/]\n[red]score: {scores[0]}[/] ")
+            try:
+                sample_kl = kl[0].sum().item()
+                console.print(f"[green]{tokenizer.decode(queries[0], skip_special_tokens=True)}[/]\n[blue]{tokenizer.decode(responses[0], skip_special_tokens=True)}[/]\n[red]score: {scores[0]}, kl: {kl[0].sum().item()}, total reward: {scores[0] - kl_ctl.value * sample_kl} [/]")
+            except:
+                pass
 
         # Do multiple epochs of PPO training, with a fresh random shuffle in each epoch
         for ppo_epoch_idx in range(args.ppo.noptepochs):
@@ -485,7 +489,7 @@ def train(args: Args):
                 return_mean, return_var = returns.mean(), returns.var()
                 value_mean, value_var = values.mean(), values.var()
             if accelerator.is_main_process:
-                print(f"ppo_epoch_idx={ppo_epoch_idx}", "approxkl", approxkl.item(), "pg_loss", pg_loss.item(), "pg_clipfrac", pg_clipfrac.item(), "ratio", ratio.mean().item())
+                console.print(f"ppo_epoch_idx", ppo_epoch_idx, "approxkl", approxkl.item(), "pg_loss", pg_loss.item(), "pg_clipfrac", pg_clipfrac.item(), "ratio", ratio.mean().item())
 
         kl = logprobs - ref_logprobs
         mean_kl = kl.sum(1).mean()
