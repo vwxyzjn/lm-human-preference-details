@@ -351,7 +351,7 @@ def train(args: Args):
     policy.pretrained_model.generation_config.pad_token_id = None  # generate tokens without truncation / padding
     # IMPORTANT: Layer norm produces weird gradients, which affects Adam optimizer to impact all the parameters systematically
     # In comparison, SGD does not appear to have this issue. TODO: add a link to the issue
-    optimizer = optim.Adam(policy.parameters(), lr=args.ppo.lr, eps=5e-4, betas=(0.9, 0.999))
+    optimizer = optim.AdamW(policy.parameters(), eps=1e-5, betas=(0.9, 0.999))
     dataset = MyDataset(
         DATASET[args.task.query_dataset],
         tokenizer,
