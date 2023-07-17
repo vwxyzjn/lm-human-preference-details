@@ -297,7 +297,7 @@ def train(args: Args):
     args.world_size = accelerator.num_processes
     args.batch_size = int(args.local_batch_size * args.world_size)
 
-    console = Console()
+    console = Console(force_terminal=True)
     run_name = f"{args.exp_name}__{args.seed}__{int(time.time())}"
     writer = SimpleNamespace() # dummy writer
     writer.add_scalar = lambda x, y, z: None
@@ -335,7 +335,7 @@ def train(args: Args):
     reward_model = AutoModelForCausalLMWithRewardHead(AutoModelForCausalLM.from_pretrained(args.base_model)).to(device)
     reward_model.pretrained_model.generation_config.eos_token_id = None  # disable `pad_token_id` and `eos_token_id` because we just want to
     reward_model.pretrained_model.generation_config.pad_token_id = None  # generate tokens without truncation / padding
-    optimizer = optim.Adam(reward_model.parameters(), lr=args.lr, eps=1e-5)
+    optimizer = optim.AdamW(reward_model.parameters(), lr=args.lr, eps=1e-5)
     dataset = MyDataset(
         DATASET[args.task.query_dataset],
         tokenizer,
@@ -413,6 +413,7 @@ def train(args: Args):
         accelerator.backward(loss)
         optimizer.step()
         writer.add_scalar("loss", accelerator.gather(loss).mean().item(), global_step)
+        writer.add_scalar("lr", lr, global_step)
 
         if args.print_sample_output_freq > 0 and global_step % args.print_sample_output_freq == 0:
             data = next(iter_dataloader)

@@ -29,7 +29,7 @@ class AdaptiveKLParams:
 
 @dataclass
 class RewardHParams:
-    kl_coef: float = 0.25
+    kl_coef: float = 0.15
     adaptive_kl: Optional[AdaptiveKLParams] = field(default_factory=AdaptiveKLParams)
     trained_model: Optional[str] = "models/reward.pt"
     label_dataset: tyro.conf.Suppress[Optional[str]] = None
@@ -305,7 +305,7 @@ def train(args: Args):
     # `per_rank_minibatch_size` is our `args.ppo.local_mini_batch_size`
     args.ppo.num_updates = args.ppo.total_episodes // args.ppo.batch_size
 
-    console = Console()
+    console = Console(force_terminal=True)
     run_name = f"{args.exp_name}__{args.seed}__{int(time.time())}"
     writer = SimpleNamespace() # dummy writer
     writer.add_scalar = lambda x, y, z: None
@@ -351,7 +351,7 @@ def train(args: Args):
     policy.pretrained_model.generation_config.pad_token_id = None  # generate tokens without truncation / padding
     # IMPORTANT: Layer norm produces weird gradients, which affects Adam optimizer to impact all the parameters systematically
     # In comparison, SGD does not appear to have this issue. TODO: add a link to the issue
-    optimizer = optim.AdamW(policy.parameters(), eps=1e-5, betas=(0.9, 0.999))
+    optimizer = optim.AdamW(policy.parameters(), lr=args.ppo.lr, eps=1e-5)
     dataset = MyDataset(
         DATASET[args.task.query_dataset],
         tokenizer,
@@ -478,12 +478,6 @@ def train(args: Args):
                 loss = pg_loss + args.ppo.vf_coef * vf_loss
                 optimizer.zero_grad()
                 accelerator.backward(loss)
-                grads = [
-                    param.grad.detach().flatten()
-                    for param in policy.parameters()
-                    if param.grad is not None
-                ]
-                norm = torch.cat(grads).norm()
                 optimizer.step()
                 pd = torch.nn.functional.softmax(logits, dim=-1)
                 entropy = torch.logsumexp(logits, dim=-1) - torch.sum(pd * logits, dim=-1)
@@ -506,7 +500,6 @@ def train(args: Args):
         writer.add_scalar("ppo/loss/policy", accelerator.gather(pg_loss).mean().item(), update)
         writer.add_scalar("ppo/loss/value", accelerator.gather(vf_loss).mean().item(), update)
         writer.add_scalar("ppo/loss/total", accelerator.gather(loss).mean().item(), update)
-        writer.add_scalar("ppo/loss/norm", accelerator.gather(norm).mean().item(), update)
         writer.add_scalar("ppo/policy/entropy", accelerator.gather(entropy.mean()).mean().item(), update)
         writer.add_scalar("ppo/policy/approxkl", accelerator.gather(approxkl).mean().item(), update)
         writer.add_scalar("ppo/policy/clipfrac", accelerator.gather(pg_clipfrac).mean().item(), update)
