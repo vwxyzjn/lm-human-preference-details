@@ -72,7 +72,7 @@ class Args:
     """per rank batch size"""
     lr: float = 0.00005
     """the learning rate"""
-    local_rollout_batch_size: int = 128
+    local_rollout_batch_size: int = 512
     """per rank rollot batch size"""
     world_size: tyro.conf.Suppress[int] = None
     """the number of processes to use"""
