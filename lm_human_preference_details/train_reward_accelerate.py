@@ -11,6 +11,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import torch.nn.functional as F
 import tyro
 from rich.console import Console
 from datasets import load_dataset
@@ -72,7 +73,7 @@ class Args:
     """per rank batch size"""
     lr: float = 0.00005
     """the learning rate"""
-    local_rollout_batch_size: int = 512
+    local_rollout_batch_size: int = 128
     """per rank rollot batch size"""
     world_size: tyro.conf.Suppress[int] = None
     """the number of processes to use"""
@@ -240,8 +241,8 @@ def get_reward(reward_model, query_responses, tokenizer):
 
 def normalize(args, accelerator, device, tokenizer, pretrained_model, reward_model, iter_dataloader, generation_config):
     # reset reward scales
-    reward_model.module.reward_gain.data = torch.tensor(1.0, device=device)
-    reward_model.module.reward_bias.data = torch.tensor(0.0, device=device)
+    reward_model.module.reward_gain.data.fill_(1.0)
+    reward_model.module.reward_bias.data.fill_(0.0)
 
     # sample queries and responses
     n_batches = ceil_div(args.normalize_samples, args.local_rollout_batch_size)
@@ -332,6 +333,7 @@ def train(args: Args):
     )
     # we use the padding token manually but do not resize the token embedding of the model
     tokenizer.add_special_tokens({"pad_token": "[PAD]"})
+    untrained_model = AutoModelForCausalLMWithRewardHead(AutoModelForCausalLM.from_pretrained(args.base_model)).to(device)
     reward_model = AutoModelForCausalLMWithRewardHead(AutoModelForCausalLM.from_pretrained(args.base_model)).to(device)
     reward_model.pretrained_model.generation_config.eos_token_id = None  # disable `pad_token_id` and `eos_token_id` because we just want to
     reward_model.pretrained_model.generation_config.pad_token_id = None  # generate tokens without truncation / padding
@@ -365,8 +367,10 @@ def train(args: Args):
     print("Num labels found in source:", len(label))
     print("training on", args.labels.num_train, "in batches of", args.local_batch_size)
 
+    print("before====", reward_model.module.reward_gain.data)
     if args.normalize_before:
         normalize(args, accelerator, device, tokenizer, accelerator.unwrap_model(reward_model).pretrained_model, reward_model, iter_dataloader, generation_config)
+    print("after====", reward_model.module.reward_gain.data)
 
     print("===training reward model===")
     all_inds = np.arange(args.labels.num_train)
@@ -416,15 +420,38 @@ def train(args: Args):
         writer.add_scalar("lr", lr, global_step)
 
         if args.print_sample_output_freq > 0 and global_step % args.print_sample_output_freq == 0:
-            data = next(iter_dataloader)
-            queries = data["input_ids"].to(device)
-            queries = left_padding_to_right_padding(data["input_ids"], tokenizer.pad_token_id).to(device)
-            query_responses = generate(accelerator.unwrap_model(reward_model).pretrained_model, queries, tokenizer, generation_config)
-            responses = query_responses[:, queries.shape[1]:]
-            reward = get_reward(reward_model, query_responses, tokenizer)[1]
-            print(f"global_step {global_step}:")
-            console.print(f"[green]{tokenizer.decode(queries[0], skip_special_tokens=True)}[/]\n[blue]{tokenizer.decode(responses[0], skip_special_tokens=True)}[/]\n[red]reward: {reward[0].item()}[/] ")
+            with torch.no_grad():
+                data = next(iter_dataloader)
+                queries = data["input_ids"].to(device)
+                context_length = queries.shape[1]
+                queries = left_padding_to_right_padding(data["input_ids"], tokenizer.pad_token_id).to(device)
+                query_responses = generate(accelerator.unwrap_model(reward_model).pretrained_model, queries, tokenizer, generation_config)
+                responses = query_responses[:, context_length:]
 
+                output, reward = get_reward(reward_model, query_responses, tokenizer)
+                logits = output.logits[:,context_length-1:-1]
+                logits /= args.task.temperature
+                all_logprobs = F.log_softmax(logits, dim=-1)
+                logprobs = torch.gather(all_logprobs, 2, responses.unsqueeze(-1)).squeeze(-1)
+
+                output, _ = get_reward(untrained_model, query_responses, tokenizer)
+                logits = output.logits[:,context_length-1:-1]
+                logits /= args.task.temperature
+                all_logprobs = F.log_softmax(logits, dim=-1)
+                ref_logprobs = torch.gather(all_logprobs, 2, responses.unsqueeze(-1)).squeeze(-1)
+
+                print(f"global_step {global_step}:")
+                kl = logprobs - ref_logprobs
+                console.print(
+                    f"[green]{tokenizer.decode(queries[0], skip_special_tokens=True)}[/]"
+                    f"\n[blue]{tokenizer.decode(responses[0], skip_special_tokens=True)}[/]"
+                    f"\n[red]reward: {reward[0].item()}[/]"
+                    f"\n[red]kl: {kl[0].sum().item()}[/]"
+                    f"\n[red]average kl: {kl.sum(1).mean().item()}[/]"
+                )
+                writer.add_scalar("kl", kl.sum(1).mean().item(), global_step)
+
+    torch.cuda.empty_cache()
     if args.normalize_after:
         normalize(args, accelerator, device, tokenizer, accelerator.unwrap_model(reward_model).pretrained_model, reward_model, iter_dataloader, generation_config)
 
