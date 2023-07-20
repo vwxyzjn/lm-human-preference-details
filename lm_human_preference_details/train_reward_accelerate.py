@@ -335,7 +335,14 @@ def train(args: Args):
     reward_model = AutoModelForCausalLMWithRewardHead(AutoModelForCausalLM.from_pretrained(args.base_model)).to(device)
     reward_model.pretrained_model.generation_config.eos_token_id = None  # disable `pad_token_id` and `eos_token_id` because we just want to
     reward_model.pretrained_model.generation_config.pad_token_id = None  # generate tokens without truncation / padding
-    optimizer = optim.AdamW(reward_model.parameters(), lr=args.lr, eps=1e-5)
+    # per OpenAI's setting `trained_models.TrainedModel(hparams.task.policy.initial_model).m.get_params()`
+    # only a subset of parameters are trained
+    params = []
+    for name, param in reward_model.named_parameters():
+        if not any(f".h.{i}" in name for i in range(2, 12)):
+            print(name)
+            params.append(param)
+    optimizer = optim.AdamW(params, lr=args.lr, eps=1e-5)
     dataset = MyDataset(
         DATASET[args.task.query_dataset],
         tokenizer,
