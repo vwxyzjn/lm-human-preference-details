@@ -49,6 +49,7 @@ class PpoHParams:
     nminibatches: int = 1
     noptepochs: int = 4
     lr: float = 0.00001
+    eps: float = 1e-5
     vf_coef: float = .1
     cliprange: float = .2
     cliprange_value: float = .2
@@ -351,7 +352,7 @@ def train(args: Args):
     policy.pretrained_model.generation_config.pad_token_id = None  # generate tokens without truncation / padding
     # IMPORTANT: Layer norm produces weird gradients, which affects Adam optimizer to impact all the parameters systematically
     # In comparison, SGD does not appear to have this issue. TODO: add a link to the issue
-    optimizer = optim.AdamW(policy.parameters(), lr=args.ppo.lr, eps=1e-5)
+    optimizer = optim.AdamW(policy.parameters(), lr=args.ppo.lr, eps=args.ppo.eps)
     dataset = MyDataset(
         DATASET[args.task.query_dataset],
         tokenizer,
@@ -439,24 +440,25 @@ def train(args: Args):
             except:
                 pass
 
+        with torch.no_grad():
+            lastgaelam = 0
+            advantages_reversed = []
+            gen_length = args.task.response_length
+            for t in reversed(range(gen_length)):
+                nextvalues = values[:, t + 1] if t < gen_length - 1 else 0.0
+                delta = rewards[:, t] + args.ppo.gamma * nextvalues - values[:, t]
+                lastgaelam = delta + args.ppo.gamma * args.ppo.lam * lastgaelam
+                advantages_reversed.append(lastgaelam)
+            advantages = torch.stack(advantages_reversed[::-1], axis=1)
+            returns = advantages + values
+            advantages = whiten(advantages)
+
         # Do multiple epochs of PPO training, with a fresh random shuffle in each epoch
         for ppo_epoch_idx in range(args.ppo.noptepochs):
             order = np.random.permutation(args.ppo.local_batch_size)
             for mb_start in range(0, args.ppo.local_batch_size, args.ppo.local_mini_batch_size):
                 # The reference codebase does not use minibatch really but we should implement it
                 # TODO: implmenet mini batch size
-                with torch.no_grad():
-                    lastgaelam = 0
-                    advantages_reversed = []
-                    gen_length = args.task.response_length
-                    for t in reversed(range(gen_length)):
-                        nextvalues = values[:, t + 1] if t < gen_length - 1 else 0.0
-                        delta = rewards[:, t] + args.ppo.gamma * nextvalues - values[:, t]
-                        lastgaelam = delta + args.ppo.gamma * args.ppo.lam * lastgaelam
-                        advantages_reversed.append(lastgaelam)
-                    advantages = torch.stack(advantages_reversed[::-1], axis=1)
-                    returns = advantages + values
-                    advantages = whiten(advantages)
 
                 output, vpred_temp = forward(policy, query_responses, tokenizer)
                 logits = output.logits[:,context_length-1:-1]
@@ -464,7 +466,7 @@ def train(args: Args):
                 new_all_logprobs = F.log_softmax(logits, dim=-1)
                 new_logprobs = torch.gather(new_all_logprobs, 2, responses.unsqueeze(-1)).squeeze(-1)
                 vpred = vpred_temp[:,context_length-1:-1].squeeze(-1)
-                vpredclipped = torch.clamp(vpred, values - args.ppo.cliprange_value, values + args.ppo.cliprange_value)
+                vpredclipped = torch.clamp(vpred, vpred - args.ppo.cliprange_value, vpred + args.ppo.cliprange_value)
                 vf_losses1 = torch.square(vpred - returns)
                 vf_losses2 = torch.square(vpredclipped - returns)
                 vf_loss = 0.5 * torch.max(vf_losses1, vf_losses2).mean()

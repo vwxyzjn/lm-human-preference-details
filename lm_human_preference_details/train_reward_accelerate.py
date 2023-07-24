@@ -73,6 +73,8 @@ class Args:
     """per rank batch size"""
     lr: float = 0.00005
     """the learning rate"""
+    eps: float = 1e-5
+    """the epsilon for AdamW"""
     local_rollout_batch_size: int = 512
     """per rank rollot batch size"""
     world_size: tyro.conf.Suppress[int] = None
@@ -338,7 +340,7 @@ def train(args: Args):
     reward_model = AutoModelForCausalLMWithRewardHead(AutoModelForCausalLM.from_pretrained(args.base_model)).to(device)
     reward_model.pretrained_model.generation_config.eos_token_id = None  # disable `pad_token_id` and `eos_token_id` because we just want to
     reward_model.pretrained_model.generation_config.pad_token_id = None  # generate tokens without truncation / padding
-    optimizer = optim.AdamW(reward_model.parameters(), lr=args.lr, eps=1e-5)
+    optimizer = optim.AdamW(reward_model.parameters(), lr=args.lr, eps=args.eps)
     dataset = MyDataset(
         DATASET[args.task.query_dataset],
         tokenizer,
