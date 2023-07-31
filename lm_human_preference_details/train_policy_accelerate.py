@@ -290,8 +290,7 @@ def forward(policy, query_responses, tokenizer):
         output_hidden_states=True,
     )
 
-# if __name__ == "__main__":
-#     args = tyro.cli(Args)
+
 def train(args: Args):
     accelerator = Accelerator()
     args.ppo.world_size = accelerator.num_processes
@@ -351,8 +350,8 @@ def train(args: Args):
     policy.pretrained_model.generation_config.eos_token_id = None  # disable `pad_token_id` and `eos_token_id` because we just want to
     policy.pretrained_model.generation_config.pad_token_id = None  # generate tokens without truncation / padding
     # IMPORTANT: Layer norm produces weird gradients, which affects Adam optimizer to impact all the parameters systematically
-    # In comparison, SGD does not appear to have this issue. TODO: add a link to the issue
-    optimizer = optim.AdamW(policy.parameters(), lr=args.ppo.lr, eps=args.ppo.eps)
+    # see https://github.com/pytorch/pytorch/issues/104857 for more details
+    optimizer = optim.Adam(policy.parameters(), lr=args.ppo.lr, eps=1e-5)
     dataset = MyDataset(
         DATASET[args.task.query_dataset],
         tokenizer,
@@ -413,7 +412,6 @@ def train(args: Args):
             postprocessed_responses = torch.where(truncate_mask, torch.full_like(responses, tokenizer.pad_token_id), responses)
 
             # 2. run reward model on the truncated responses
-            # TODO: fix position ids
             postprocessed_query_responses = torch.cat((queries, postprocessed_responses), 1)
             scores = get_reward(reward_model, postprocessed_query_responses, tokenizer).flatten()
 

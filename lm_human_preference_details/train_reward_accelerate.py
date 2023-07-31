@@ -292,8 +292,6 @@ def normalize(args, accelerator, device, tokenizer, pretrained_model, reward_mod
         print(f"after mean: {mean}, after std: {std}")
 
 
-# if __name__ == "__main__":
-#     args = tyro.cli(Args)
 def train(args: Args):
     accelerator = Accelerator(
         kwargs_handlers=[DistributedDataParallelKwargs(broadcast_buffers=False)] # this is needed to avoid https://github.com/pytorch/pytorch/issues/22095#issuecomment-505099500
@@ -340,7 +338,7 @@ def train(args: Args):
     reward_model = AutoModelForCausalLMWithRewardHead(AutoModelForCausalLM.from_pretrained(args.base_model)).to(device)
     reward_model.pretrained_model.generation_config.eos_token_id = None  # disable `pad_token_id` and `eos_token_id` because we just want to
     reward_model.pretrained_model.generation_config.pad_token_id = None  # generate tokens without truncation / padding
-    optimizer = optim.AdamW(reward_model.parameters(), lr=args.lr, eps=args.eps)
+    optimizer = optim.Adam(reward_model.parameters(), lr=args.lr, eps=args.eps)
     dataset = MyDataset(
         DATASET[args.task.query_dataset],
         tokenizer,
@@ -491,9 +489,10 @@ def train(args: Args):
                 )  # shape (batch_size, num_labels), basically a reward prediction for each label
                 accuracy = (predicted_rewards.argmax(1) == mb_best).float().mean()
                 test_accuracies.append(accuracy)
-            writer.add_scalar("test/accuracy", accelerator.gather(torch.stack(test_accuracies).mean()).mean().item(), global_step)
+            test_accuracy = accelerator.gather(torch.stack(test_accuracies).mean()).mean().item()
+            writer.add_scalar("test/accuracy", test_accuracy, global_step)
             if accelerator.is_main_process:
-                print("test/accuracy", accelerator.gather(torch.stack(test_accuracies).mean()).mean().item(), global_step)
+                print("test/accuracy", test_accuracy, global_step)
 
     torch.cuda.empty_cache()
     if args.normalize_after:
