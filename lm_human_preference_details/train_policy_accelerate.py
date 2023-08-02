@@ -120,7 +120,7 @@ class AdamTensorFlowStyle(optim.Optimizer):
         defaults = dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay)
         super(AdamTensorFlowStyle, self).__init__(params, defaults)
 
-    def step(self):
+    def step(self, unknown=None):
         loss = None
         for group in self.param_groups:
             for p in group['params']:
