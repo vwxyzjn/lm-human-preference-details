@@ -523,6 +523,11 @@ def train(args: Args):
 
     print("===training policy===")
     global_step = 0
+    approxkls = torch.zeros((args.ppo.noptepochs, args.ppo.nminibatches), device=device)
+    clipfracs = torch.zeros((args.ppo.noptepochs, args.ppo.nminibatches), device=device)
+    pg_losses = torch.zeros((args.ppo.noptepochs, args.ppo.nminibatches), device=device)
+    vf_losses = torch.zeros((args.ppo.noptepochs, args.ppo.nminibatches), device=device)
+    entropies = torch.zeros((args.ppo.noptepochs, args.ppo.nminibatches), device=device)
     for update in range(1, args.ppo.num_updates + 1):
         global_step += 1 * args.ppo.batch_size
         frac = 1.0 - (update - 1.0) / args.ppo.num_updates
@@ -599,8 +604,15 @@ def train(args: Args):
             advantages = whiten(advantages)
 
         # Do multiple epochs of PPO training, with a fresh random shuffle in each epoch
+
+        approxkls = torch.zeros((args.ppo.noptepochs, args.ppo.nminibatches), device=device)
+        clipfracs = torch.zeros((args.ppo.noptepochs, args.ppo.nminibatches), device=device)
+        pg_losses = torch.zeros((args.ppo.noptepochs, args.ppo.nminibatches), device=device)
+        vf_losses = torch.zeros((args.ppo.noptepochs, args.ppo.nminibatches), device=device)
+        entropies = torch.zeros((args.ppo.noptepochs, args.ppo.nminibatches), device=device)
         for ppo_epoch_idx in range(args.ppo.noptepochs):
             order = np.random.permutation(args.ppo.local_batch_size)
+            minibatch_idx = 0
             for mb_start in range(0, args.ppo.local_batch_size, args.ppo.local_mini_batch_size):
                 # The reference codebase does not use minibatch really but we should implement it
                 # TODO: implmenet mini batch size
@@ -631,6 +643,12 @@ def train(args: Args):
                 approxkl = .5 * (logprobs_diff ** 2).mean()
                 return_mean, return_var = returns.mean(), returns.var()
                 value_mean, value_var = values.mean(), values.var()
+                approxkls[ppo_epoch_idx, minibatch_idx] = approxkl
+                clipfracs[ppo_epoch_idx, minibatch_idx] = pg_clipfrac
+                pg_losses[ppo_epoch_idx, minibatch_idx] = pg_loss
+                vf_losses[ppo_epoch_idx, minibatch_idx] = vf_loss
+                entropies[ppo_epoch_idx, minibatch_idx] = entropy.mean()
+                minibatch_idx += 1
             if accelerator.is_main_process:
                 console.print(f"ppo_epoch_idx", ppo_epoch_idx, "approxkl", approxkl.item(), "pg_loss", pg_loss.item(), "pg_clipfrac", pg_clipfrac.item(), "ratio", ratio.mean().item())
 
@@ -650,6 +668,11 @@ def train(args: Args):
         writer.add_scalar("ppo/policy/entropy", accelerator.gather(entropy.mean()).mean().item(), update)
         writer.add_scalar("ppo/policy/approxkl", accelerator.gather(approxkl).mean().item(), update)
         writer.add_scalar("ppo/policy/clipfrac", accelerator.gather(pg_clipfrac).mean().item(), update)
+        writer.add_scalar("ppo/policy/approxkl_avg", accelerator.gather(approxkls).mean().item(), update)
+        writer.add_scalar("ppo/policy/clipfrac_avg", accelerator.gather(clipfracs).mean().item(), update)
+        writer.add_scalar("ppo/loss/policy_avg", accelerator.gather(pg_losses).mean().item(), update)
+        writer.add_scalar("ppo/loss/value_avg", accelerator.gather(vf_losses).mean().item(), update)
+        writer.add_scalar("ppo/policy/entropy_avg", accelerator.gather(entropies).mean().item(), update)
         writer.add_scalar("ppo/returns/mean", accelerator.gather(return_mean).mean().item(), update)
         writer.add_scalar("ppo/returns/var", accelerator.gather(return_var).mean().item(), update)
         writer.add_scalar("ppo/val/vpred", accelerator.gather(vpred.mean()).mean().item(), update)
