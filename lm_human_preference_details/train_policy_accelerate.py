@@ -109,45 +109,150 @@ class Args:
     ppo: PpoHParams = field(default_factory=PpoHParams)
 
 
-class AdamTensorFlowStyle(optim.Optimizer):
-    """https://gist.github.com/aerinkim/dfe3da1000e67aced1c7d9279351cb88
-    Adam algorithm with TensorFlow style update: it uses the
-    formulation just before Section 2.1 of the Kingma and Ba paper rather than
-    the formulation in Algorithm 1, the "epsilon" referred to here is "epsilon
-    hat" in the paper.
-    """
-    def __init__(self, params, lr=1e-3, betas=(0.9, 0.99), eps=1e-8, weight_decay=0):
-        defaults = dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay)
-        super(AdamTensorFlowStyle, self).__init__(params, defaults)
+from torch import Tensor, optim
+from typing import List, Optional
+from torch.optim.optimizer import _use_grad_for_differentiable, _get_value, _dispatch_sqrt
 
-    def step(self, unknown=None):
+
+def _single_tensor_adam(params: List[Tensor],
+                        grads: List[Tensor],
+                        exp_avgs: List[Tensor],
+                        exp_avg_sqs: List[Tensor],
+                        max_exp_avg_sqs: List[Tensor],
+                        state_steps: List[Tensor],
+                        grad_scale: Optional[Tensor],
+                        found_inf: Optional[Tensor],
+                        *,
+                        amsgrad: bool,
+                        beta1: float,
+                        beta2: float,
+                        lr: float,
+                        weight_decay: float,
+                        eps: float,
+                        maximize: bool,
+                        capturable: bool,
+                        differentiable: bool):
+
+    assert grad_scale is None and found_inf is None
+
+    for i, param in enumerate(params):
+        grad = grads[i] if not maximize else -grads[i]
+        exp_avg = exp_avgs[i]
+        exp_avg_sq = exp_avg_sqs[i]
+        step_t = state_steps[i]
+        # update step
+        step_t += 1
+        # Decay the first and second moment running average coefficient
+        exp_avg.mul_(beta1).add_(grad, alpha=1 - beta1)
+        exp_avg_sq.mul_(beta2).addcmul_(grad, grad.conj(), value=1 - beta2)
+        step = _get_value(step_t)
+        
+        ### pytorch adam implementation:
+        # bias_correction1 = 1 - beta1 ** step
+        # bias_correction2 = 1 - beta2 ** step
+        # step_size = lr / bias_correction1
+        # bias_correction2_sqrt = _dispatch_sqrt(bias_correction2)
+        # denom = (exp_avg_sq.sqrt() / bias_correction2_sqrt).add_(eps)
+        # param.addcdiv_(exp_avg, denom, value=-step_size)
+
+        ### tensorflow adam implementation:
+        lr_t = lr * _dispatch_sqrt((1 - beta2 ** step)) / (1 - beta1 ** step)
+        denom = exp_avg_sq.sqrt().add_(eps)
+        param.addcdiv_(exp_avg, denom, value=-lr_t)
+
+
+def adam(params: List[Tensor],
+         grads: List[Tensor],
+         exp_avgs: List[Tensor],
+         exp_avg_sqs: List[Tensor],
+         max_exp_avg_sqs: List[Tensor],
+         state_steps: List[Tensor],
+         # kwonly args with defaults are not supported by functions compiled with torchscript issue #70627
+         # setting this as kwarg for now as functional API is compiled by torch/distributed/optim
+         foreach: Optional[bool] = None,
+         capturable: bool = False,
+         differentiable: bool = False,
+         fused: Optional[bool] = None,
+         grad_scale: Optional[Tensor] = None,
+         found_inf: Optional[Tensor] = None,
+         *,
+         amsgrad: bool,
+         beta1: float,
+         beta2: float,
+         lr: float,
+         weight_decay: float,
+         eps: float,
+         maximize: bool):
+    
+    func = _single_tensor_adam
+
+    func(params,
+         grads,
+         exp_avgs,
+         exp_avg_sqs,
+         max_exp_avg_sqs,
+         state_steps,
+         amsgrad=amsgrad,
+         beta1=beta1,
+         beta2=beta2,
+         lr=lr,
+         weight_decay=weight_decay,
+         eps=eps,
+         maximize=maximize,
+         capturable=capturable,
+         differentiable=differentiable,
+         grad_scale=grad_scale,
+         found_inf=found_inf)
+
+class AdamTensorFlowStyle(optim.Adam):
+    @_use_grad_for_differentiable
+    def step(self, closure=None):
+        self._cuda_graph_capture_health_check()
         loss = None
-        for group in self.param_groups:
-            for p in group['params']:
-                grad = p.grad.data
-                state = self.state[p]
-                # State initialization
-                if len(state) == 0:
-                    state['step'] = 0
-                    state['exp_avg'] = torch.zeros_like(p.data)
-                    state['exp_avg_sq'] = torch.zeros_like(p.data)
-                exp_avg, exp_avg_sq = state['exp_avg'], state['exp_avg_sq']
-                b1, b2 = group['betas']
-                state['step'] += 1
-                if group['weight_decay'] != 0:
-                    grad = grad.add(group['weight_decay'], p.data)
-                exp_avg = torch.mul(exp_avg, b1) + (1 - b1)*grad
-                exp_avg_sq = torch.mul(exp_avg_sq, b2) + (1-b2)*(grad*grad)
-                denom = exp_avg_sq.sqrt() + group['eps']
-                # pytorch adam implementation: 
-                # bias_correction1 = 1 / (1 - b1 ** state['step'])
-                # bias_correction2 = 1 / (1 - b2 ** state['step'])
-                # adapted_learning_rate = group['lr'] * bias_correction1 / math.sqrt(bias_correction2)
-                # p.data = p.data - adapted_learning_rate * exp_avg / denom
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
 
-                # tensorflow adam implementation:
-                lr = group['lr'] * np.sqrt(1 - b2 ** state['step']) / (1 - b1 ** state['step'])
-                p.data = p.data - lr * exp_avg / denom
+        for group in self.param_groups:
+            params_with_grad = []
+            grads = []
+            exp_avgs = []
+            exp_avg_sqs = []
+            max_exp_avg_sqs = []
+            state_steps = []
+            beta1, beta2 = group['betas']
+
+            self._init_group(
+                group,
+                params_with_grad,
+                grads,
+                exp_avgs,
+                exp_avg_sqs,
+                max_exp_avg_sqs,
+                state_steps)
+
+            adam(
+                params_with_grad,
+                grads,
+                exp_avgs,
+                exp_avg_sqs,
+                max_exp_avg_sqs,
+                state_steps,
+                amsgrad=group['amsgrad'],
+                beta1=beta1,
+                beta2=beta2,
+                lr=group['lr'],
+                weight_decay=group['weight_decay'],
+                eps=group['eps'],
+                maximize=group['maximize'],
+                foreach=group['foreach'],
+                capturable=group['capturable'],
+                differentiable=group['differentiable'],
+                fused=group['fused'],
+                grad_scale=getattr(self, "grad_scale", None),
+                found_inf=getattr(self, "found_inf", None),
+            )
+
         return loss
 
 
