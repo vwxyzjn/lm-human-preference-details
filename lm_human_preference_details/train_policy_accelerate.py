@@ -109,6 +109,48 @@ class Args:
     ppo: PpoHParams = field(default_factory=PpoHParams)
 
 
+class AdamTensorFlowStyle(optim.Optimizer):
+    """https://gist.github.com/aerinkim/dfe3da1000e67aced1c7d9279351cb88
+    Adam algorithm with TensorFlow style update: it uses the
+    formulation just before Section 2.1 of the Kingma and Ba paper rather than
+    the formulation in Algorithm 1, the "epsilon" referred to here is "epsilon
+    hat" in the paper.
+    """
+    def __init__(self, params, lr=1e-3, betas=(0.9, 0.99), eps=1e-8, weight_decay=0):
+        defaults = dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay)
+        super(AdamTensorFlowStyle, self).__init__(params, defaults)
+
+    def step(self):
+        loss = None
+        for group in self.param_groups:
+            for p in group['params']:
+                grad = p.grad.data
+                state = self.state[p]
+                # State initialization
+                if len(state) == 0:
+                    state['step'] = 0
+                    state['exp_avg'] = torch.zeros_like(p.data)
+                    state['exp_avg_sq'] = torch.zeros_like(p.data)
+                exp_avg, exp_avg_sq = state['exp_avg'], state['exp_avg_sq']
+                b1, b2 = group['betas']
+                state['step'] += 1
+                if group['weight_decay'] != 0:
+                    grad = grad.add(group['weight_decay'], p.data)
+                exp_avg = torch.mul(exp_avg, b1) + (1 - b1)*grad
+                exp_avg_sq = torch.mul(exp_avg_sq, b2) + (1-b2)*(grad*grad)
+                denom = exp_avg_sq.sqrt() + group['eps']
+                # pytorch adam implementation: 
+                # bias_correction1 = 1 / (1 - b1 ** state['step'])
+                # bias_correction2 = 1 / (1 - b2 ** state['step'])
+                # adapted_learning_rate = group['lr'] * bias_correction1 / math.sqrt(bias_correction2)
+                # p.data = p.data - adapted_learning_rate * exp_avg / denom
+
+                # tensorflow adam implementation:
+                lr = group['lr'] * np.sqrt(1 - b2 ** state['step']) / (1 - b1 ** state['step'])
+                p.data = p.data - lr * exp_avg / denom
+        return loss
+
+
 class AdaptiveKLController:
     def __init__(self, init_kl_coef: float, hparams: AdaptiveKLParams):
         self.value = init_kl_coef
@@ -351,7 +393,7 @@ def train(args: Args):
     policy.pretrained_model.generation_config.pad_token_id = None  # generate tokens without truncation / padding
     # IMPORTANT: Layer norm produces weird gradients, which affects Adam optimizer to impact all the parameters systematically
     # see https://github.com/pytorch/pytorch/issues/104857 for more details
-    optimizer = optim.Adam(policy.parameters(), lr=args.ppo.lr, eps=args.ppo.eps)
+    optimizer = AdamTensorFlowStyle(policy.parameters(), lr=args.ppo.lr, eps=args.ppo.eps)
     dataset = MyDataset(
         DATASET[args.task.query_dataset],
         tokenizer,
