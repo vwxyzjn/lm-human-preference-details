@@ -351,7 +351,7 @@ def train(args: Args):
     policy.pretrained_model.generation_config.pad_token_id = None  # generate tokens without truncation / padding
     # IMPORTANT: Layer norm produces weird gradients, which affects Adam optimizer to impact all the parameters systematically
     # see https://github.com/pytorch/pytorch/issues/104857 for more details
-    optimizer = optim.Adam(policy.parameters(), lr=args.ppo.lr, eps=1e-5)
+    optimizer = optim.Adam(policy.parameters(), lr=args.ppo.lr, eps=args.ppo.eps)
     dataset = MyDataset(
         DATASET[args.task.query_dataset],
         tokenizer,
