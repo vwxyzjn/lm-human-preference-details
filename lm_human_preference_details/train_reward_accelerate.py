@@ -307,7 +307,7 @@ class AutoModelForCausalLMWithRewardHead(nn.Module):
 
 # a pytorch dataset
 class MyDataset(IterableDataset):
-    def __init__(self, generator, tokenizer, query_length, start_text=None, end_text=None, seed=None):
+    def __init__(self, generator, tokenizer, query_length, seed, start_text=None, end_text=None):
         self.generator = generator
         self.tokenizer = tokenizer
         self.query_length = query_length
@@ -470,10 +470,14 @@ def train(args: Args):
         )
         pprint(args)
     device = accelerator.device
-    args.seed += accelerator.process_index
-    random.seed(args.seed)
-    np.random.seed(args.seed)
-    torch.manual_seed(args.seed)
+    # jax-style rng key generation; so that the rng keys are not continuous / sequential (e.g., [1, 2, 3, 4])
+    # they should be like [1715945195,  504011663, 1037299162, ...]
+    rng = np.random.default_rng(args.seed)
+    rng_keys = rng.integers(low=1, high=np.iinfo(np.int32).max, size=(accelerator.num_processes,))
+    local_seed = rng_keys[accelerator.process_index]
+    random.seed(local_seed)
+    np.random.seed(local_seed)
+    torch.manual_seed(local_seed)
     torch.backends.cudnn.deterministic = True
     tokenizer = AutoTokenizer.from_pretrained(
         args.base_model,
@@ -490,6 +494,7 @@ def train(args: Args):
         DATASET[args.task.query_dataset],
         tokenizer,
         args.task.query_length,
+        seed=local_seed,
         start_text=args.task.start_text,
         end_text=args.task.end_text,
     )
