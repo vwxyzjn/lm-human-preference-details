@@ -453,6 +453,7 @@ def train(args: Args):
     run_name = f"{args.exp_name}__{args.seed}__{int(time.time())}"
     writer = SimpleNamespace() # dummy writer
     writer.add_scalar = lambda x, y, z: None
+    writer.add_histogram = lambda x, y, z: None
     if accelerator.is_main_process:
         if args.track:
             import wandb
