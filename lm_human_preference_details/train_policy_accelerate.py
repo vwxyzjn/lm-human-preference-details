@@ -108,6 +108,8 @@ class Args:
     """How often to print sample output"""
     save_path: str = "models/policy.pt"
     """Where to save the model"""
+    use_tensorflow_adam: bool = True
+    """Whether to use tensorflow-style Adam optimizer instead of PyTorch's"""
     task: TaskHParams = field(default_factory=TaskHParams)
     rewards: RewardHParams = field(default_factory=RewardHParams)
     ppo: PpoHParams = field(default_factory=PpoHParams)
@@ -480,7 +482,10 @@ def train(args: Args):
     policy.pretrained_model.generation_config.pad_token_id = None  # generate tokens without truncation / padding
     # IMPORTANT: Layer norm produces weird gradients, which affects Adam optimizer to impact all the parameters systematically
     # see https://github.com/pytorch/pytorch/issues/104857 for more details
-    optimizer = AdamTensorFlowStyle(policy.parameters(), lr=args.ppo.lr, eps=args.ppo.eps)
+    if args.use_tensorflow_adam:
+        optimizer = AdamTensorFlowStyle(policy.parameters(), lr=args.ppo.lr, eps=args.ppo.eps)
+    else:
+        optimizer = optim.Adam(policy.parameters(), lr=args.ppo.lr, eps=args.ppo.eps)
     dataset = MyDataset(
         DATASET[args.task.query_dataset],
         tokenizer,

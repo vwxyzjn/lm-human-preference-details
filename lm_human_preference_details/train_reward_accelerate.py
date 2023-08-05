@@ -97,6 +97,8 @@ class Args:
     """How often to print sample output"""
     save_path: str = "models/reward.pt"
     """Where to save the model"""
+    use_tensorflow_adam: bool = True
+    """Whether to use tensorflow-style Adam optimizer instead of PyTorch's"""
     task: TaskHParams = field(default_factory=TaskHParams)
     labels: LabelHParams = field(default_factory=LabelHParams)
 
@@ -478,7 +480,10 @@ def train(args: Args):
     reward_model = AutoModelForCausalLMWithRewardHead(AutoModelForCausalLM.from_pretrained(args.base_model)).to(device)
     reward_model.pretrained_model.generation_config.eos_token_id = None  # disable `pad_token_id` and `eos_token_id` because we just want to
     reward_model.pretrained_model.generation_config.pad_token_id = None  # generate tokens without truncation / padding
-    optimizer = AdamTensorFlowStyle(reward_model.parameters(), lr=args.lr, eps=args.eps)
+    if args.use_tensorflow_adam:
+        optimizer = AdamTensorFlowStyle(reward_model.parameters(), lr=args.lr, eps=args.eps)
+    else:
+        optimizer = optim.Adam(reward_model.parameters(), lr=args.lr, eps=args.eps)
     dataset = MyDataset(
         DATASET[args.task.query_dataset],
         tokenizer,
