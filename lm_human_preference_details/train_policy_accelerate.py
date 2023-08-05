@@ -42,6 +42,10 @@ class PpoHParams:
     local_mini_batch_size: tyro.conf.Suppress[int] = None
     batch_size: tyro.conf.Suppress[int] = None
     mini_batch_size: tyro.conf.Suppress[int] = None
+    gradient_accumulation_steps: int = 1
+    """gradient accumulation steps"""
+    local_micro_batch_size: tyro.conf.Suppress[int] = None
+    """per rank micro batch size"""
     world_size: tyro.conf.Suppress[int] = None
     batch_size: tyro.conf.Suppress[int] = None
     minibatch_size: tyro.conf.Suppress[int] = None
@@ -282,35 +286,11 @@ def whiten(values, shift_mean=True):
     return whitened
 
 
-class ScalarHead(nn.Module):
-    def __init__(self, config, scale=None, **kwargs):
-        super().__init__()
-        if not hasattr(config, "summary_dropout_prob"):
-            summary_dropout_prob = kwargs.pop("summary_dropout_prob", 0.1)
-        else:
-            summary_dropout_prob = config.summary_dropout_prob
-        self.dropout = nn.Dropout(summary_dropout_prob) if summary_dropout_prob else nn.Identity()
-        # some models such as OPT have a projection layer before the word embeddings - e.g. OPT-350m
-        if hasattr(config, "word_embed_proj_dim"):
-            hidden_size = config.word_embed_proj_dim
-        else:
-            hidden_size = config.hidden_size
-        if scale is None:
-            scale = 1 / np.sqrt(hidden_size + 1)
-        self.summary = layer_init(nn.Linear(hidden_size, 1), std=scale)
-        self.flatten = nn.Flatten()
-
-    def forward(self, hidden_states):
-        output = self.dropout(hidden_states)
-        output = self.summary(output)
-        return output
-
-
 class AutoModelForCausalLMWithScalarHead(nn.Module):
     def __init__(self, pretrained_model):
         super().__init__()
         self.pretrained_model = pretrained_model
-        self.scalar_head = ScalarHead(self.pretrained_model.config, scale=0.0)
+        self.scalar_head = layer_init(nn.Linear(pretrained_model.config.hidden_size, 1), std=0)
 
     def forward(self, **kwargs):
         output = self.pretrained_model(**kwargs)
@@ -321,7 +301,7 @@ class AutoModelForCausalLMWithRewardHead(nn.Module):
     def __init__(self, pretrained_model):
         super().__init__()
         self.pretrained_model = pretrained_model
-        self.scalar_head = ScalarHead(self.pretrained_model.config)
+        self.scalar_head = layer_init(nn.Linear(pretrained_model.config.hidden_size, 1), std=1 / np.sqrt(pretrained_model.config.hidden_size + 1))
         self.reward_gain = torch.nn.Parameter(torch.tensor(1.0), requires_grad=True)
         self.reward_bias = torch.nn.Parameter(torch.tensor(0.0), requires_grad=True)
 
@@ -436,12 +416,12 @@ def forward(policy, query_responses, tokenizer):
 
 
 def train(args: Args):
-    accelerator = Accelerator()
+    accelerator = Accelerator(gradient_accumulation_steps=args.ppo.gradient_accumulation_steps)
     args.ppo.world_size = accelerator.num_processes
     args.ppo.batch_size = int(args.ppo.local_batch_size * args.ppo.world_size)
     args.ppo.minibatch_size = exact_div(args.ppo.batch_size, args.ppo.nminibatches)
-
     args.ppo.local_mini_batch_size = exact_div(args.ppo.local_batch_size, args.ppo.nminibatches)
+    args.ppo.local_micro_batch_size = exact_div(args.ppo.local_mini_batch_size, args.ppo.gradient_accumulation_steps)
     if args.ppo.whiten_rewards:
         assert args.ppo.local_mini_batch_size >= 8, \
             f"Per-rank minibatch size {args.ppo.local_mini_batch_size} is insufficient for whitening"
@@ -526,11 +506,11 @@ def train(args: Args):
 
     print("===training policy===")
     global_step = 0
-    approxkls = torch.zeros((args.ppo.noptepochs, args.ppo.nminibatches), device=device)
-    clipfracs = torch.zeros((args.ppo.noptepochs, args.ppo.nminibatches), device=device)
-    pg_losses = torch.zeros((args.ppo.noptepochs, args.ppo.nminibatches), device=device)
-    vf_losses = torch.zeros((args.ppo.noptepochs, args.ppo.nminibatches), device=device)
-    entropies = torch.zeros((args.ppo.noptepochs, args.ppo.nminibatches), device=device)
+    approxkls_stats = torch.zeros((args.ppo.noptepochs, args.ppo.nminibatches, args.ppo.gradient_accumulation_steps), device=device)
+    clipfracs_stats = torch.zeros((args.ppo.noptepochs, args.ppo.nminibatches, args.ppo.gradient_accumulation_steps), device=device)
+    pg_losses_stats = torch.zeros((args.ppo.noptepochs, args.ppo.nminibatches, args.ppo.gradient_accumulation_steps), device=device)
+    vf_losses_stats = torch.zeros((args.ppo.noptepochs, args.ppo.nminibatches, args.ppo.gradient_accumulation_steps), device=device)
+    entropies_stats = torch.zeros((args.ppo.noptepochs, args.ppo.nminibatches, args.ppo.gradient_accumulation_steps), device=device)
     for update in range(1, args.ppo.num_updates + 1):
         global_step += 1 * args.ppo.batch_size
         frac = 1.0 - (update - 1.0) / args.ppo.num_updates
@@ -550,12 +530,14 @@ def train(args: Args):
             all_logprobs = F.log_softmax(logits, dim=-1)
             logprobs = torch.gather(all_logprobs, 2, responses.unsqueeze(-1)).squeeze(-1)
             values = accelerator.unwrap_model(policy).scalar_head(output.hidden_states[-1][:,context_length-1:-1]).squeeze(-1)
+            del output, logits, all_logprobs; torch.cuda.empty_cache()
 
             ref_output, _ = forward(ref_policy, query_responses, tokenizer)
             ref_logits = ref_output.logits[:,context_length-1:-1]
             ref_logits /= args.task.temperature
             ref_all_logprobs = F.log_softmax(ref_logits, dim=-1)
             ref_logprobs = torch.gather(ref_all_logprobs, 2, responses.unsqueeze(-1)).squeeze(-1)
+            del ref_output, ref_logits, ref_all_logprobs; torch.cuda.empty_cache()
 
             # **Response Processing**
             # 1. truncate at the first occurrence of `truncate_token` that appears at or after
@@ -565,6 +547,7 @@ def train(args: Args):
             truncate_after_or_token_mask = torch.cat([torch.zeros_like(truncate_token_mask)[:,:args.task.truncate_after], truncate_token_mask[:,args.task.truncate_after:]], dim=1)
             truncate_mask = (torch.cumsum(truncate_after_or_token_mask, dim=1) - truncate_after_or_token_mask.long()).bool()
             postprocessed_responses = torch.where(truncate_mask, torch.full_like(responses, tokenizer.pad_token_id), responses)
+            del truncate_token_mask, truncate_after_or_token_mask, truncate_mask; torch.cuda.empty_cache()
 
             # 2. run reward model on the truncated responses
             postprocessed_query_responses = torch.cat((queries, postprocessed_responses), 1)
@@ -576,6 +559,7 @@ def train(args: Args):
             matches_token = (postprocessed_responses[:, args.task.truncate_after:] == args.task.truncate_token)
             filter_mask = torch.any(matches_token, dim=-1)
             scores = torch.where(filter_mask, scores, torch.full_like(scores, args.task.penalty_reward_value))
+            del matches_token, filter_mask; torch.cuda.empty_cache()
 
             # 4. compute rewards
             kl = logprobs - ref_logprobs
@@ -590,10 +574,12 @@ def train(args: Args):
                 sample_kl = kl[0].sum().item()
                 postprocessed_responses = postprocessed_query_responses[:,context_length:]
                 console.print(f"[green]{tokenizer.decode(queries[0], skip_special_tokens=True)}[/]\n[yellow]{tokenizer.decode(postprocessed_responses[0], skip_special_tokens=True)}[/]\n[blue](NO POST-PROCESSING){tokenizer.decode(responses[0], skip_special_tokens=True)}[/]\n[red]score: {scores[0]}, kl: {kl[0].sum().item()}, total reward: {scores[0] - kl_ctl.value * sample_kl} [/]")
-            except:
+            except Exception as e:
+                print(e)
                 pass
-
-        with torch.no_grad():
+            del postprocessed_query_responses; torch.cuda.empty_cache()
+            
+            # 6. compute advantages and returns
             lastgaelam = 0
             advantages_reversed = []
             gen_length = args.task.response_length
@@ -607,91 +593,98 @@ def train(args: Args):
             advantages = whiten(advantages)
 
         # Do multiple epochs of PPO training, with a fresh random shuffle in each epoch
-
-        approxkls = torch.zeros((args.ppo.noptepochs, args.ppo.nminibatches), device=device)
-        clipfracs = torch.zeros((args.ppo.noptepochs, args.ppo.nminibatches), device=device)
-        pg_losses = torch.zeros((args.ppo.noptepochs, args.ppo.nminibatches), device=device)
-        vf_losses = torch.zeros((args.ppo.noptepochs, args.ppo.nminibatches), device=device)
-        entropies = torch.zeros((args.ppo.noptepochs, args.ppo.nminibatches), device=device)
         for ppo_epoch_idx in range(args.ppo.noptepochs):
-            order = np.random.permutation(args.ppo.local_batch_size)
+            b_inds = np.random.permutation(args.ppo.local_batch_size)
             minibatch_idx = 0
-            for mb_start in range(0, args.ppo.local_batch_size, args.ppo.local_mini_batch_size):
-                # The reference codebase does not use minibatch really but we should implement it
-                # TODO: implmenet mini batch size
+            for mini_batch_start in range(0, args.ppo.local_batch_size, args.ppo.local_mini_batch_size):
+                mini_batch_end = mini_batch_start + args.ppo.local_mini_batch_size
+                mini_batch_inds = b_inds[mini_batch_start:mini_batch_end]
+                gradient_accumulation_idx = 0
+                with accelerator.accumulate(policy):
+                    for micro_batch_start in range(0, args.ppo.local_mini_batch_size, args.ppo.local_micro_batch_size):
+                        micro_batch_end = micro_batch_start + args.ppo.local_micro_batch_size 
+                        micro_batch_inds = mini_batch_inds[micro_batch_start:micro_batch_end]
+                        mb_return = returns[micro_batch_inds]
+                        mb_advantage = advantages[micro_batch_inds]
+                        mb_responses = responses[micro_batch_inds]
+                        mb_query_responses = query_responses[micro_batch_inds]
+                        mb_logprobs = logprobs[micro_batch_inds]
 
-                output, vpred_temp = forward(policy, query_responses, tokenizer)
-                logits = output.logits[:,context_length-1:-1]
-                logits /= args.task.temperature
-                new_all_logprobs = F.log_softmax(logits, dim=-1)
-                new_logprobs = torch.gather(new_all_logprobs, 2, responses.unsqueeze(-1)).squeeze(-1)
-                vpred = vpred_temp[:,context_length-1:-1].squeeze(-1)
-                vpredclipped = torch.clamp(vpred, vpred - args.ppo.cliprange_value, vpred + args.ppo.cliprange_value)
-                vf_losses1 = torch.square(vpred - returns)
-                vf_losses2 = torch.square(vpredclipped - returns)
-                vf_loss = 0.5 * torch.max(vf_losses1, vf_losses2).mean()
-                vf_clipfrac = (vf_losses2 > vf_losses1).float().mean()
-                logprobs_diff = new_logprobs - logprobs
-                ratio = torch.exp(logprobs_diff)
-                pg_losses = -advantages * ratio
-                pg_losses2 = -advantages * torch.clamp(ratio, 1.0 - args.ppo.cliprange, 1.0 + args.ppo.cliprange)
-                pg_loss = torch.max(pg_losses, pg_losses2).mean()
-                pg_clipfrac = (pg_losses2 > pg_losses).float().mean()
-                loss = pg_loss + args.ppo.vf_coef * vf_loss
-                optimizer.zero_grad()
-                accelerator.backward(loss)
-                optimizer.step()
-                pd = torch.nn.functional.softmax(logits, dim=-1)
-                entropy = torch.logsumexp(logits, dim=-1) - torch.sum(pd * logits, dim=-1)
-                approxkl = .5 * (logprobs_diff ** 2).mean()
-                return_mean, return_var = returns.mean(), returns.var()
-                value_mean, value_var = values.mean(), values.var()
-                approxkls[ppo_epoch_idx, minibatch_idx] = approxkl
-                clipfracs[ppo_epoch_idx, minibatch_idx] = pg_clipfrac
-                pg_losses[ppo_epoch_idx, minibatch_idx] = pg_loss
-                vf_losses[ppo_epoch_idx, minibatch_idx] = vf_loss
-                entropies[ppo_epoch_idx, minibatch_idx] = entropy.mean()
-                minibatch_idx += 1
-            if accelerator.is_main_process:
-                console.print(f"ppo_epoch_idx", ppo_epoch_idx, "approxkl", approxkl.item(), "pg_loss", pg_loss.item(), "pg_clipfrac", pg_clipfrac.item(), "ratio", ratio.mean().item())
+                        output, vpred_temp = forward(policy, mb_query_responses, tokenizer)
+                        logits = output.logits[:,context_length-1:-1]
+                        logits /= args.task.temperature
+                        new_all_logprobs = F.log_softmax(logits, dim=-1)
+                        new_logprobs = torch.gather(new_all_logprobs, 2, mb_responses.unsqueeze(-1)).squeeze(-1)
+                        vpred = vpred_temp[:,context_length-1:-1].squeeze(-1)
+                        vpredclipped = torch.clamp(vpred, vpred - args.ppo.cliprange_value, vpred + args.ppo.cliprange_value)
+                        vf_losses1 = torch.square(vpred - mb_return)
+                        vf_losses2 = torch.square(vpredclipped - mb_return)
+                        vf_loss = 0.5 * torch.max(vf_losses1, vf_losses2).mean()
+                        vf_clipfrac = (vf_losses2 > vf_losses1).float().mean()
+                        logprobs_diff = new_logprobs - mb_logprobs
+                        ratio = torch.exp(logprobs_diff)
+                        pg_losses = -mb_advantage * ratio
+                        pg_losses2 = -mb_advantage * torch.clamp(ratio, 1.0 - args.ppo.cliprange, 1.0 + args.ppo.cliprange)
+                        pg_loss = torch.max(pg_losses, pg_losses2).mean()
+                        pg_clipfrac = (pg_losses2 > pg_losses).float().mean()
+                        loss = pg_loss + args.ppo.vf_coef * vf_loss
+                        accelerator.backward(loss)
+                        optimizer.step()
+                        optimizer.zero_grad()
+                        pd = torch.nn.functional.softmax(logits, dim=-1)
+                        entropy = torch.logsumexp(logits, dim=-1) - torch.sum(pd * logits, dim=-1)
+                        approxkl = .5 * (logprobs_diff ** 2).mean()
+                        return_mean, return_var = returns.mean(), returns.var()
+                        value_mean, value_var = values.mean(), values.var()
+                        with torch.no_grad():
+                            approxkls_stats[ppo_epoch_idx, minibatch_idx, gradient_accumulation_idx] = approxkl
+                            clipfracs_stats[ppo_epoch_idx, minibatch_idx, gradient_accumulation_idx] = pg_clipfrac
+                            pg_losses_stats[ppo_epoch_idx, minibatch_idx, gradient_accumulation_idx] = pg_loss
+                            vf_losses_stats[ppo_epoch_idx, minibatch_idx, gradient_accumulation_idx] = vf_loss
+                            entropies_stats[ppo_epoch_idx, minibatch_idx, gradient_accumulation_idx] = entropy.mean()
+                        gradient_accumulation_idx += 1
+                    minibatch_idx += 1
+                if accelerator.is_main_process:
+                    console.print(f"ppo_epoch_idx", ppo_epoch_idx, "approxkl", approxkl.item(), "pg_loss", pg_loss.item(), "pg_clipfrac", pg_clipfrac.item(), "ratio", ratio.mean().item())
 
-        writer.add_histogram("ppo/val/ratio_hist", ratio, update)
-        kl = logprobs - ref_logprobs
-        mean_kl = kl.sum(1).mean()
-        mean_entropy = (-logprobs).sum(1).mean()
-        mean_non_score_reward = non_score_reward.sum(1).mean()
-        writer.add_scalar("objective/kl_coef", kl_ctl.value, update)
-        writer.add_scalar("objective/kl", accelerator.gather(mean_kl).mean().item(), update)
-        writer.add_scalar("objective/entropy", accelerator.gather(mean_entropy).mean().item(), update)
-        writer.add_scalar("objective/non_score_reward", accelerator.gather(mean_non_score_reward).mean().item(), update)
-        writer.add_scalar("objective/score_total", accelerator.gather(mean_non_score_reward + scores.mean()).mean().item(), update)
-        writer.add_scalar("objective/scores", accelerator.gather(scores.mean()).mean().item(), update)
-        writer.add_scalar("ppo/loss/policy", accelerator.gather(pg_loss).mean().item(), update)
-        writer.add_scalar("ppo/loss/value", accelerator.gather(vf_loss).mean().item(), update)
-        writer.add_scalar("ppo/loss/total", accelerator.gather(loss).mean().item(), update)
-        writer.add_scalar("ppo/policy/entropy", accelerator.gather(entropy.mean()).mean().item(), update)
-        writer.add_scalar("ppo/policy/approxkl", accelerator.gather(approxkl).mean().item(), update)
-        writer.add_scalar("ppo/policy/clipfrac", accelerator.gather(pg_clipfrac).mean().item(), update)
-        writer.add_scalar("ppo/policy/approxkl_avg", accelerator.gather(approxkls).mean().item(), update)
-        writer.add_scalar("ppo/policy/clipfrac_avg", accelerator.gather(clipfracs).mean().item(), update)
-        writer.add_scalar("ppo/loss/policy_avg", accelerator.gather(pg_losses).mean().item(), update)
-        writer.add_scalar("ppo/loss/value_avg", accelerator.gather(vf_losses).mean().item(), update)
-        writer.add_scalar("ppo/policy/entropy_avg", accelerator.gather(entropies).mean().item(), update)
-        writer.add_scalar("ppo/returns/mean", accelerator.gather(return_mean).mean().item(), update)
-        writer.add_scalar("ppo/returns/var", accelerator.gather(return_var).mean().item(), update)
-        writer.add_scalar("ppo/val/vpred", accelerator.gather(vpred.mean()).mean().item(), update)
-        writer.add_scalar("ppo/val/error", accelerator.gather(vf_losses1.mean()).mean().item(), update)
-        writer.add_scalar("ppo/val/clipfrac", accelerator.gather(vf_clipfrac).mean().item(), update)
-        writer.add_scalar("ppo/val/mean", accelerator.gather(value_mean).mean().item(), update)
-        writer.add_scalar("ppo/val/var", accelerator.gather(value_var).mean().item(), update)
-        writer.add_scalar("ppo/val/ratio", accelerator.gather(ratio.mean()).mean().item(), update)
-        writer.add_scalar("ppo/val/ratio_var", accelerator.gather(ratio.mean()).var().item(), update)
-        writer.add_scalar("ppo/val/advantage", accelerator.gather(advantages.mean()).mean().item(), update)
-        writer.add_scalar("ppo/val/advantage_var", accelerator.gather(advantages.mean()).var().item(), update)
-        writer.add_scalar("ppo/val/num_eos_tokens", (responses == tokenizer.eos_token_id).sum().item(), update)
-        writer.add_scalar("ppo/lr", lrnow, update)
-        writer.add_scalar("ppo/episode", global_step, update)
-        kl_ctl.update(mean_kl.item(), args.ppo.batch_size)
+        with torch.no_grad():
+            writer.add_histogram("ppo/val/ratio_hist", ratio, update)
+            kl = logprobs - ref_logprobs
+            mean_kl = kl.sum(1).mean()
+            mean_entropy = (-logprobs).sum(1).mean()
+            mean_non_score_reward = non_score_reward.sum(1).mean()
+            writer.add_scalar("objective/kl_coef", kl_ctl.value, update)
+            writer.add_scalar("objective/kl", accelerator.gather(mean_kl).mean().item(), update)
+            writer.add_scalar("objective/entropy", accelerator.gather(mean_entropy).mean().item(), update)
+            writer.add_scalar("objective/non_score_reward", accelerator.gather(mean_non_score_reward).mean().item(), update)
+            writer.add_scalar("objective/score_total", accelerator.gather(mean_non_score_reward + scores.mean()).mean().item(), update)
+            writer.add_scalar("objective/scores", accelerator.gather(scores.mean()).mean().item(), update)
+            writer.add_scalar("ppo/loss/policy", accelerator.gather(pg_loss).mean().item(), update)
+            writer.add_scalar("ppo/loss/value", accelerator.gather(vf_loss).mean().item(), update)
+            writer.add_scalar("ppo/loss/total", accelerator.gather(loss).mean().item(), update)
+            writer.add_scalar("ppo/policy/entropy", accelerator.gather(entropy.mean()).mean().item(), update)
+            writer.add_scalar("ppo/policy/approxkl", accelerator.gather(approxkl).mean().item(), update)
+            writer.add_scalar("ppo/policy/clipfrac", accelerator.gather(pg_clipfrac).mean().item(), update)
+            writer.add_scalar("ppo/policy/approxkl_avg", accelerator.gather(approxkls_stats).mean().item(), update)
+            writer.add_scalar("ppo/policy/clipfrac_avg", accelerator.gather(clipfracs_stats).mean().item(), update)
+            writer.add_scalar("ppo/loss/policy_avg", accelerator.gather(pg_losses_stats).mean().item(), update)
+            writer.add_scalar("ppo/loss/value_avg", accelerator.gather(vf_losses_stats).mean().item(), update)
+            writer.add_scalar("ppo/policy/entropy_avg", accelerator.gather(entropies_stats).mean().item(), update)
+            writer.add_scalar("ppo/returns/mean", accelerator.gather(return_mean).mean().item(), update)
+            writer.add_scalar("ppo/returns/var", accelerator.gather(return_var).mean().item(), update)
+            writer.add_scalar("ppo/val/vpred", accelerator.gather(vpred.mean()).mean().item(), update)
+            writer.add_scalar("ppo/val/error", accelerator.gather(vf_losses1.mean()).mean().item(), update)
+            writer.add_scalar("ppo/val/clipfrac", accelerator.gather(vf_clipfrac).mean().item(), update)
+            writer.add_scalar("ppo/val/mean", accelerator.gather(value_mean).mean().item(), update)
+            writer.add_scalar("ppo/val/var", accelerator.gather(value_var).mean().item(), update)
+            writer.add_scalar("ppo/val/ratio", accelerator.gather(ratio.mean()).mean().item(), update)
+            writer.add_scalar("ppo/val/ratio_var", accelerator.gather(ratio.mean()).var().item(), update)
+            writer.add_scalar("ppo/val/advantage", accelerator.gather(advantages.mean()).mean().item(), update)
+            writer.add_scalar("ppo/val/advantage_var", accelerator.gather(advantages.mean()).var().item(), update)
+            writer.add_scalar("ppo/val/num_eos_tokens", (responses == tokenizer.eos_token_id).sum().item(), update)
+            writer.add_scalar("ppo/lr", lrnow, update)
+            writer.add_scalar("ppo/episode", global_step, update)
+            kl_ctl.update(mean_kl.item(), args.ppo.batch_size)
 
     # save model
     if args.save_path:

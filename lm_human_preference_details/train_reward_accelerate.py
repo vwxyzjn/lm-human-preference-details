@@ -71,6 +71,10 @@ class Args:
     """the name of the dataset to use for labels in `https://huggingface.co/datasets/vwxyzjn/lm-human-preferences`"""
     local_batch_size: int = 4
     """per rank batch size"""
+    gradient_accumulation_steps: int = 1
+    """gradient accumulation steps"""
+    local_micro_batch_size: tyro.conf.Suppress[int] = None
+    """per rank micro batch size"""
     lr: float = 0.00005
     """the learning rate"""
     eps: float = 1e-5
@@ -253,35 +257,11 @@ def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
 OPENAI_PAD_TOKEN_ID = 50259
 
 
-class ScalarHead(nn.Module):
-    def __init__(self, config, scale=None, **kwargs):
-        super().__init__()
-        if not hasattr(config, "summary_dropout_prob"):
-            summary_dropout_prob = kwargs.pop("summary_dropout_prob", 0.1)
-        else:
-            summary_dropout_prob = config.summary_dropout_prob
-        self.dropout = nn.Dropout(summary_dropout_prob) if summary_dropout_prob else nn.Identity()
-        # some models such as OPT have a projection layer before the word embeddings - e.g. OPT-350m
-        if hasattr(config, "word_embed_proj_dim"):
-            hidden_size = config.word_embed_proj_dim
-        else:
-            hidden_size = config.hidden_size
-        if scale is None:
-            scale = 1 / np.sqrt(hidden_size + 1)
-        self.summary = layer_init(nn.Linear(hidden_size, 1), std=scale)
-        self.flatten = nn.Flatten()
-
-    def forward(self, hidden_states):
-        output = self.dropout(hidden_states)
-        output = self.summary(output)
-        return output
-
-
 class AutoModelForCausalLMWithScalarHead(nn.Module):
     def __init__(self, pretrained_model):
         super().__init__()
         self.pretrained_model = pretrained_model
-        self.scalar_head = ScalarHead(self.pretrained_model.config, scale=0.0)
+        self.scalar_head = layer_init(nn.Linear(pretrained_model.config.hidden_size, 1), std=0)
 
     def forward(self, **kwargs):
         output = self.pretrained_model(**kwargs)
@@ -292,7 +272,7 @@ class AutoModelForCausalLMWithRewardHead(nn.Module):
     def __init__(self, pretrained_model):
         super().__init__()
         self.pretrained_model = pretrained_model
-        self.scalar_head = ScalarHead(self.pretrained_model.config)
+        self.scalar_head = layer_init(nn.Linear(pretrained_model.config.hidden_size, 1), std=1 / np.sqrt(pretrained_model.config.hidden_size + 1))
         self.reward_gain = torch.nn.Parameter(torch.tensor(1.0), requires_grad=True)
         self.reward_bias = torch.nn.Parameter(torch.tensor(0.0), requires_grad=True)
 
@@ -356,6 +336,13 @@ def left_padding_to_right_padding(query, pad_id):
 
 def ceil_div(a, b):
     return (a - 1) // b + 1
+
+
+def exact_div(a, b):
+    q = a // b
+    if a != q * b:
+        raise ValueError('Inexact division: %s / %s = %s' % (a, b, a / b))
+    return q
 
 
 def generate(pretrained_model, queries, tokenizer, generation_config):
@@ -441,10 +428,12 @@ def normalize(args, accelerator, device, tokenizer, pretrained_model, reward_mod
 
 def train(args: Args):
     accelerator = Accelerator(
-        kwargs_handlers=[DistributedDataParallelKwargs(broadcast_buffers=False)] # this is needed to avoid https://github.com/pytorch/pytorch/issues/22095#issuecomment-505099500
+        kwargs_handlers=[DistributedDataParallelKwargs(broadcast_buffers=False)], # this is needed to avoid https://github.com/pytorch/pytorch/issues/22095#issuecomment-505099500
+        gradient_accumulation_steps=args.gradient_accumulation_steps
     )
     args.world_size = accelerator.num_processes
     args.batch_size = int(args.local_batch_size * args.world_size)
+    args.local_micro_batch_size = exact_div(args.local_batch_size, args.gradient_accumulation_steps)
 
     console = Console(force_terminal=True)
     run_name = f"{args.exp_name}__{args.seed}__{int(time.time())}"
@@ -532,48 +521,98 @@ def train(args: Args):
     all_inds = all_inds.cpu().numpy()
     global_step = 0
     for start in range(0, args.labels.num_train, args.batch_size):
-        global_step += 1
-        end = start + args.batch_size
-        b_inds_all = all_inds[start:end]
-        b_inds = b_inds_all[accelerator.process_index::accelerator.num_processes] #  multi-GPU slicing
+        # linear rate annealing
         lr = (1 - start / args.labels.num_train) * args.lr
         optimizer.param_groups[0]["lr"] = lr
-        mb_data = label[b_inds]
-        # print("accelerator.process_index", accelerator.process_index, b_inds, b_inds_all)
-        mb_query = torch.from_numpy(np.stack(mb_data["query"]))
-        mb_query = left_padding_to_right_padding(mb_query, tokenizer.pad_token_id).to(device)
-        mb_best = torch.from_numpy(np.stack(mb_data["best"])).to(device)
-        mb_responses = [
-            torch.from_numpy(np.stack(mb_data[f"sample{i}"])).to(device)
-            for i in range(args.labels.num_labels)
-        ]
-        # hack: deal with openai's padding token
-        # assert (mb_query == tokenizer.pad_token_id).sum() == 0
-        mb_query[mb_query == OPENAI_PAD_TOKEN_ID] = tokenizer.pad_token_id
-        for item in mb_responses:
-            # assert (item == tokenizer.pad_token_id).sum() == 0
-            item[item == OPENAI_PAD_TOKEN_ID] = tokenizer.pad_token_id
 
-        predicted_rewards = []
-        for i in range(args.labels.num_labels):
-            query_responses = torch.cat([mb_query, mb_responses[i]], dim=1)
-            reward = get_reward(reward_model, query_responses, tokenizer)[1]
-            predicted_rewards.append(
-                reward.squeeze()
-            )
-        predicted_rewards = torch.stack(
-            predicted_rewards, dim=1
-        )  # shape (batch_size, num_labels), basically a reward prediction for each label
-        accuracy = (predicted_rewards.argmax(1) == mb_best).float().mean()
-        loss = torch.nn.functional.cross_entropy(predicted_rewards, mb_best)
-        optimizer.zero_grad()
-        accelerator.backward(loss)
-        optimizer.step()
-        writer.add_scalar("train/loss", accelerator.gather(loss).mean().item(), global_step)
-        writer.add_scalar("train/accuracy", accelerator.gather(accuracy).mean().item(), global_step)
+        with accelerator.accumulate(reward_model):
+            global_step += 1
+            end = start + args.batch_size
+            b_inds_all = all_inds[start:end]
+            b_inds = b_inds_all[accelerator.process_index::accelerator.num_processes] #  multi-GPU slicing
+            losses = torch.zeros((args.gradient_accumulation_steps,), device=device)
+            accuracies = torch.zeros((args.gradient_accumulation_steps,), device=device)
+            gradient_accumulation_step = 0
+            for micro_batch_start in range(0, args.local_batch_size, args.local_micro_batch_size):
+                micro_batch_end = micro_batch_start + args.local_micro_batch_size 
+                micro_batch_inds = b_inds[micro_batch_start:micro_batch_end]
+                mb_data = label[micro_batch_inds]
+                mb_query = torch.from_numpy(np.stack(mb_data["query"]))
+                mb_query = left_padding_to_right_padding(mb_query, tokenizer.pad_token_id).to(device)
+                mb_best = torch.from_numpy(np.stack(mb_data["best"])).to(device)
+                mb_responses = [
+                    torch.from_numpy(np.stack(mb_data[f"sample{i}"])).to(device)
+                    for i in range(args.labels.num_labels)
+                ]
+                # hack: deal with openai's padding token
+                mb_query[mb_query == OPENAI_PAD_TOKEN_ID] = tokenizer.pad_token_id
+                for item in mb_responses:
+                    item[item == OPENAI_PAD_TOKEN_ID] = tokenizer.pad_token_id
+
+                predicted_rewards = []
+                for i in range(args.labels.num_labels):
+                    query_responses = torch.cat([mb_query, mb_responses[i]], dim=1)
+                    reward = get_reward(reward_model, query_responses, tokenizer)[1]
+                    predicted_rewards.append(
+                        reward.view(-1)
+                    )
+                predicted_rewards = torch.stack(
+                    predicted_rewards, dim=1
+                )  # shape (batch_size, num_labels), basically a reward prediction for each label
+                accuracy = (predicted_rewards.argmax(1) == mb_best).float().mean()
+                loss = torch.nn.functional.cross_entropy(predicted_rewards, mb_best)
+                accelerator.backward(loss)
+                optimizer.step()  # accelerate handles gradient accumulation automatically
+                optimizer.zero_grad()
+                losses[gradient_accumulation_step] = loss
+                accuracies[gradient_accumulation_step] = accuracy
+                gradient_accumulation_step += 1
+
+        writer.add_scalar("train/loss", accelerator.gather(losses).mean().item(), global_step)
+        writer.add_scalar("train/accuracy", accelerator.gather(accuracies).mean().item(), global_step)
         writer.add_scalar("train/lr", lr, global_step)
 
         if args.print_sample_output_freq > 0 and global_step % args.print_sample_output_freq == 0:
+            # eval on test_label, some duplicate code (I don't want to make the training loop into a function...)
+            test_accuracies = []
+            all_inds = np.arange(len(label))
+            for start in range(args.labels.num_train, len(label), args.batch_size):
+                end = start + args.batch_size
+                b_inds_all = all_inds[start:end]
+                b_inds = b_inds_all[accelerator.process_index::accelerator.num_processes] #  multi-GPU slicing
+                for micro_batch_start in range(0, args.local_batch_size, args.local_micro_batch_size):
+                    micro_batch_end = micro_batch_start + args.local_micro_batch_size 
+                    micro_batch_inds = b_inds[micro_batch_start:micro_batch_end]
+                    mb_data = label[micro_batch_inds]
+                    mb_query = torch.from_numpy(np.stack(mb_data["query"]))
+                    mb_query = left_padding_to_right_padding(mb_query, tokenizer.pad_token_id).to(device)
+                    mb_best = torch.from_numpy(np.stack(mb_data["best"])).to(device)
+                    mb_responses = [
+                        torch.from_numpy(np.stack(mb_data[f"sample{i}"])).to(device)
+                        for i in range(args.labels.num_labels)
+                    ]
+                    # hack: deal with openai's padding token
+                    mb_query[mb_query == OPENAI_PAD_TOKEN_ID] = tokenizer.pad_token_id
+                    for item in mb_responses:
+                        item[item == OPENAI_PAD_TOKEN_ID] = tokenizer.pad_token_id
+                    predicted_rewards = []
+                    for i in range(args.labels.num_labels):
+                        query_responses = torch.cat([mb_query, mb_responses[i]], dim=1)
+                        reward = get_reward(reward_model, query_responses, tokenizer)[1]
+                        predicted_rewards.append(
+                            reward.view(-1)
+                        )
+                    predicted_rewards = torch.stack(
+                        predicted_rewards, dim=1
+                    )  # shape (batch_size, num_labels), basically a reward prediction for each label
+                    accuracy = (predicted_rewards.argmax(1) == mb_best).float().mean()
+                    test_accuracies.append(accuracy)
+            test_accuracy = accelerator.gather(torch.stack(test_accuracies).mean()).mean().item()
+            writer.add_scalar("test/accuracy", test_accuracy, global_step)
+            if accelerator.is_main_process:
+                print("test/accuracy", test_accuracy, global_step)
+
+            # the part below is testing out some generations and KLs, not presented in the original code
             with torch.no_grad():
                 data = next(iter_dataloader)
                 queries = data["input_ids"].to(device)
@@ -604,46 +643,6 @@ def train(args: Args):
                     f"\n[red]average kl: {kl.sum(1).mean().item()}[/]"
                 )
                 writer.add_scalar("train/kl", kl.sum(1).mean().item(), global_step)
-
-            # eval on test_label
-            test_accuracies = []
-            all_inds = np.arange(len(label))
-            for start in range(args.labels.num_train, len(label), args.batch_size):
-                end = start + args.batch_size
-                b_inds_all = all_inds[start:end]
-                b_inds = b_inds_all[accelerator.process_index::accelerator.num_processes] #  multi-GPU slicing
-                mb_data = label[b_inds]
-                # print("accelerator.process_index", accelerator.process_index, b_inds, b_inds_all)
-                mb_query = torch.from_numpy(np.stack(mb_data["query"]))
-                mb_query = left_padding_to_right_padding(mb_query, tokenizer.pad_token_id).to(device)
-                mb_best = torch.from_numpy(np.stack(mb_data["best"])).to(device)
-                mb_responses = [
-                    torch.from_numpy(np.stack(mb_data[f"sample{i}"])).to(device)
-                    for i in range(args.labels.num_labels)
-                ]
-                # hack: deal with openai's padding token
-                # assert (mb_query == tokenizer.pad_token_id).sum() == 0
-                mb_query[mb_query == OPENAI_PAD_TOKEN_ID] = tokenizer.pad_token_id
-                for item in mb_responses:
-                    # assert (item == tokenizer.pad_token_id).sum() == 0
-                    item[item == OPENAI_PAD_TOKEN_ID] = tokenizer.pad_token_id
-
-                predicted_rewards = []
-                for i in range(args.labels.num_labels):
-                    query_responses = torch.cat([mb_query, mb_responses[i]], dim=1)
-                    reward = get_reward(reward_model, query_responses, tokenizer)[1]
-                    predicted_rewards.append(
-                        reward.squeeze()
-                    )
-                predicted_rewards = torch.stack(
-                    predicted_rewards, dim=1
-                )  # shape (batch_size, num_labels), basically a reward prediction for each label
-                accuracy = (predicted_rewards.argmax(1) == mb_best).float().mean()
-                test_accuracies.append(accuracy)
-            test_accuracy = accelerator.gather(torch.stack(test_accuracies).mean()).mean().item()
-            writer.add_scalar("test/accuracy", test_accuracy, global_step)
-            if accelerator.is_main_process:
-                print("test/accuracy", test_accuracy, global_step)
 
     torch.cuda.empty_cache()
     if args.normalize_after:
