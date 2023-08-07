@@ -533,15 +533,15 @@ def train(args: Args):
         lr = (1 - start / args.labels.num_train) * args.lr
         optimizer.param_groups[0]["lr"] = lr
 
-        with accelerator.accumulate(reward_model):
-            global_step += 1
-            end = start + args.batch_size
-            b_inds_all = all_inds[start:end]
-            b_inds = b_inds_all[accelerator.process_index::accelerator.num_processes] #  multi-GPU slicing
-            losses = torch.zeros((args.gradient_accumulation_steps,), device=device)
-            accuracies = torch.zeros((args.gradient_accumulation_steps,), device=device)
-            gradient_accumulation_step = 0
-            for micro_batch_start in range(0, args.local_batch_size, args.local_micro_batch_size):
+        global_step += 1
+        end = start + args.batch_size
+        b_inds_all = all_inds[start:end]
+        b_inds = b_inds_all[accelerator.process_index::accelerator.num_processes] #  multi-GPU slicing
+        losses = torch.zeros((args.gradient_accumulation_steps,), device=device)
+        accuracies = torch.zeros((args.gradient_accumulation_steps,), device=device)
+        gradient_accumulation_step = 0
+        for micro_batch_start in range(0, args.local_batch_size, args.local_micro_batch_size):
+            with accelerator.accumulate(reward_model):
                 micro_batch_end = micro_batch_start + args.local_micro_batch_size 
                 micro_batch_inds = b_inds[micro_batch_start:micro_batch_end]
                 mb_data = label[micro_batch_inds]
@@ -574,7 +574,7 @@ def train(args: Args):
                 optimizer.zero_grad()
                 losses[gradient_accumulation_step] = loss
                 accuracies[gradient_accumulation_step] = accuracy
-                gradient_accumulation_step += 1
+            gradient_accumulation_step += 1
 
         writer.add_scalar("train/loss", accelerator.gather(losses).mean().item(), global_step)
         writer.add_scalar("train/accuracy", accelerator.gather(accuracies).mean().item(), global_step)

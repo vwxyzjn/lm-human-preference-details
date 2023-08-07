@@ -605,8 +605,8 @@ def train(args: Args):
                 mini_batch_end = mini_batch_start + args.ppo.local_mini_batch_size
                 mini_batch_inds = b_inds[mini_batch_start:mini_batch_end]
                 gradient_accumulation_idx = 0
-                with accelerator.accumulate(policy):
-                    for micro_batch_start in range(0, args.ppo.local_mini_batch_size, args.ppo.local_micro_batch_size):
+                for micro_batch_start in range(0, args.ppo.local_mini_batch_size, args.ppo.local_micro_batch_size):
+                    with accelerator.accumulate(policy):
                         micro_batch_end = micro_batch_start + args.ppo.local_micro_batch_size 
                         micro_batch_inds = mini_batch_inds[micro_batch_start:micro_batch_end]
                         mb_return = returns[micro_batch_inds]
@@ -647,8 +647,8 @@ def train(args: Args):
                             pg_losses_stats[ppo_epoch_idx, minibatch_idx, gradient_accumulation_idx] = pg_loss
                             vf_losses_stats[ppo_epoch_idx, minibatch_idx, gradient_accumulation_idx] = vf_loss
                             entropies_stats[ppo_epoch_idx, minibatch_idx, gradient_accumulation_idx] = entropy.mean()
-                        gradient_accumulation_idx += 1
-                    minibatch_idx += 1
+                    gradient_accumulation_idx += 1
+                minibatch_idx += 1
                 if accelerator.is_main_process:
                     console.print(f"ppo_epoch_idx", ppo_epoch_idx, "approxkl", approxkl.item(), "pg_loss", pg_loss.item(), "pg_clipfrac", pg_clipfrac.item(), "ratio", ratio.mean().item())
 
