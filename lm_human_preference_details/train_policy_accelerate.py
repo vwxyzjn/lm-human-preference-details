@@ -621,7 +621,7 @@ def train(args: Args):
                         new_all_logprobs = F.log_softmax(logits, dim=-1)
                         new_logprobs = torch.gather(new_all_logprobs, 2, mb_responses.unsqueeze(-1)).squeeze(-1)
                         vpred = vpred_temp[:,context_length-1:-1].squeeze(-1)
-                        vpredclipped = torch.clamp(vpred, vpred - args.ppo.cliprange_value, vpred + args.ppo.cliprange_value)
+                        vpredclipped = torch.clamp(vpred, values - args.ppo.cliprange_value, values + args.ppo.cliprange_value)
                         vf_losses1 = torch.square(vpred - mb_return)
                         vf_losses2 = torch.square(vpredclipped - mb_return)
                         vf_loss = 0.5 * torch.max(vf_losses1, vf_losses2).mean()
