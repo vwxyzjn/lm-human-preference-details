@@ -515,6 +515,7 @@ def train(args: Args):
     clipfracs_stats = torch.zeros((args.ppo.noptepochs, args.ppo.nminibatches, args.ppo.gradient_accumulation_steps), device=device)
     pg_losses_stats = torch.zeros((args.ppo.noptepochs, args.ppo.nminibatches, args.ppo.gradient_accumulation_steps), device=device)
     vf_losses_stats = torch.zeros((args.ppo.noptepochs, args.ppo.nminibatches, args.ppo.gradient_accumulation_steps), device=device)
+    vf_clipfrac_stats = torch.zeros((args.ppo.noptepochs, args.ppo.nminibatches, args.ppo.gradient_accumulation_steps), device=device)
     entropies_stats = torch.zeros((args.ppo.noptepochs, args.ppo.nminibatches, args.ppo.gradient_accumulation_steps), device=device)
     for update in range(1, args.ppo.num_updates + 1):
         global_step += 1 * args.ppo.batch_size
@@ -529,12 +530,12 @@ def train(args: Args):
             context_length = queries.shape[1]
             responses = query_responses[:,context_length:]
 
-            output, _ = forward(policy, query_responses, tokenizer)
+            output, full_values = forward(policy, query_responses, tokenizer)
+            values = full_values[:,context_length-1:-1].squeeze(-1)
             logits = output.logits[:,context_length-1:-1]
             logits /= args.task.temperature
             all_logprobs = F.log_softmax(logits, dim=-1)
             logprobs = torch.gather(all_logprobs, 2, responses.unsqueeze(-1)).squeeze(-1)
-            values = accelerator.unwrap_model(policy).scalar_head(output.hidden_states[-1][:,context_length-1:-1]).squeeze(-1)
             del output, logits, all_logprobs; torch.cuda.empty_cache()
 
             ref_output, _ = forward(ref_policy, query_responses, tokenizer)
@@ -596,6 +597,8 @@ def train(args: Args):
             advantages = torch.stack(advantages_reversed[::-1], axis=1)
             returns = advantages + values
             advantages = whiten(advantages)
+            return_mean, return_var = returns.mean(), returns.var()
+            value_mean, value_var = values.mean(), values.var()
 
         # Do multiple epochs of PPO training, with a fresh random shuffle in each epoch
         for ppo_epoch_idx in range(args.ppo.noptepochs):
@@ -611,6 +614,7 @@ def train(args: Args):
                         micro_batch_inds = mini_batch_inds[micro_batch_start:micro_batch_end]
                         mb_return = returns[micro_batch_inds]
                         mb_advantage = advantages[micro_batch_inds]
+                        mb_values = values[micro_batch_inds]
                         mb_responses = responses[micro_batch_inds]
                         mb_query_responses = query_responses[micro_batch_inds]
                         mb_logprobs = logprobs[micro_batch_inds]
@@ -621,8 +625,7 @@ def train(args: Args):
                         new_all_logprobs = F.log_softmax(logits, dim=-1)
                         new_logprobs = torch.gather(new_all_logprobs, 2, mb_responses.unsqueeze(-1)).squeeze(-1)
                         vpred = vpred_temp[:,context_length-1:-1].squeeze(-1)
-                        # vpredclipped = torch.clamp(vpred, values - args.ppo.cliprange_value, values + args.ppo.cliprange_value)
-                        vpredclipped = values + torch.clamp(vpred - values, -args.ppo.cliprange_value, args.ppo.cliprange_value)
+                        vpredclipped = torch.clamp(vpred, mb_values - args.ppo.cliprange_value, mb_values + args.ppo.cliprange_value)
                         vf_losses1 = torch.square(vpred - mb_return)
                         vf_losses2 = torch.square(vpredclipped - mb_return)
                         vf_loss = 0.5 * torch.max(vf_losses1, vf_losses2).mean()
@@ -640,13 +643,12 @@ def train(args: Args):
                         pd = torch.nn.functional.softmax(logits, dim=-1)
                         entropy = torch.logsumexp(logits, dim=-1) - torch.sum(pd * logits, dim=-1)
                         approxkl = .5 * (logprobs_diff ** 2).mean()
-                        return_mean, return_var = returns.mean(), returns.var()
-                        value_mean, value_var = values.mean(), values.var()
                         with torch.no_grad():
                             approxkls_stats[ppo_epoch_idx, minibatch_idx, gradient_accumulation_idx] = approxkl
                             clipfracs_stats[ppo_epoch_idx, minibatch_idx, gradient_accumulation_idx] = pg_clipfrac
                             pg_losses_stats[ppo_epoch_idx, minibatch_idx, gradient_accumulation_idx] = pg_loss
                             vf_losses_stats[ppo_epoch_idx, minibatch_idx, gradient_accumulation_idx] = vf_loss
+                            vf_clipfrac_stats[ppo_epoch_idx, minibatch_idx, gradient_accumulation_idx] = vf_clipfrac
                             entropies_stats[ppo_epoch_idx, minibatch_idx, gradient_accumulation_idx] = entropy.mean()
                     gradient_accumulation_idx += 1
                 minibatch_idx += 1
@@ -675,6 +677,7 @@ def train(args: Args):
             writer.add_scalar("ppo/policy/clipfrac_avg", accelerator.gather(clipfracs_stats).mean().item(), update)
             writer.add_scalar("ppo/loss/policy_avg", accelerator.gather(pg_losses_stats).mean().item(), update)
             writer.add_scalar("ppo/loss/value_avg", accelerator.gather(vf_losses_stats).mean().item(), update)
+            writer.add_scalar("ppo/val/clipfrac_avg", accelerator.gather(vf_clipfrac_stats).mean().item(), update)
             writer.add_scalar("ppo/policy/entropy_avg", accelerator.gather(entropies_stats).mean().item(), update)
             writer.add_scalar("ppo/returns/mean", accelerator.gather(return_mean).mean().item(), update)
             writer.add_scalar("ppo/returns/var", accelerator.gather(return_var).mean().item(), update)
