@@ -540,6 +540,7 @@ def train(args: Args):
                 micro_batch_end = micro_batch_start + args.local_micro_batch_size 
                 micro_batch_inds = b_inds[micro_batch_start:micro_batch_end]
                 mb_data = label[micro_batch_inds]
+                accelerator.print(accelerator.gather(torch.tensor(micro_batch_inds, device=device)))
                 mb_query = torch.from_numpy(np.stack(mb_data["query"])).to(device)
                 mb_best = torch.from_numpy(np.stack(mb_data["best"])).to(device)
                 mb_responses = [
@@ -579,10 +580,10 @@ def train(args: Args):
             with torch.no_grad():
                 # eval on test_label, some duplicate code (I don't want to make the training loop into a function...)
                 test_accuracies = []
-                all_inds = np.arange(len(label))
+                new_all_inds = np.arange(len(label))
                 for start in range(args.labels.num_train, len(label), args.batch_size):
                     end = start + args.batch_size
-                    b_inds_all = all_inds[start:end]
+                    b_inds_all = new_all_inds[start:end]
                     b_inds = b_inds_all[accelerator.process_index::accelerator.num_processes] #  multi-GPU slicing
                     for micro_batch_start in range(0, args.local_batch_size, args.local_micro_batch_size):
                         micro_batch_end = micro_batch_start + args.local_micro_batch_size 
@@ -602,6 +603,7 @@ def train(args: Args):
                         predicted_rewards = []
                         for i in range(args.labels.num_labels):
                             query_responses = torch.cat([mb_query, mb_responses[i]], dim=1)
+                            query_responses = left_padding_to_right_padding(query_responses, tokenizer.pad_token_id)
                             reward = get_reward(reward_model, query_responses, tokenizer)[1]
                             predicted_rewards.append(
                                 reward.view(-1)
