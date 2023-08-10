@@ -518,8 +518,7 @@ def train(args: Args):
     print("after====", reward_model.module.reward_gain.data)
 
     print("===training reward model===")
-    all_inds = np.arange(args.labels.num_train)
-    np.random.shuffle(all_inds)
+    all_inds = np.random.permutation(args.labels.num_train)
     # ensure that all processes have the same shuffled indices
     all_inds = broadcast(torch.tensor(all_inds, device=device), 0)
     all_inds = all_inds.cpu().numpy()
@@ -541,8 +540,7 @@ def train(args: Args):
                 micro_batch_end = micro_batch_start + args.local_micro_batch_size 
                 micro_batch_inds = b_inds[micro_batch_start:micro_batch_end]
                 mb_data = label[micro_batch_inds]
-                mb_query = torch.from_numpy(np.stack(mb_data["query"]))
-                mb_query = left_padding_to_right_padding(mb_query, tokenizer.pad_token_id).to(device)
+                mb_query = torch.from_numpy(np.stack(mb_data["query"])).to(device)
                 mb_best = torch.from_numpy(np.stack(mb_data["best"])).to(device)
                 mb_responses = [
                     torch.from_numpy(np.stack(mb_data[f"sample{i}"])).to(device)
@@ -556,6 +554,7 @@ def train(args: Args):
                 predicted_rewards = []
                 for i in range(args.labels.num_labels):
                     query_responses = torch.cat([mb_query, mb_responses[i]], dim=1)
+                    query_responses = left_padding_to_right_padding(query_responses, tokenizer.pad_token_id)
                     reward = get_reward(reward_model, query_responses, tokenizer)[1]
                     predicted_rewards.append(
                         reward.view(-1)
