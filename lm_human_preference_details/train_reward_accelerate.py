@@ -335,7 +335,7 @@ def left_padding_to_right_padding(query, pad_id):
     return torch.tensor([
         [pad_id]*(row==pad_id).sum() + [x for x in row if x != pad_id]
         for row in query
-    ])
+    ], device=query.device)
 
 
 def ceil_div(a, b):
