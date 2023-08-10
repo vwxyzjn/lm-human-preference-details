@@ -553,6 +553,7 @@ def train(args: Args):
 
             # 2. run reward model on the truncated responses
             postprocessed_query_responses = torch.cat((queries, postprocessed_responses), 1)
+            postprocessed_query_responses = left_padding_to_right_padding(postprocessed_query_responses, tokenizer.pad_token_id)
             scores = get_reward(reward_model, postprocessed_query_responses, tokenizer).flatten()
 
             # 3. filter response. Ensure that the sample contains truncate_token
