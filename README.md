@@ -46,33 +46,30 @@ accelerate launch \
 
 ## Current status
 
-Currently for a reproduction, I used the same dataset, same data processing pipeline, same initial model architecture and weights (`gpt2` 124M pretrained model). Hyperparameters are exactly the same except for the adam optimizer's `eps` which I used `5e-4` instead of `1e-5` for better stability
+Currently for a reproduction, I used the same dataset, same data processing pipeline, same initial model architecture and weights (`gpt2` 124M pretrained model). Hyperparameters are exactly the same.
 
 The following charts shows the learning curves of various metrics for `sentiment` and `descriptiveness` tasks, each with 10 random seeds.
-
-
->**Warning** Notice how my reproduction in `sentiment` has lower `entropy` and has lower `score` in `descriptiveness`. It may be related to subtle issues with the optimizer's setting. See https://github.com/pytorch/pytorch/issues/104857#issuecomment-1635068659
-
 
 ```
 pip install openrlbenchmark==0.2.1a4
 python -m openrlbenchmark.rlops_multi_metrics \
-    --filters '?we=openrlbenchmark&wpn=lm-human-preferences&ceik=task_id&cen=task.value.policy.initial_model&metrics=ppo/objective/score&metrics=ppo/objective/kl&metrics=ppo/objective/entropy&metrics=ppo/objective/score_total&metrics=ppo/objective/kl_coef&metrics=ppo/ppo/loss/total&metrics=ppo/ppo/loss/value&metrics=ppo/ppo/loss/policy&metrics=ppo/ppo/policy/clipfrac&metrics=ppo/ppo/policy/entropy&metrics=ppo/ppo/returns/mean&metrics=ppo/ppo/policy/approxkl&metrics=ppo/ppo/val/clipfrac&metrics=ppo/ppo/val/error&metrics=ppo/ppo/val/mean&metrics=ppo/ppo/returns/var&metrics=ppo/ppo/val/vpred' \
+    --filters '?we=openrlbenchmark&wpn=lm-human-preferences&xaxis=_step&ceik=task_id&cen=task.value.policy.initial_model&metrics=ppo/objective/score&metrics=ppo/objective/kl&metrics=ppo/objective/entropy&metrics=ppo/objective/score_total&metrics=ppo/objective/kl_coef&metrics=ppo/ppo/loss/total&metrics=ppo/ppo/loss/value&metrics=ppo/ppo/loss/policy&metrics=ppo/ppo/policy/clipfrac&metrics=ppo/ppo/policy/entropy&metrics=ppo/ppo/returns/mean&metrics=ppo/ppo/policy/approxkl&metrics=ppo/ppo/val/clipfrac&metrics=ppo/ppo/val/error&metrics=ppo/ppo/val/mean&metrics=ppo/ppo/returns/var&metrics=ppo/ppo/val/vpred' \
         '124M' \
-    --filters '?we=costa-huang&wpn=cleanrl&ceik=rewards.value.label_dataset&cen=exp_name&metrics=objective/scores&metrics=objective/kl&metrics=objective/entropy&metrics=objective/score_total&metrics=objective/kl_coef&metrics=ppo/loss/total&metrics=ppo/loss/value&metrics=ppo/loss/policy&metrics=ppo/policy/clipfrac&metrics=ppo/policy/entropy&metrics=ppo/returns/mean&metrics=ppo/policy/approxkl&metrics=ppo/val/clipfrac&metrics=ppo/val/error&metrics=ppo/val/mean&metrics=ppo/returns/var&metrics=ppo/val/vpred' \
-        'train_policy_accelerate?tag=v0.1.0-20-gd63c6c3' \
+    --filters '?we=openrlbenchmark&wpn=lm_human_preference_details&xaxis=_step&ceik=rewards.value.label_dataset&cen=exp_name&metrics=objective/scores&metrics=objective/kl&metrics=objective/entropy&metrics=objective/score_total&metrics=objective/kl_coef&metrics=ppo/loss/total&metrics=ppo/loss/value&metrics=ppo/loss/policy_avg&metrics=ppo/policy/clipfrac_avg&metrics=ppo/policy/entropy_avg&metrics=ppo/returns/mean&metrics=ppo/policy/approxkl_avg&metrics=ppo/val/clipfrac_avg&metrics=ppo/val/error&metrics=ppo/val/mean&metrics=ppo/returns/var&metrics=ppo/val/vpred' \
+        'train_policy_accelerate?tag=v0.1.0-58-g4f42012&tag=tf_adam&tag=gpt2&cl=tf_adam,gpt2' \
     --env-ids sentiment descriptiveness \
     --env-ids sentiment/offline_5k.json  descriptiveness/offline_5k.json \
     --no-check-empty-runs \
-    --pc.ncols 5 \
+    --pc.ncols 6 \
     --pc.ncols-legend 1 \
     --output-filename static/0compare \
-    --scan-history --report
+    --scan-history  --report
+# (optionally) you can add `--report`` to generate wandb report
 ``` 
 ![](static/ours1.png)
 
 
-Wandb report is availible at https://wandb.ai/costa-huang/cleanrl/reports/Regression-Report-train_policy_accelerate--Vmlldzo0ODk0MjM2. Feel free to check out the logs of the runs for sample outputs.
+Wandb report is availible at https://wandb.ai/costa-huang/cleanrl/reports/Regression-Report-train_policy_accelerate--Vmlldzo1MTEwMzQw. Feel free to check out the logs of the runs for sample outputs.
 
 ![](static/wandb.png)
 
@@ -99,22 +96,26 @@ Wandb report is availible at https://wandb.ai/costa-huang/cleanrl/reports/Regres
     kl = +11.00
     total = +0.55
     ```
-* https://wandb.ai/costa-huang/cleanrl/runs/fu902lyc/logs
+* https://wandb.ai/openrlbenchmark/lm_human_preference_details/runs/38v19l2k
     * 
     ```
-    query: he was quiet for a minute, his eyes unreadable.
-    response: " I'm so glad you're here. It's been a long time since we've known each other.
-    score: 0.5942718982696533, kl: 7.33388090133667, total reward: -0.45726191997528076
+    29676 query: `` you know who the bassist for the red hot chili peppers is? ''
+    29677 response:  I got a couple of bucks for a half of what I was selling and we were 
+    29678 pretty happy.
+    29681 score: 1.7029974460601807, kl: 2.753568410873413, total reward: 
+    29682 1.2474089860916138 
 
-    query: she knew she shouldn't, but she reached out to capture that particular hand
-    before he could go.
-    response: That was all that mattered.
-    "I'm glad to see you're happy," she said.
-    score: 2.0057406425476074, kl: 6.900775909423828, total reward: 1.025254249572754
 
-    query: she offered a tense shrug before reaching for the door handle.
-    response: "We're going to be fine," he said, "and we're going to be okay.
-    score: 0.9820655584335327, kl: 7.899775505065918, total reward: -0.15402913093566895
+    29754 query: `` it means, '' he said, `` that we 'll keep you. ''
+    29755 response: This means that we can get the ship that we want to build from the ground up.
+    29760 score: 1.8134586811065674, kl: 5.874235153198242, total reward: 
+
+    29770 query: i stuffed a french fry in my mouth, feeling a little bummed about the current 
+    29771 situation and kicking myself for not staying totally away from him in the first 
+    29772 place.
+    29773 response: I'm genuinely happy with my stay here with no regret. I love my 
+    29774 sister, she is amazing.
+    29777 score: 2.78997802734375, kl: 5.462193965911865, total reward: 1.8888899087905884
     ```
 
 
@@ -140,24 +141,18 @@ Wandb report is availible at https://wandb.ai/costa-huang/cleanrl/reports/Regres
     kl = +9.55
     total = +1.68
     ```
-* https://wandb.ai/costa-huang/cleanRL/runs/e75dhls2/logs
+* https://wandb.ai/openrlbenchmark/lm_human_preference_details/runs/e3rysbw8
     * 
     ```
-    query: `` you really don't think i can do it, '' i said, trying not to sound stung.
-    response: had to kneel down to take a deep breath, her hand wrapped around her waist. her
-    face was red with tears
-    score: -1.0, kl: 8.85654354095459, total reward: -2.0279948711395264
+    30052 query: she shivered.
+    30053 response: She looked up at the old man who had lain with her, and he gave her a
+    30054 kiss.
+    30058 score: 2.936002731323242, kl: 3.442370891571045, total reward: 1.6455250978469849 
 
-    query: it's ridiculous for someone with your pedigree to go to art school.
-    response:  And if Mikan has any problems with this, he has to be kidding himselfWhat's in
-    the Water at Su
-    score: -1.0, kl: -4.508945465087891, total reward: -0.47910648584365845
-    
-    query: jimmy was on the back seat of his truck.
-    response:  His lips were furrowed and his lips were still furrowed. He was dressed in a
-    white coat.
-    score: 1.3276370763778687, kl: 7.90595006942749, total reward:
-    0.41623085737228394
+    30023 query: asked jason with frustration apparent in his strained voice.
+    30024 response: He was dressed in a suit and tie with a white button down shirt
+    30025 and a white knitted hat.
+    30028 score: 4.891026973724365, kl: 10.192875862121582, total reward: 1.0853893756866455 
     ```
 
 ## Learning curves of `openai/lm-human-preferences`
