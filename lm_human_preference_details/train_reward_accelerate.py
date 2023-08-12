@@ -71,18 +71,24 @@ class Args:
     """the name of the dataset to use for labels in `https://huggingface.co/datasets/vwxyzjn/lm-human-preferences`"""
     local_batch_size: int = 4
     """per rank batch size"""
+    gradient_accumulation_steps: int = 1
+    """gradient accumulation steps"""
+    local_micro_batch_size: tyro.conf.Suppress[int] = None
+    """per rank micro batch size"""
     lr: float = 0.00005
     """the learning rate"""
     eps: float = 1e-5
     """the epsilon for AdamW"""
-    local_rollout_batch_size: int = 512
-    """per rank rollot batch size"""
+    rollout_batch_size: int = 512
+    """rollot batch size"""
     world_size: tyro.conf.Suppress[int] = None
     """the number of processes to use"""
     batch_size: tyro.conf.Suppress[int] = None
     """the batch size across all ranks"""
-    normalize_samples: int = 256
+    local_normalize_samples: int = 256
     """Samples used to estimate reward mean and std"""
+    normalize_samples: tyro.conf.Suppress[int] = None
+    """Samples used to estimate reward mean and std across all ranks"""
     debug_normalize: int = 0
     """Samples used to check that normalization worked"""
     normalize_before: bool = True
@@ -93,8 +99,157 @@ class Args:
     """How often to print sample output"""
     save_path: str = "models/reward.pt"
     """Where to save the model"""
+    use_tensorflow_adam: bool = True
+    """Whether to use tensorflow-style Adam optimizer instead of PyTorch's"""
     task: TaskHParams = field(default_factory=TaskHParams)
     labels: LabelHParams = field(default_factory=LabelHParams)
+
+
+from torch import Tensor, optim
+from typing import List, Optional
+from torch.optim.optimizer import _use_grad_for_differentiable, _get_value, _dispatch_sqrt
+
+
+def _single_tensor_adam(params: List[Tensor],
+                        grads: List[Tensor],
+                        exp_avgs: List[Tensor],
+                        exp_avg_sqs: List[Tensor],
+                        max_exp_avg_sqs: List[Tensor],
+                        state_steps: List[Tensor],
+                        grad_scale: Optional[Tensor],
+                        found_inf: Optional[Tensor],
+                        *,
+                        amsgrad: bool,
+                        beta1: float,
+                        beta2: float,
+                        lr: float,
+                        weight_decay: float,
+                        eps: float,
+                        maximize: bool,
+                        capturable: bool,
+                        differentiable: bool):
+
+    assert grad_scale is None and found_inf is None
+
+    for i, param in enumerate(params):
+        grad = grads[i] if not maximize else -grads[i]
+        exp_avg = exp_avgs[i]
+        exp_avg_sq = exp_avg_sqs[i]
+        step_t = state_steps[i]
+        # update step
+        step_t += 1
+        # Decay the first and second moment running average coefficient
+        exp_avg.mul_(beta1).add_(grad, alpha=1 - beta1)
+        exp_avg_sq.mul_(beta2).addcmul_(grad, grad.conj(), value=1 - beta2)
+        step = _get_value(step_t)
+        
+        ### pytorch adam implementation:
+        # bias_correction1 = 1 - beta1 ** step
+        # bias_correction2 = 1 - beta2 ** step
+        # step_size = lr / bias_correction1
+        # bias_correction2_sqrt = _dispatch_sqrt(bias_correction2)
+        # denom = (exp_avg_sq.sqrt() / bias_correction2_sqrt).add_(eps)
+        # param.addcdiv_(exp_avg, denom, value=-step_size)
+
+        ### tensorflow adam implementation:
+        lr_t = lr * _dispatch_sqrt((1 - beta2 ** step)) / (1 - beta1 ** step)
+        denom = exp_avg_sq.sqrt().add_(eps)
+        param.addcdiv_(exp_avg, denom, value=-lr_t)
+
+
+def adam(params: List[Tensor],
+         grads: List[Tensor],
+         exp_avgs: List[Tensor],
+         exp_avg_sqs: List[Tensor],
+         max_exp_avg_sqs: List[Tensor],
+         state_steps: List[Tensor],
+         # kwonly args with defaults are not supported by functions compiled with torchscript issue #70627
+         # setting this as kwarg for now as functional API is compiled by torch/distributed/optim
+         foreach: Optional[bool] = None,
+         capturable: bool = False,
+         differentiable: bool = False,
+         fused: Optional[bool] = None,
+         grad_scale: Optional[Tensor] = None,
+         found_inf: Optional[Tensor] = None,
+         *,
+         amsgrad: bool,
+         beta1: float,
+         beta2: float,
+         lr: float,
+         weight_decay: float,
+         eps: float,
+         maximize: bool):
+    
+    func = _single_tensor_adam
+
+    func(params,
+         grads,
+         exp_avgs,
+         exp_avg_sqs,
+         max_exp_avg_sqs,
+         state_steps,
+         amsgrad=amsgrad,
+         beta1=beta1,
+         beta2=beta2,
+         lr=lr,
+         weight_decay=weight_decay,
+         eps=eps,
+         maximize=maximize,
+         capturable=capturable,
+         differentiable=differentiable,
+         grad_scale=grad_scale,
+         found_inf=found_inf)
+
+class AdamTensorFlowStyle(optim.Adam):
+    @_use_grad_for_differentiable
+    def step(self, closure=None):
+        self._cuda_graph_capture_health_check()
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+
+        for group in self.param_groups:
+            params_with_grad = []
+            grads = []
+            exp_avgs = []
+            exp_avg_sqs = []
+            max_exp_avg_sqs = []
+            state_steps = []
+            beta1, beta2 = group['betas']
+
+            self._init_group(
+                group,
+                params_with_grad,
+                grads,
+                exp_avgs,
+                exp_avg_sqs,
+                max_exp_avg_sqs,
+                state_steps)
+
+            adam(
+                params_with_grad,
+                grads,
+                exp_avgs,
+                exp_avg_sqs,
+                max_exp_avg_sqs,
+                state_steps,
+                amsgrad=group['amsgrad'],
+                beta1=beta1,
+                beta2=beta2,
+                lr=group['lr'],
+                weight_decay=group['weight_decay'],
+                eps=group['eps'],
+                maximize=group['maximize'],
+                foreach=group['foreach'],
+                capturable=group['capturable'],
+                differentiable=group['differentiable'],
+                fused=group['fused'],
+                grad_scale=getattr(self, "grad_scale", None),
+                found_inf=getattr(self, "found_inf", None),
+            )
+
+        return loss
 
 
 def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
@@ -106,35 +261,11 @@ def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
 OPENAI_PAD_TOKEN_ID = 50259
 
 
-class ScalarHead(nn.Module):
-    def __init__(self, config, scale=None, **kwargs):
-        super().__init__()
-        if not hasattr(config, "summary_dropout_prob"):
-            summary_dropout_prob = kwargs.pop("summary_dropout_prob", 0.1)
-        else:
-            summary_dropout_prob = config.summary_dropout_prob
-        self.dropout = nn.Dropout(summary_dropout_prob) if summary_dropout_prob else nn.Identity()
-        # some models such as OPT have a projection layer before the word embeddings - e.g. OPT-350m
-        if hasattr(config, "word_embed_proj_dim"):
-            hidden_size = config.word_embed_proj_dim
-        else:
-            hidden_size = config.hidden_size
-        if scale is None:
-            scale = 1 / np.sqrt(hidden_size + 1)
-        self.summary = layer_init(nn.Linear(hidden_size, 1), std=scale)
-        self.flatten = nn.Flatten()
-
-    def forward(self, hidden_states):
-        output = self.dropout(hidden_states)
-        output = self.summary(output)
-        return output
-
-
 class AutoModelForCausalLMWithScalarHead(nn.Module):
     def __init__(self, pretrained_model):
         super().__init__()
         self.pretrained_model = pretrained_model
-        self.scalar_head = ScalarHead(self.pretrained_model.config, scale=0.0)
+        self.scalar_head = layer_init(nn.Linear(pretrained_model.config.hidden_size, 1), std=0)
 
     def forward(self, **kwargs):
         output = self.pretrained_model(**kwargs)
@@ -145,7 +276,7 @@ class AutoModelForCausalLMWithRewardHead(nn.Module):
     def __init__(self, pretrained_model):
         super().__init__()
         self.pretrained_model = pretrained_model
-        self.scalar_head = ScalarHead(self.pretrained_model.config)
+        self.scalar_head = layer_init(nn.Linear(pretrained_model.config.hidden_size, 1), std=1 / np.sqrt(pretrained_model.config.hidden_size + 1))
         self.reward_gain = torch.nn.Parameter(torch.tensor(1.0), requires_grad=True)
         self.reward_bias = torch.nn.Parameter(torch.tensor(0.0), requires_grad=True)
 
@@ -160,7 +291,7 @@ class AutoModelForCausalLMWithRewardHead(nn.Module):
 
 # a pytorch dataset
 class MyDataset(IterableDataset):
-    def __init__(self, generator, tokenizer, query_length, start_text=None, end_text=None, seed=None):
+    def __init__(self, generator, tokenizer, query_length, seed, start_text=None, end_text=None):
         self.generator = generator
         self.tokenizer = tokenizer
         self.query_length = query_length
@@ -204,11 +335,18 @@ def left_padding_to_right_padding(query, pad_id):
     return torch.tensor([
         [pad_id]*(row==pad_id).sum() + [x for x in row if x != pad_id]
         for row in query
-    ])
+    ], device=query.device)
 
 
 def ceil_div(a, b):
     return (a - 1) // b + 1
+
+
+def exact_div(a, b):
+    q = a // b
+    if a != q * b:
+        raise ValueError('Inexact division: %s / %s = %s' % (a, b, a / b))
+    return q
 
 
 def generate(pretrained_model, queries, tokenizer, generation_config):
@@ -248,7 +386,7 @@ def normalize(args, accelerator, device, tokenizer, pretrained_model, reward_mod
         reward_model.module.reward_bias.data.fill_(0.0)
 
         # sample queries and responses
-        n_batches = ceil_div(args.normalize_samples, args.local_rollout_batch_size)
+        n_batches = ceil_div(args.local_normalize_samples, args.rollout_batch_size)
         sample_queries_responses = []
         for _ in range(n_batches):
             data = next(iter_dataloader)
@@ -275,7 +413,7 @@ def normalize(args, accelerator, device, tokenizer, pretrained_model, reward_mod
         reward_model.module.reward_bias.data = bias
 
         # after normalization statistics
-        n_batches = ceil_div(args.normalize_samples, args.local_rollout_batch_size)
+        n_batches = ceil_div(args.local_normalize_samples, args.rollout_batch_size)
         sample_queries_responses = []
         for _ in range(n_batches):
             data = next(iter_dataloader)
@@ -294,10 +432,13 @@ def normalize(args, accelerator, device, tokenizer, pretrained_model, reward_mod
 
 def train(args: Args):
     accelerator = Accelerator(
-        kwargs_handlers=[DistributedDataParallelKwargs(broadcast_buffers=False)] # this is needed to avoid https://github.com/pytorch/pytorch/issues/22095#issuecomment-505099500
+        kwargs_handlers=[DistributedDataParallelKwargs(broadcast_buffers=False)], # this is needed to avoid https://github.com/pytorch/pytorch/issues/22095#issuecomment-505099500
+        gradient_accumulation_steps=args.gradient_accumulation_steps
     )
     args.world_size = accelerator.num_processes
     args.batch_size = int(args.local_batch_size * args.world_size)
+    args.normalize_samples = int(args.local_normalize_samples * args.world_size)
+    args.local_micro_batch_size = exact_div(args.local_batch_size, args.gradient_accumulation_steps)
 
     console = Console(force_terminal=True)
     run_name = f"{args.exp_name}__{args.seed}__{int(time.time())}"
@@ -323,10 +464,10 @@ def train(args: Args):
         )
         pprint(args)
     device = accelerator.device
-    args.seed += accelerator.process_index
-    random.seed(args.seed)
-    np.random.seed(args.seed)
-    torch.manual_seed(args.seed)
+    local_seed = args.seed + accelerator.process_index * 100003  # Prime
+    random.seed(local_seed)
+    np.random.seed(local_seed)
+    torch.manual_seed(local_seed)
     torch.backends.cudnn.deterministic = True
     tokenizer = AutoTokenizer.from_pretrained(
         args.base_model,
@@ -338,17 +479,20 @@ def train(args: Args):
     reward_model = AutoModelForCausalLMWithRewardHead(AutoModelForCausalLM.from_pretrained(args.base_model)).to(device)
     reward_model.pretrained_model.generation_config.eos_token_id = None  # disable `pad_token_id` and `eos_token_id` because we just want to
     reward_model.pretrained_model.generation_config.pad_token_id = None  # generate tokens without truncation / padding
-    optimizer = optim.Adam(reward_model.parameters(), lr=args.lr, eps=args.eps)
+    if args.use_tensorflow_adam:
+        optimizer = AdamTensorFlowStyle(reward_model.parameters(), lr=args.lr, eps=args.eps)
+    else:
+        optimizer = optim.Adam(reward_model.parameters(), lr=args.lr, eps=args.eps)
     dataset = MyDataset(
         DATASET[args.task.query_dataset],
         tokenizer,
         args.task.query_length,
+        seed=local_seed,
         start_text=args.task.start_text,
         end_text=args.task.end_text,
     )
-    dataloader = DataLoader(dataset, batch_size=args.local_rollout_batch_size)
+    dataloader = DataLoader(dataset, batch_size=args.rollout_batch_size)
     reward_model, optimizer, dataloader = accelerator.prepare(reward_model, optimizer, dataloader)
-    print(reward_model)
     iter_dataloader = iter(dataloader)
 
     generation_config = GenerationConfig(
@@ -374,56 +518,107 @@ def train(args: Args):
     print("after====", reward_model.module.reward_gain.data)
 
     print("===training reward model===")
-    all_inds = np.arange(args.labels.num_train)
-    np.random.shuffle(all_inds)
+    all_inds = np.random.permutation(args.labels.num_train)
     # ensure that all processes have the same shuffled indices
     all_inds = broadcast(torch.tensor(all_inds, device=device), 0)
     all_inds = all_inds.cpu().numpy()
     global_step = 0
     for start in range(0, args.labels.num_train, args.batch_size):
+        # linear rate annealing
+        lr = (1 - start / args.labels.num_train) * args.lr
+        optimizer.param_groups[0]["lr"] = lr
+
         global_step += 1
         end = start + args.batch_size
         b_inds_all = all_inds[start:end]
         b_inds = b_inds_all[accelerator.process_index::accelerator.num_processes] #  multi-GPU slicing
-        lr = (1 - start / args.labels.num_train) * args.lr
-        optimizer.param_groups[0]["lr"] = lr
-        mb_data = label[b_inds]
-        # print("accelerator.process_index", accelerator.process_index, b_inds, b_inds_all)
-        mb_query = torch.from_numpy(np.stack(mb_data["query"]))
-        mb_query = left_padding_to_right_padding(mb_query, tokenizer.pad_token_id).to(device)
-        mb_best = torch.from_numpy(np.stack(mb_data["best"])).to(device)
-        mb_responses = [
-            torch.from_numpy(np.stack(mb_data[f"sample{i}"])).to(device)
-            for i in range(args.labels.num_labels)
-        ]
-        # hack: deal with openai's padding token
-        # assert (mb_query == tokenizer.pad_token_id).sum() == 0
-        mb_query[mb_query == OPENAI_PAD_TOKEN_ID] = tokenizer.pad_token_id
-        for item in mb_responses:
-            # assert (item == tokenizer.pad_token_id).sum() == 0
-            item[item == OPENAI_PAD_TOKEN_ID] = tokenizer.pad_token_id
+        losses = torch.zeros((args.gradient_accumulation_steps,), device=device)
+        accuracies = torch.zeros((args.gradient_accumulation_steps,), device=device)
+        gradient_accumulation_step = 0
+        for micro_batch_start in range(0, args.local_batch_size, args.local_micro_batch_size):
+            with accelerator.accumulate(reward_model):
+                micro_batch_end = micro_batch_start + args.local_micro_batch_size 
+                micro_batch_inds = b_inds[micro_batch_start:micro_batch_end]
+                mb_data = label[micro_batch_inds]
+                accelerator.print(accelerator.gather(torch.tensor(micro_batch_inds, device=device)))
+                mb_query = torch.from_numpy(np.stack(mb_data["query"])).to(device)
+                mb_best = torch.from_numpy(np.stack(mb_data["best"])).to(device)
+                mb_responses = [
+                    torch.from_numpy(np.stack(mb_data[f"sample{i}"])).to(device)
+                    for i in range(args.labels.num_labels)
+                ]
+                # hack: deal with openai's padding token
+                mb_query[mb_query == OPENAI_PAD_TOKEN_ID] = tokenizer.pad_token_id
+                for item in mb_responses:
+                    item[item == OPENAI_PAD_TOKEN_ID] = tokenizer.pad_token_id
 
-        predicted_rewards = []
-        for i in range(args.labels.num_labels):
-            query_responses = torch.cat([mb_query, mb_responses[i]], dim=1)
-            reward = get_reward(reward_model, query_responses, tokenizer)[1]
-            predicted_rewards.append(
-                reward.squeeze()
-            )
-        predicted_rewards = torch.stack(
-            predicted_rewards, dim=1
-        )  # shape (batch_size, num_labels), basically a reward prediction for each label
-        accuracy = (predicted_rewards.argmax(1) == mb_best).float().mean()
-        loss = torch.nn.functional.cross_entropy(predicted_rewards, mb_best)
-        optimizer.zero_grad()
-        accelerator.backward(loss)
-        optimizer.step()
-        writer.add_scalar("train/loss", accelerator.gather(loss).mean().item(), global_step)
-        writer.add_scalar("train/accuracy", accelerator.gather(accuracy).mean().item(), global_step)
+                predicted_rewards = []
+                for i in range(args.labels.num_labels):
+                    query_responses = torch.cat([mb_query, mb_responses[i]], dim=1)
+                    query_responses = left_padding_to_right_padding(query_responses, tokenizer.pad_token_id)
+                    reward = get_reward(reward_model, query_responses, tokenizer)[1]
+                    predicted_rewards.append(
+                        reward.view(-1)
+                    )
+                predicted_rewards = torch.stack(
+                    predicted_rewards, dim=1
+                )  # shape (batch_size, num_labels), basically a reward prediction for each label
+                accuracy = (predicted_rewards.argmax(1) == mb_best).float().mean()
+                loss = torch.nn.functional.cross_entropy(predicted_rewards, mb_best)
+                accelerator.backward(loss)
+                optimizer.step()  # accelerate handles gradient accumulation automatically
+                optimizer.zero_grad()
+                losses[gradient_accumulation_step] = loss
+                accuracies[gradient_accumulation_step] = accuracy
+            gradient_accumulation_step += 1
+
+        writer.add_scalar("train/loss", accelerator.gather(losses).mean().item(), global_step)
+        writer.add_scalar("train/accuracy", accelerator.gather(accuracies).mean().item(), global_step)
         writer.add_scalar("train/lr", lr, global_step)
 
         if args.print_sample_output_freq > 0 and global_step % args.print_sample_output_freq == 0:
             with torch.no_grad():
+                # eval on test_label, some duplicate code (I don't want to make the training loop into a function...)
+                test_accuracies = []
+                new_all_inds = np.arange(len(label))
+                for start in range(args.labels.num_train, len(label), args.batch_size):
+                    end = start + args.batch_size
+                    b_inds_all = new_all_inds[start:end]
+                    b_inds = b_inds_all[accelerator.process_index::accelerator.num_processes] #  multi-GPU slicing
+                    for micro_batch_start in range(0, args.local_batch_size, args.local_micro_batch_size):
+                        micro_batch_end = micro_batch_start + args.local_micro_batch_size 
+                        micro_batch_inds = b_inds[micro_batch_start:micro_batch_end]
+                        mb_data = label[micro_batch_inds]
+                        mb_query = torch.from_numpy(np.stack(mb_data["query"]))
+                        mb_query = left_padding_to_right_padding(mb_query, tokenizer.pad_token_id).to(device)
+                        mb_best = torch.from_numpy(np.stack(mb_data["best"])).to(device)
+                        mb_responses = [
+                            torch.from_numpy(np.stack(mb_data[f"sample{i}"])).to(device)
+                            for i in range(args.labels.num_labels)
+                        ]
+                        # hack: deal with openai's padding token
+                        mb_query[mb_query == OPENAI_PAD_TOKEN_ID] = tokenizer.pad_token_id
+                        for item in mb_responses:
+                            item[item == OPENAI_PAD_TOKEN_ID] = tokenizer.pad_token_id
+                        predicted_rewards = []
+                        for i in range(args.labels.num_labels):
+                            query_responses = torch.cat([mb_query, mb_responses[i]], dim=1)
+                            query_responses = left_padding_to_right_padding(query_responses, tokenizer.pad_token_id)
+                            reward = get_reward(reward_model, query_responses, tokenizer)[1]
+                            predicted_rewards.append(
+                                reward.view(-1)
+                            )
+                        predicted_rewards = torch.stack(
+                            predicted_rewards, dim=1
+                        )  # shape (batch_size, num_labels), basically a reward prediction for each label
+                        accuracy = (predicted_rewards.argmax(1) == mb_best).float().mean()
+                        test_accuracies.append(accuracy)
+                test_accuracy = accelerator.gather(torch.stack(test_accuracies).mean()).mean().item()
+                writer.add_scalar("test/accuracy", test_accuracy, global_step)
+                if accelerator.is_main_process:
+                    print("test/accuracy", test_accuracy, global_step)
+
+                # the part below is testing out some generations and KLs, not presented in the original code
                 data = next(iter_dataloader)
                 queries = data["input_ids"].to(device)
                 context_length = queries.shape[1]
@@ -436,12 +631,14 @@ def train(args: Args):
                 logits /= args.task.temperature
                 all_logprobs = F.log_softmax(logits, dim=-1)
                 logprobs = torch.gather(all_logprobs, 2, responses.unsqueeze(-1)).squeeze(-1)
+                del output, logits, all_logprobs; torch.cuda.empty_cache()
 
                 output, _ = get_reward(untrained_model, query_responses, tokenizer)
                 logits = output.logits[:,context_length-1:-1]
                 logits /= args.task.temperature
                 all_logprobs = F.log_softmax(logits, dim=-1)
                 ref_logprobs = torch.gather(all_logprobs, 2, responses.unsqueeze(-1)).squeeze(-1)
+                del output, logits, all_logprobs; torch.cuda.empty_cache()
 
                 print(f"global_step {global_step}:")
                 kl = logprobs - ref_logprobs
@@ -453,46 +650,6 @@ def train(args: Args):
                     f"\n[red]average kl: {kl.sum(1).mean().item()}[/]"
                 )
                 writer.add_scalar("train/kl", kl.sum(1).mean().item(), global_step)
-
-            # eval on test_label
-            test_accuracies = []
-            all_inds = np.arange(len(label))
-            for start in range(args.labels.num_train, len(label), args.batch_size):
-                end = start + args.batch_size
-                b_inds_all = all_inds[start:end]
-                b_inds = b_inds_all[accelerator.process_index::accelerator.num_processes] #  multi-GPU slicing
-                mb_data = label[b_inds]
-                # print("accelerator.process_index", accelerator.process_index, b_inds, b_inds_all)
-                mb_query = torch.from_numpy(np.stack(mb_data["query"]))
-                mb_query = left_padding_to_right_padding(mb_query, tokenizer.pad_token_id).to(device)
-                mb_best = torch.from_numpy(np.stack(mb_data["best"])).to(device)
-                mb_responses = [
-                    torch.from_numpy(np.stack(mb_data[f"sample{i}"])).to(device)
-                    for i in range(args.labels.num_labels)
-                ]
-                # hack: deal with openai's padding token
-                # assert (mb_query == tokenizer.pad_token_id).sum() == 0
-                mb_query[mb_query == OPENAI_PAD_TOKEN_ID] = tokenizer.pad_token_id
-                for item in mb_responses:
-                    # assert (item == tokenizer.pad_token_id).sum() == 0
-                    item[item == OPENAI_PAD_TOKEN_ID] = tokenizer.pad_token_id
-
-                predicted_rewards = []
-                for i in range(args.labels.num_labels):
-                    query_responses = torch.cat([mb_query, mb_responses[i]], dim=1)
-                    reward = get_reward(reward_model, query_responses, tokenizer)[1]
-                    predicted_rewards.append(
-                        reward.squeeze()
-                    )
-                predicted_rewards = torch.stack(
-                    predicted_rewards, dim=1
-                )  # shape (batch_size, num_labels), basically a reward prediction for each label
-                accuracy = (predicted_rewards.argmax(1) == mb_best).float().mean()
-                test_accuracies.append(accuracy)
-            test_accuracy = accelerator.gather(torch.stack(test_accuracies).mean()).mean().item()
-            writer.add_scalar("test/accuracy", test_accuracy, global_step)
-            if accelerator.is_main_process:
-                print("test/accuracy", test_accuracy, global_step)
 
     torch.cuda.empty_cache()
     if args.normalize_after:

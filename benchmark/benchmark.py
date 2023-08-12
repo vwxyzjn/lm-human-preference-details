@@ -76,13 +76,13 @@ def autotag() -> str:
 if __name__ == "__main__":
     args = parse_args()
     if args.auto_tag:
-        if "WANDB_TAGS" in os.environ:
-            raise ValueError(
-                "WANDB_TAGS is already set. Please unset it before running this script or run the script with --auto-tag False"
-            )
+        existing_wandb_tag = os.environ.get("WANDB_TAGS", "")
         wandb_tag = autotag()
         if len(wandb_tag) > 0:
-            os.environ["WANDB_TAGS"] = wandb_tag
+            if len(existing_wandb_tag) > 0:
+                os.environ["WANDB_TAGS"] = ",".join([existing_wandb_tag, wandb_tag])
+            else:
+                os.environ["WANDB_TAGS"] = wandb_tag
 
     commands = []
     for seed in range(0, args.num_seeds):
