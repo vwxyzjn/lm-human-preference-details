@@ -329,9 +329,8 @@ class MyDataset(IterableDataset):
             yield output
 
 
-def left_padding_to_right_padding(query, pad_id):
-    # got to convert to right padding, otherwise `transformers` has weird issues
-    # even with `position_ids`
+def right_padding_to_left_padding(query, pad_id):
+    # Convert from right padding to left padding.
     return torch.tensor([
         [pad_id]*(row==pad_id).sum() + [x for x in row if x != pad_id]
         for row in query
@@ -391,7 +390,7 @@ def normalize(args, accelerator, device, tokenizer, pretrained_model, reward_mod
         for _ in range(n_batches):
             data = next(iter_dataloader)
             queries = data["input_ids"].to(device)
-            queries = left_padding_to_right_padding(data["input_ids"], tokenizer.pad_token_id).to(device)
+            queries = right_padding_to_left_padding(data["input_ids"], tokenizer.pad_token_id).to(device)
             query_responses = generate(pretrained_model, queries, tokenizer, generation_config)
             sample_queries_responses.append(query_responses)
         
@@ -418,7 +417,7 @@ def normalize(args, accelerator, device, tokenizer, pretrained_model, reward_mod
         for _ in range(n_batches):
             data = next(iter_dataloader)
             queries = data["input_ids"].to(device)
-            queries = left_padding_to_right_padding(data["input_ids"], tokenizer.pad_token_id).to(device)
+            queries = right_padding_to_left_padding(data["input_ids"], tokenizer.pad_token_id).to(device)
             query_responses = generate(pretrained_model, queries, tokenizer, generation_config)
             sample_queries_responses.append(query_responses)
         rewards = []
@@ -555,7 +554,7 @@ def train(args: Args):
                 predicted_rewards = []
                 for i in range(args.labels.num_labels):
                     query_responses = torch.cat([mb_query, mb_responses[i]], dim=1)
-                    query_responses = left_padding_to_right_padding(query_responses, tokenizer.pad_token_id)
+                    query_responses = right_padding_to_left_padding(query_responses, tokenizer.pad_token_id)
                     reward = get_reward(reward_model, query_responses, tokenizer)[1]
                     predicted_rewards.append(
                         reward.view(-1)
@@ -590,7 +589,7 @@ def train(args: Args):
                         micro_batch_inds = b_inds[micro_batch_start:micro_batch_end]
                         mb_data = label[micro_batch_inds]
                         mb_query = torch.from_numpy(np.stack(mb_data["query"]))
-                        mb_query = left_padding_to_right_padding(mb_query, tokenizer.pad_token_id).to(device)
+                        mb_query = right_padding_to_left_padding(mb_query, tokenizer.pad_token_id).to(device)
                         mb_best = torch.from_numpy(np.stack(mb_data["best"])).to(device)
                         mb_responses = [
                             torch.from_numpy(np.stack(mb_data[f"sample{i}"])).to(device)
@@ -603,7 +602,7 @@ def train(args: Args):
                         predicted_rewards = []
                         for i in range(args.labels.num_labels):
                             query_responses = torch.cat([mb_query, mb_responses[i]], dim=1)
-                            query_responses = left_padding_to_right_padding(query_responses, tokenizer.pad_token_id)
+                            query_responses = right_padding_to_left_padding(query_responses, tokenizer.pad_token_id)
                             reward = get_reward(reward_model, query_responses, tokenizer)[1]
                             predicted_rewards.append(
                                 reward.view(-1)
@@ -622,7 +621,7 @@ def train(args: Args):
                 data = next(iter_dataloader)
                 queries = data["input_ids"].to(device)
                 context_length = queries.shape[1]
-                queries = left_padding_to_right_padding(data["input_ids"], tokenizer.pad_token_id).to(device)
+                queries = right_padding_to_left_padding(data["input_ids"], tokenizer.pad_token_id).to(device)
                 query_responses = generate(accelerator.unwrap_model(reward_model).pretrained_model, queries, tokenizer, generation_config)
                 responses = query_responses[:, context_length:]
 
