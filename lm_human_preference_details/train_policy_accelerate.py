@@ -348,9 +348,8 @@ class MyDataset(IterableDataset):
             yield output
 
 
-def left_padding_to_right_padding(query, pad_id):
-    # got to convert to right padding, otherwise `transformers` has weird issues
-    # even with `position_ids`
+def right_padding_to_left_padding(query, pad_id):
+    # Convert from right padding to left padding.
     return torch.tensor([
         [pad_id]*(row==pad_id).sum() + [x for x in row if x != pad_id]
         for row in query
@@ -521,7 +520,7 @@ def train(args: Args):
         data = next(iter_dataloader)
         with torch.no_grad():
             queries = data["input_ids"].to(device)
-            queries = left_padding_to_right_padding(data["input_ids"], tokenizer.pad_token_id).to(device)
+            queries = right_padding_to_left_padding(data["input_ids"], tokenizer.pad_token_id).to(device)
             query_responses = generate(accelerator.unwrap_model(policy).pretrained_model, queries, tokenizer, generation_config)
             context_length = queries.shape[1]
             responses = query_responses[:,context_length:]
@@ -553,7 +552,7 @@ def train(args: Args):
 
             # 2. run reward model on the truncated responses
             postprocessed_query_responses = torch.cat((queries, postprocessed_responses), 1)
-            postprocessed_query_responses = left_padding_to_right_padding(postprocessed_query_responses, tokenizer.pad_token_id)
+            postprocessed_query_responses = right_padding_to_left_padding(postprocessed_query_responses, tokenizer.pad_token_id)
             scores = get_reward(reward_model, postprocessed_query_responses, tokenizer).flatten()
 
             # 3. filter response. Ensure that the sample contains truncate_token
