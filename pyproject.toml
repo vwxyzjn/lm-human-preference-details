@@ -17,6 +17,7 @@ ftfy = "^6.1.1"
 rich = "^13.4.2"
 transformers = "^4.30.1"
 tensorboard = "^2.13.0"
+accelerate = "^0.22.0"
 
 
 [tool.poetry.group.dev.dependencies]
