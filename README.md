@@ -14,6 +14,7 @@ This repo is just for educational / learning purposes. For more advanced users, 
 
 ```
 poetry install
+poetry shell
 accelerate launch \
     --num_processes 8 \
     lm_human_preference_details/train_both_accelerate.py \
