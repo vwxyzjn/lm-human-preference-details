@@ -513,7 +513,7 @@ def train(args: Args):
 
     print("before====", reward_model.module.reward_gain.data)
     if args.normalize_before:
-        normalize(args, accelerator, device, tokenizer, accelerator.unwrap_model(reward_model).pretrained_model, reward_model, iter_dataloader, generation_config)
+        normalize(args, accelerator, device, tokenizer, untrained_model, reward_model, iter_dataloader, generation_config)
     print("after====", reward_model.module.reward_gain.data)
 
     print("===training reward model===")
@@ -652,7 +652,7 @@ def train(args: Args):
 
     torch.cuda.empty_cache()
     if args.normalize_after:
-        normalize(args, accelerator, device, tokenizer, accelerator.unwrap_model(reward_model).pretrained_model, reward_model, iter_dataloader, generation_config)
+        normalize(args, accelerator, device, tokenizer, untrained_model, reward_model, iter_dataloader, generation_config)
 
     # save model
     if args.save_path:
