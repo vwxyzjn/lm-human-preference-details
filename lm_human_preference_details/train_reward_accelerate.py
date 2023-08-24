@@ -476,6 +476,8 @@ def train(args: Args):
     tokenizer.add_special_tokens({"pad_token": "[PAD]"})
     untrained_model = AutoModelForCausalLMWithRewardHead(AutoModelForCausalLM.from_pretrained(args.base_model)).to(device)
     reward_model = AutoModelForCausalLMWithRewardHead(AutoModelForCausalLM.from_pretrained(args.base_model)).to(device)
+    untrained_model.pretrained_model.generation_config.eos_token_id = None  # disable `pad_token_id` and `eos_token_id` because we just want to
+    untrained_model.pretrained_model.generation_config.pad_token_id = None  # generate tokens without truncation / padding
     reward_model.pretrained_model.generation_config.eos_token_id = None  # disable `pad_token_id` and `eos_token_id` because we just want to
     reward_model.pretrained_model.generation_config.pad_token_id = None  # generate tokens without truncation / padding
     if args.use_tensorflow_adam:
@@ -513,7 +515,7 @@ def train(args: Args):
 
     print("before====", reward_model.module.reward_gain.data)
     if args.normalize_before:
-        normalize(args, accelerator, device, tokenizer, untrained_model, reward_model, iter_dataloader, generation_config)
+        normalize(args, accelerator, device, tokenizer, untrained_model.pretrained_model, reward_model, iter_dataloader, generation_config)
     print("after====", reward_model.module.reward_gain.data)
 
     print("===training reward model===")
@@ -539,7 +541,6 @@ def train(args: Args):
                 micro_batch_end = micro_batch_start + args.local_micro_batch_size 
                 micro_batch_inds = b_inds[micro_batch_start:micro_batch_end]
                 mb_data = label[micro_batch_inds]
-                accelerator.print(accelerator.gather(torch.tensor(micro_batch_inds, device=device)))
                 mb_query = torch.from_numpy(np.stack(mb_data["query"])).to(device)
                 mb_best = torch.from_numpy(np.stack(mb_data["best"])).to(device)
                 mb_responses = [
@@ -652,7 +653,7 @@ def train(args: Args):
 
     torch.cuda.empty_cache()
     if args.normalize_after:
-        normalize(args, accelerator, device, tokenizer, untrained_model, reward_model, iter_dataloader, generation_config)
+        normalize(args, accelerator, device, tokenizer, untrained_model.pretrained_model, reward_model, iter_dataloader, generation_config)
 
     # save model
     if args.save_path:
