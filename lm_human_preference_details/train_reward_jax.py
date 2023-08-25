@@ -23,12 +23,8 @@ from flax import traverse_util, jax_utils
 from flax.training.train_state import TrainState
 import flax.linen as nn
 
-# from flax.metrics import tensorboard
-# import tensorflow as tf
 from lm_human_preference_details.data import DATASET
 from torch.utils import tensorboard
-
-# tf.config.experimental.set_visible_devices([], "GPU")
 
 
 @dataclass
@@ -65,7 +61,7 @@ class Args:
     """seed of the experiment"""
     track: bool = False
     """if toggled, this experiment will be tracked with Weights and Biases"""
-    wandb_project_name: str = "cleanrl"
+    wandb_project_name: str = "lm_human_preference_details"
     """the wandb's project name"""
     wandb_entity: Optional[str] = None
     """the entity (team) of wandb's project"""
