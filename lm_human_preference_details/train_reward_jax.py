@@ -1,20 +1,23 @@
-""" Train jax-based reward model for LM human preference details."""
 import os
-from dataclasses import asdict, dataclass, field
-from typing import Optional
 import time
-import functools
+from dataclasses import asdict, dataclass, field
+from types import SimpleNamespace
+from typing import Optional
 import numpy as np
+import tyro
+from datasets import load_dataset
+from rich.pretty import pprint
 from torch.utils.data import DataLoader, IterableDataset
+
+import functools
 import jax
 import jax.numpy as jnp
 import orbax
 import optax
+from optax import ScaleByAdamState, update_moment, update_moment_per_elem_norm
+from optax._src.alias import _scale_by_learning_rate
+from optax._src import base, utils, combine, numerics
 from einops import rearrange
-import tyro
-from datasets import load_dataset
-from rich.pretty import pprint
-import transformers
 import flax
 from flax.training import common_utils
 from flax.training import orbax_utils
@@ -22,9 +25,9 @@ from flax.core.frozen_dict import freeze
 from flax import traverse_util, jax_utils
 from flax.training.train_state import TrainState
 import flax.linen as nn
-
+from transformers import FlaxAutoModelForCausalLM, AutoTokenizer, GenerationConfig
+from torch.utils.tensorboard import SummaryWriter
 from lm_human_preference_details.data import DATASET
-from torch.utils import tensorboard
 
 
 @dataclass
@@ -61,20 +64,21 @@ class Args:
     """seed of the experiment"""
     track: bool = False
     """if toggled, this experiment will be tracked with Weights and Biases"""
-    wandb_project_name: str = "lm_human_preference_details"
+    wandb_project_name: str = "cleanrl"
     """the wandb's project name"""
     wandb_entity: Optional[str] = None
     """the entity (team) of wandb's project"""
     cuda: bool = True
     """Whether to use cuda if available."""
+    distributed: bool = False
+    "whether to use `jax.distirbuted`"
     run_name: tyro.conf.Suppress[str] = None
     """TO BE FILLED: a unique name of this run"""
 
     base_model: str = "gpt2"
     """the name of the pretrained model to use"""
     label_dataset: str = "sentiment/offline_5k.json"
-    """the name of the dataset to use for labels in
-    `https://huggingface.co/datasets/vwxyzjn/lm-human-preferences`"""
+    """the name of the dataset to use for labels in `https://huggingface.co/datasets/vwxyzjn/lm-human-preferences`"""
     local_batch_size: int = 4
     """per rank batch size"""
     gradient_accumulation_steps: int = 1
@@ -85,7 +89,7 @@ class Args:
     """the learning rate"""
     eps: float = 1e-5
     """the epsilon for AdamW"""
-    rollout_batch_size: int = 512  # decrease this to e.g. 64 if OOM
+    rollout_batch_size: int = 512
     """rollout batch size"""
     world_size: tyro.conf.Suppress[int] = None
     """the number of processes to use"""
@@ -98,16 +102,14 @@ class Args:
     debug_normalize: int = 0
     """Samples used to check that normalization worked"""
     normalize_before: bool = True
-    """Whether, before training, to normalize the rewards on the policy to the
-    scales on the training buffer. (For comparisons, just use mean 0, var 1.)"""
+    """Whether, before training, to normalize the rewards on the policy to the scales on the training buffer. (For comparisons, just use mean 0, var 1.)"""
     normalize_after: bool = True
-    """Whether, after training, to normalize the rewards on the ref policy to
-    mean 0, var 1 (so the KL coefficient always has the same meaning)."""
+    """Whether, after training, to normalize the rewards on the ref policy to mean 0, var 1 (so the KL coefficient always has the same meaning)."""
     print_sample_output_freq: int = 10
     """How often to print sample output"""
-    save_path: str = "models/"
+    save_path: str = "models/reward.pt"
     """Where to save the model"""
-    use_tensorflow_adam: bool = False
+    use_tensorflow_adam: bool = True
     """Whether to use tensorflow-style Adam optimizer instead of PyTorch's"""
     task: TaskHParams = field(default_factory=TaskHParams)
     labels: LabelHParams = field(default_factory=LabelHParams)
@@ -116,49 +118,107 @@ class Args:
 OPENAI_PAD_TOKEN_ID = 50259
 
 
+def scale_by_adam_tf_style(
+    b1: float = 0.9,
+    b2: float = 0.999,
+    eps: float = 1e-8,
+    eps_root: float = 0.0,
+    mu_dtype=None,
+) -> base.GradientTransformation:
+    """Rescale updates according to the Adam algorithm.
+    References:
+            [Kingma et al, 2014](https://arxiv.org/abs/1412.6980)
+    Args:
+            b1: Decay rate for the exponentially weighted average of grads.
+            b2: Decay rate for the exponentially weighted average of squared grads.
+            eps: Term added to the denominator to improve numerical stability.
+            eps_root: Term added to the denominator inside the square-root to improve
+                    numerical stability when backpropagating gradients through the rescaling.
+            mu_dtype: Optional `dtype` to be used for the first order accumulator; if
+                    `None` then the `dtype` is inferred from `params` and `updates`.
+    Returns:
+            A `GradientTransformation` object.
+    """
+
+    mu_dtype = utils.canonicalize_dtype(mu_dtype)
+
+    def init_fn(params):
+        mu = jax.tree_util.tree_map(  # First moment
+            lambda t: jnp.zeros_like(t, dtype=mu_dtype), params
+        )
+        nu = jax.tree_util.tree_map(jnp.zeros_like, params)  # Second moment
+        return ScaleByAdamState(count=jnp.zeros([], jnp.int32), mu=mu, nu=nu)
+
+    def update_fn(updates, state, params=None):
+        del params
+        mu = update_moment(updates, state.mu, b1, 1)
+        nu = update_moment_per_elem_norm(updates, state.nu, b2, 2)
+        count_inc = numerics.safe_int32_increment(state.count)
+
+        ### `optax` default adam implementation
+        # mu_hat = bias_correction(mu, b1, count_inc)
+        # nu_hat = bias_correction(nu, b2, count_inc)
+        # updates = jax.tree_util.tree_map(
+        #     lambda m, v: m / (jnp.sqrt(v + eps_root) + eps), mu_hat, nu_hat)
+        ### Tensorflow adam implementation
+        updates = jax.tree_util.tree_map(
+            lambda m, v: (jnp.sqrt(1 - b2**count_inc) / (1 - b1**count_inc))
+            * m
+            / (jnp.sqrt(v + eps_root) + eps),
+            mu,
+            nu,
+        )  #
+        mu = utils.cast_tree(mu, mu_dtype)
+        return updates, ScaleByAdamState(count=count_inc, mu=mu, nu=nu)
+
+    return base.GradientTransformation(init_fn, update_fn)
+
+
+def adam_tf_style(
+    learning_rate,
+    b1: float = 0.9,
+    b2: float = 0.999,
+    eps: float = 1e-8,
+    eps_root: float = 0.0,
+    mu_dtype=None,
+):
+    return combine.chain(
+        scale_by_adam_tf_style(
+            b1=b1, b2=b2, eps=eps, eps_root=eps_root, mu_dtype=mu_dtype
+        ),
+        _scale_by_learning_rate(learning_rate),
+    )
+
+
 @flax.struct.dataclass
 class RewardModelParams:
     """Parameters for the reward model."""
 
-    backbone_params: flax.core.FrozenDict
+    lm_backbone_params: flax.core.FrozenDict
     head_params: flax.core.FrozenDict
 
 
 class RewardHead(nn.Module):
-    """Affine transform head for the reward model.
-
-    Attributes:
-      head_input_size: Size of the input to the head. The weights of the linear
-        layer are initialized from mean-zero Gaussians with std
-        1/sqrt(head_input_size + 1).
-
-    Example:
-      model = RewardHead(head_input_size=768)
-      variables = model.init(jax.random.PRNGKey(0),
-        jnp.ones((1, 6, 768)))
-    """
-
     head_input_size: int
 
-    def setup(self):
-        self.reward_linear = nn.Dense(
+    @nn.compact
+    def __call__(self, x):
+        assert x.shape[-1] == self.head_input_size
+        x = nn.Dense(
             1,
             kernel_init=nn.initializers.normal(
                 stddev=1 / np.sqrt(self.head_input_size + 1)
             ),
             bias_init=nn.initializers.zeros_init(),
-        )
-        self.reward_gain = self.param("reward_gain", nn.initializers.ones_init(), ())
-        self.reward_bias = self.param("reward_bias", nn.initializers.zeros_init(), ())
-
-    def __call__(self, x):
-        assert x.shape[-1] == self.head_input_size
-        x = self.reward_linear(x)
-        x = x * self.reward_gain + self.reward_bias
+        )(x)
+        reward_gain = self.param("reward_gain", nn.initializers.ones_init(), ())
+        reward_bias = self.param("reward_bias", nn.initializers.zeros_init(), ())
+        x = x * reward_gain + reward_bias
         return x
 
 
-class MyDataset(IterableDataset):
+# Dataset for reward-model normalization
+class NormalizationDataset(IterableDataset):
     """A dataset for reward model normalization."""
 
     def __init__(
@@ -219,7 +279,7 @@ def ceil_div(a, b):
 def exact_div(a, b):
     q = a // b
     if a != q * b:
-        raise ValueError(f"Inexact division: {a} / {b} = {a/b}")
+        raise ValueError("Inexact division: %s / %s = %s" % (a, b, a / b))
     return q
 
 
@@ -228,94 +288,87 @@ def generate(pretrained_model, queries, args, generation_config):
     """generate in a way that does not affect padding tokens"""
     context_length = queries.shape[1]
     attention_mask = queries != args.pad_token_id
-    # set padding tokens to 0
-    input_ids = jnp.where(attention_mask, queries, 0)
+    input_ids = jnp.where(attention_mask, queries, 0)  # set padding tokens to 0
     output = pretrained_model.generate(
         input_ids=input_ids,
         attention_mask=attention_mask.astype("int32"),
-        # position_ids=attention_mask.cumsum(1) - attention_mask.long(),
-        # generation collapsed if this was turned on.
-        # TODO: why does generation collapse with this?
+        # need to convert to int for now, due to the bug https://github.com/huggingface/transformers/issues/25634
+        # position_ids=attention_mask.cumsum(1) - attention_mask.long(), # generation collapsed if this was turned on. TODO: why does generation collapse with this?
         generation_config=generation_config,
         return_dict_in_generate=True,
     )
+    # restore padding tokens
     return jnp.concatenate((queries, output.sequences[:, context_length:]), axis=1)
 
 
 def single_epoch_linear_schedule(global_step, args):
-    """ anneal learning rate linearly to reach 0 after one epoch."""
+    """anneal learning rate linearly to reach 0 after one epoch."""
     frac = 1.0 - global_step * args.batch_size / args.labels.num_train
     return args.lr * frac
 
 
 def create_initial_reward_state_and_models(init_key, args):
-    # pylint: disable=redefined-outer-name
     """reate reward model and initial reward state."""
 
-    reward_backbone = transformers.FlaxAutoModelForCausalLM.from_pretrained(
-        args.base_model
-    )
-    reward_head = RewardHead(head_input_size=reward_backbone.config.hidden_size)
+    lm_backbone = FlaxAutoModelForCausalLM.from_pretrained(args.base_model)
+    scalar_head = RewardHead(head_input_size=lm_backbone.config.hidden_size)
+
+    def get_reward(
+        params: RewardModelParams,
+        query_responses_ids: jnp.ndarray,
+    ):
+        """Get reward for each queiry--response pair."""
+        assert query_responses_ids.ndim == 2
+        # query_responses_ids: [batch_size, length]
+
+        # mask out padding tokens
+        attention_mask = query_responses_ids != args.pad_token_id
+        query_responses_ids = jnp.where(attention_mask, query_responses_ids, 0)
+
+        # assign position ids
+        position_ids = attention_mask.cumsum(1) - attention_mask
+
+        reward_latents = lm_backbone.module.apply(
+            variables=params.lm_backbone_params,
+            input_ids=query_responses_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            output_hidden_states=True,
+        ).hidden_states[-1]
+        # shape: [batch_size, length, hidden_size]
+
+        last_reward_latents = reward_latents[:, -1, :]
+        # shape: [batch_size, hidden_size]
+
+        reward = scalar_head.apply(variables=params.head_params, x=last_reward_latents)
+        # shape: [batch_size, 1]
+        return reward
 
     if args.use_tensorflow_adam:
-        raise NotImplementedError("tensorflow adam is not implemented yet.")
+        adam = adam_tf_style
     else:
-        optimizer = optax.adam(
-            learning_rate=functools.partial(single_epoch_linear_schedule, args=args),
-            eps=args.eps,
-        )
+        adam = optax.adam
 
-    if args.gradient_accumulation_steps > 1:
-        optimizer = optax.MultiSteps(optimizer, args.gradient_accumulation_steps)
+    optimizer = adam(
+        learning_rate=functools.partial(single_epoch_linear_schedule, args=args),
+        eps=args.eps,
+    )
+
+    optimizer = optax.MultiSteps(optimizer, args.gradient_accumulation_steps)
     state = TrainState.create(
-        apply_fn=None,
+        apply_fn=get_reward,
         params=RewardModelParams(
-            backbone_params=flax.core.FrozenDict({"params": reward_backbone.params}),
+            lm_backbone_params=flax.core.FrozenDict({"params": lm_backbone.params}),
             head_params=flax.core.FrozenDict(
-                reward_head.init(
+                scalar_head.init(
                     init_key,
-                    jnp.ones(reward_backbone.config.hidden_size)[None, None, :],
+                    jnp.ones(lm_backbone.config.hidden_size)[None, None, :],
                 )
             ),
         ),
         tx=optimizer,
     )
-    return state, reward_backbone, reward_head
-
-
-def get_reward(
-    params: RewardModelParams,
-    reward_backbone,
-    reward_head,
-    query_responses_ids: jnp.ndarray,
-    args: Args,
-):
-    """Get reward for each queiry--response pair."""
-    assert query_responses_ids.ndim == 2
-    # query_responses_ids: [batch_size, length]
-
-    # mask out padding tokens
-    attention_mask = query_responses_ids != args.pad_token_id
-    query_responses_ids = jnp.where(attention_mask, query_responses_ids, 0)
-
-    # assign position ids
-    position_ids = attention_mask.cumsum(1) - attention_mask
-
-    reward_latents = reward_backbone.module.apply(
-        variables=params.backbone_params,
-        input_ids=query_responses_ids,
-        attention_mask=attention_mask,
-        position_ids=position_ids,
-        output_hidden_states=True,
-    ).hidden_states[-1]
-    # shape: [batch_size, length, hidden_size]
-
-    last_reward_latents = reward_latents[:, -1, :]
-    # shape: [batch_size, hidden_size]
-
-    reward = reward_head.apply(variables=params.head_params, x=last_reward_latents)
-    # shape: [batch_size, 1]
-    return reward
+    return state
 
 
 def set_reward_state_head_params(
@@ -343,7 +396,7 @@ def set_reward_state_head_params(
 
     reward_state = reward_state.replace(
         params=RewardModelParams(
-            backbone_params=reward_state.params.backbone_params,
+            lm_backbone_params=reward_state.params.lm_backbone_params,
             head_params=unflat_head_params,
         )
     )
@@ -352,13 +405,10 @@ def set_reward_state_head_params(
 
 def normalize(
     args,
-    tokenizer,
     pretrained_model,
     reward_state,
     iter_dataloader,
     generation_config,
-    reward_backbone,
-    reward_head,
 ):
     # number of minibatches for computing the normalization statistics
     n_batches = ceil_div(args.local_normalize_samples, args.rollout_batch_size)
@@ -377,37 +427,33 @@ def normalize(
                 data["input_ids"], args.pad_token_id
             )
             query_responses = generate(
-                pretrained_model, queries, tokenizer, generation_config
+                pretrained_model, queries, args, generation_config
             )
             sample_queries_responses.append(query_responses)
 
         rewards = []
         for query_responses in sample_queries_responses:
             rewards.append(
-                get_reward(
+                reward_state.apply_fn(
                     reward_state.params,
-                    reward_backbone,
-                    reward_head,
                     query_responses,
-                    args,
                 )
             )
         # Here, len(rewards) = n_batches
         # each rewards[i] is a (args.rollout_batch_size, 1) array.
 
         rewards = np.concatenate(rewards)
-        # rewards shape: [args.local_normalize_samples, 1]
+        # shape: [args.local_normalize_samples, 1]
         mean, std = rewards.mean(), rewards.std()
         print(f"mean: {mean}, std: {std}")
         return mean, std
 
+    # reward normalization
     mean, std = get_normalization_stats(reward_state)
     target_mean, target_std = 0.0, 1.0
     gain = target_std / std
     bias = target_mean - gain * mean
     print(f"gain: {gain}, bias: {bias}")
-
-    # do normalization
     reward_state = set_reward_state_head_params(reward_state, gain=gain, bias=bias)
 
     # validate normalization
@@ -454,7 +500,8 @@ def prepare_left_padded_query_responses_with_labels(dataset, args):
     queries_responses[queries_responses == OPENAI_PAD_TOKEN_ID] = args.pad_token_id
 
     queries_responses = right_padding_to_left_padding(
-        rearrange(queries_responses, "q r l -> (q r) l"), pad_id=args.pad_token_id,
+        rearrange(queries_responses, "q r l -> (q r) l"),
+        pad_id=args.pad_token_id,
     )
 
     queries_responses = rearrange(
@@ -480,17 +527,14 @@ def get_dataloader_iter(rng, dataset_tokens, dataset_labels, args):
         yield batch
 
 
-def train_step(state, batch, reward_backbone, reward_head, args):
+def train_step(state, batch, args):
     """Train reward model for one step."""
     query_responses, labels = batch
     query_responses_ids = rearrange(query_responses, "q r l -> (q r) l")
-    # query_responses_ids: [num_queries * num_responses_per_query, length]
+    # shape: [num_queries * num_responses_per_query, length]
 
     def loss_function(params):
-        logits = get_reward(
-            params, reward_backbone, reward_head, query_responses_ids, args
-        )
-
+        logits = state.apply_fn(params, query_responses_ids)
         logits_reshaped = rearrange(logits, "(q r) 1 -> q r", r=args.labels.num_labels)
 
         loss = optax.softmax_cross_entropy_with_integer_labels(
@@ -509,16 +553,14 @@ def train_step(state, batch, reward_backbone, reward_head, args):
     return state, {"loss": loss, "accuracy": accuracy}
 
 
-def val_step(state, batch, reward_backbone, reward_head, args):
+def val_step(state, batch, args):
     """Eval reward model for one step."""
     query_responses, labels = batch
     query_responses_ids = rearrange(query_responses, "q r l -> (q r) l")
     # query_responses_ids: [num_queries * num_responses_per_query, length]
 
     def loss_function(params):
-        logits = get_reward(
-            params, reward_backbone, reward_head, query_responses_ids, args
-        )
+        logits = state.apply_fn(state.params, query_responses_ids)
 
         logits_reshaped = rearrange(logits, "(q r) 1 -> q r", r=args.labels.num_labels)
 
@@ -536,58 +578,58 @@ def val_step(state, batch, reward_backbone, reward_head, args):
 
 
 def train(args: Args):
-    args.world_size = len(jax.devices())
+    if args.distributed:
+        jax.distributed.initialize(
+            local_device_ids=range(
+                len(args.learner_device_ids) + len(args.actor_device_ids)
+            ),
+        )
+        print(list(range(len(args.learner_device_ids) + len(args.actor_device_ids))))
 
+    args.world_size = len(jax.devices())  # Or jax.process_count()?
     args.batch_size = int(args.local_batch_size * args.world_size)
-    args.normalize_samples = int(args.local_normalize_samples * args.world_size)
-    args.local_micro_batch_size = exact_div(
-        args.local_batch_size, args.gradient_accumulation_steps
-    )
+    args.local_rank = jax.process_index()
 
     run_name = f"{args.exp_name}__{args.seed}__{int(time.time())}"
+    writer = SimpleNamespace()  # dummy writer
+    writer.add_scalar = lambda x, y, z: None
+    if args.local_rank == 0:
+        if args.track:
+            import wandb
 
-    if args.track:
-        import wandb
-
-        wandb.init(
-            project=args.wandb_project_name,
-            entity=args.wandb_entity,
-            sync_tensorboard=True,
-            config=asdict(args),
-            name=run_name,
-            save_code=True,
+            wandb.init(
+                project=args.wandb_project_name,
+                entity=args.wandb_entity,
+                sync_tensorboard=True,
+                config=asdict(args),
+                name=run_name,
+                save_code=True,
+            )
+            wandb.run.log_code(".")
+        writer = SummaryWriter(f"runs/{run_name}")
+        writer.add_text(
+            "hyperparameters",
+            "|param|value|\n|-|-|\n%s"
+            % ("\n".join([f"|{key}|{value}|" for key, value in vars(args).items()])),
         )
-        wandb.run.log_code(".")
-
-    writer = tensorboard.SummaryWriter(f"runs/{run_name}")
-    writer.add_text(
-        "hyperparameters",
-        "|param|value|\n|-|-|\n%s"
-        % ("\n".join([f"|{key}|{value}|" for key, value in vars(args).items()])),
-    )
-    pprint(args)
-
-    tokenizer = transformers.AutoTokenizer.from_pretrained(
-        args.base_model, padding_side="right",
+        pprint(args)
+    local_seed = args.seed + args.local_rank * 100003  # Prime
+    tokenizer = AutoTokenizer.from_pretrained(
+        args.base_model,
+        padding_side="right",
     )
     # we use the padding token manually but do not resize the token embedding of the model
     tokenizer.add_special_tokens({"pad_token": "[PAD]"})
     args.pad_token_id = tokenizer.pad_token_id
-
-    untrained_model = transformers.FlaxAutoModelForCausalLM.from_pretrained(
-        args.base_model
-    )
-
-    reward_state, reward_backbone, reward_head = create_initial_reward_state_and_models(
-        jax.random.PRNGKey(args.seed), args
-    )
+    untrained_model = FlaxAutoModelForCausalLM.from_pretrained(args.base_model)
+    key = jax.random.PRNGKey(args.seed)
+    key, init_key = jax.random.split(key, 2)
+    reward_state = create_initial_reward_state_and_models(init_key, args)
 
     p_train_step = jax.pmap(
         functools.partial(
             train_step,
             args=args,
-            reward_backbone=reward_backbone,
-            reward_head=reward_head,
         ),
         axis_name="batch",
         donate_argnums=(0,),
@@ -596,17 +638,15 @@ def train(args: Args):
         functools.partial(
             val_step,
             args=args,
-            reward_backbone=reward_backbone,
-            reward_head=reward_head,
         ),
         axis_name="batch",
     )
 
-    normalization_dataset = MyDataset(
+    normalization_dataset = NormalizationDataset(
         DATASET[args.task.query_dataset],
         tokenizer,
         args.task.query_length,
-        seed=args.seed,
+        seed=local_seed,
         start_text=args.task.start_text,
         end_text=args.task.end_text,
     )
@@ -615,7 +655,7 @@ def train(args: Args):
     )
     iter_normalization_dataloader = iter(normalization_dataloader)
 
-    generation_config = transformers.GenerationConfig(
+    generation_config = GenerationConfig(
         max_new_tokens=args.task.response_length,
         min_new_tokens=args.task.response_length,
         temperature=args.task.temperature,
@@ -628,7 +668,6 @@ def train(args: Args):
     if args.normalize_before:
         print("===Normalize reward model *before* training===")
 
-        # pylint: disable=E1101:no-member
         print(
             "before normalization. "
             + f"Gain: {reward_state.params.head_params['params']['reward_gain']}"
@@ -637,13 +676,10 @@ def train(args: Args):
 
         reward_state = normalize(
             args,
-            tokenizer,
             untrained_model,
             reward_state,
             iter_normalization_dataloader,
             generation_config,
-            reward_backbone,
-            reward_head,
         )
 
         print(
@@ -657,7 +693,8 @@ def train(args: Args):
     # `labeled_dataset` has keys
     # `['sample0', 'query', 'best', 'sample3', 'sample1', 'sample2']`
     labeled_dataset = load_dataset(
-        "vwxyzjn/lm-human-preferences", data_files=[args.label_dataset],
+        "vwxyzjn/lm-human-preferences",
+        data_files=[args.label_dataset],
     )["train"]
     print("Num labels found in source:", len(labeled_dataset))
     print("training on", args.labels.num_train, "in batches of", args.local_batch_size)
@@ -673,8 +710,10 @@ def train(args: Args):
     val_queries_responses = all_queries_responses[args.labels.num_train :]
     val_labels = all_labels[args.labels.num_train :]
 
+    key, train_loader_key = jax.random.split(key, 2)
+
     train_iter = get_dataloader_iter(
-        jax.random.PRNGKey(args.seed),
+        train_loader_key,
         dataset_tokens=train_queries_responses,
         dataset_labels=train_labels,
         args=args,
@@ -726,8 +765,6 @@ def train(args: Args):
 
     if args.normalize_after:
         print("===Normalize reward model *after* training===")
-
-        # pylint: disable=E1101:no-member
         print(
             "before normalization. "
             + f"Gain: {reward_state.params.head_params['params']['reward_gain']}"
@@ -736,13 +773,10 @@ def train(args: Args):
 
         reward_state = normalize(
             args,
-            tokenizer,
             untrained_model,
             reward_state,
             iter_normalization_dataloader,
             generation_config,
-            reward_backbone,
-            reward_head,
         )
         print(
             "after normalization. "
@@ -750,13 +784,14 @@ def train(args: Args):
             + f" Bias: {reward_state.params.head_params['params']['reward_bias']}"
         )
 
-    if args.save_path:
+    # save model
+    if args.save_path and args.local_rank == 0:
         ckpt = {"reward_model": reward_state, "args": vars(args)}
         orbax_checkpointer = orbax.checkpoint.PyTreeCheckpointer()
         save_args = orbax_utils.save_args_from_target(ckpt)
         orbax_checkpointer.save(args.save_path, ckpt, save_args=save_args, force=True)
 
-    if args.track:
+    if args.local_rank == 0 and args.track:
         wandb.finish()
 
 
