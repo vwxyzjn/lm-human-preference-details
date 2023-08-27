@@ -1,0 +1,25 @@
+name: Tests
+on:
+  pull_request:
+    branches:
+      - main
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v3
+    - name: Install poetry
+      run: pipx install poetry
+    - name: Cache HF datasets, models, etc.
+      uses: actions/cache@v2
+      with:
+        path: ~/.cache/huggingface
+        key: ${{ runner.os }}-datasets-${{ hashFiles('scripts/*.py') }}
+        restore-keys: |
+          ${{ runner.os }}-datasets-
+    - uses: actions/setup-python@v4
+      with:
+        python-version: '3.9'
+        cache: 'poetry'
+    - run: poetry install
+    - run: poetry run pytest
