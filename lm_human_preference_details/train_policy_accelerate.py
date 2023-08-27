@@ -301,23 +301,23 @@ def whiten(values, shift_mean=True):
 
 
 class AutoModelForCausalLMWithScalarHead(nn.Module):
-    def __init__(self, pretrained_model):
+    def __init__(self, lm_backbone):
         super().__init__()
-        self.pretrained_model = pretrained_model
-        self.scalar_head = layer_init(nn.Linear(pretrained_model.config.hidden_size, 1), std=0)
+        self.lm_backbone = lm_backbone
+        self.scalar_head = layer_init(nn.Linear(lm_backbone.config.hidden_size, 1), std=0)
 
     def forward(self, **kwargs):
-        output = self.pretrained_model(**kwargs)
+        output = self.lm_backbone(**kwargs)
         return output, self.scalar_head(output.hidden_states[-1])
 
 
 class AutoModelForCausalLMWithRewardHead(nn.Module):
-    def __init__(self, pretrained_model):
+    def __init__(self, lm_backbone):
         super().__init__()
-        self.pretrained_model = pretrained_model
+        self.lm_backbone = lm_backbone
         self.scalar_head = layer_init(
-            nn.Linear(pretrained_model.config.hidden_size, 1),
-            std=1 / np.sqrt(pretrained_model.config.hidden_size + 1),
+            nn.Linear(lm_backbone.config.hidden_size, 1),
+            std=1 / np.sqrt(lm_backbone.config.hidden_size + 1),
         )
         self.reward_gain = torch.nn.Parameter(torch.tensor(1.0), requires_grad=True)
         self.reward_bias = torch.nn.Parameter(torch.tensor(0.0), requires_grad=True)
