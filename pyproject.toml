@@ -30,6 +30,7 @@ black = "^23.7.0"
 [tool.poetry.group.dev.dependencies]
 pre-commit = "^3.3.2"
 ipykernel = "^6.25.1"
+pytest = "^7.4.0"
 
 [build-system]
 requires = ["poetry-core"]
