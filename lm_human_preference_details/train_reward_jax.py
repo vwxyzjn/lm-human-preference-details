@@ -279,12 +279,12 @@ def exact_div(a, b):
 
 
 # TODO: pmap `generate` to accelerate reward model normalization?
-def generate(pretrained_model, queries, args, generation_config):
+def generate(lm_backbone, queries, args, generation_config):
     """generate in a way that does not affect padding tokens"""
     context_length = queries.shape[1]
     attention_mask = queries != args.pad_token_id
     input_ids = jnp.where(attention_mask, queries, 0)  # set padding tokens to 0
-    output = pretrained_model.generate(
+    output = lm_backbone.generate(
         input_ids=input_ids,
         attention_mask=attention_mask.astype("int32"),
         # need to convert to int for now, due to the bug https://github.com/huggingface/transformers/issues/25634
@@ -396,7 +396,7 @@ def set_reward_state_head_params(reward_state: TrainState, gain: float = 1.0, bi
 
 def normalize(
     args,
-    pretrained_model,
+    lm_backbone,
     reward_state,
     iter_dataloader,
     generation_config,
@@ -415,7 +415,7 @@ def normalize(
             data = next(iter_dataloader)
             queries = data["input_ids"]
             queries = right_padding_to_left_padding(data["input_ids"], args.pad_token_id)
-            query_responses = generate(pretrained_model, queries, args, generation_config)
+            query_responses = generate(lm_backbone, queries, args, generation_config)
             sample_queries_responses.append(query_responses)
 
         rewards = []
