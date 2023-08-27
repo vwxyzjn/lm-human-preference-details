@@ -45,7 +45,6 @@ def run_experiment(command: str):
     assert return_code == 0
 
 
-
 def autotag() -> str:
     wandb_tag = ""
     print("autotag feature is enabled")
@@ -59,7 +58,9 @@ def autotag() -> str:
     git_commit = subprocess.check_output(["git", "rev-parse", "--verify", "HEAD"]).decode("ascii").strip()
     try:
         # try finding the pull request number on github
-        prs = requests.get(f"https://api.github.com/search/issues?q=repo:vwxyzjn/lm-human-preference-details+is:pr+{git_commit}")
+        prs = requests.get(
+            f"https://api.github.com/search/issues?q=repo:vwxyzjn/lm-human-preference-details+is:pr+{git_commit}"
+        )
         if prs.status_code == 200:
             prs = prs.json()
             if len(prs["items"]) > 0:

@@ -1,32 +1,32 @@
+import functools
 import os
 import time
 from dataclasses import asdict, dataclass, field
 from types import SimpleNamespace
 from typing import Optional
-import numpy as np
-import tyro
-from datasets import load_dataset
-from rich.pretty import pprint
-from torch.utils.data import DataLoader, IterableDataset
 
-import functools
+import flax
+import flax.linen as nn
 import jax
 import jax.numpy as jnp
-import orbax
+import numpy as np
 import optax
-from optax import ScaleByAdamState, update_moment, update_moment_per_elem_norm
-from optax._src.alias import _scale_by_learning_rate
-from optax._src import base, utils, combine, numerics
+import orbax
+import tyro
+from datasets import load_dataset
 from einops import rearrange
-import flax
-from flax.training import common_utils
-from flax.training import orbax_utils
+from flax import jax_utils, traverse_util
 from flax.core.frozen_dict import freeze
-from flax import traverse_util, jax_utils
+from flax.training import common_utils, orbax_utils
 from flax.training.train_state import TrainState
-import flax.linen as nn
-from transformers import FlaxAutoModelForCausalLM, AutoTokenizer, GenerationConfig
+from optax import ScaleByAdamState, update_moment, update_moment_per_elem_norm
+from optax._src import base, combine, numerics, utils
+from optax._src.alias import _scale_by_learning_rate
+from rich.pretty import pprint
+from torch.utils.data import DataLoader, IterableDataset
 from torch.utils.tensorboard import SummaryWriter
+from transformers import AutoTokenizer, FlaxAutoModelForCausalLM, GenerationConfig
+
 from lm_human_preference_details.data import DATASET
 
 
@@ -143,9 +143,7 @@ def scale_by_adam_tf_style(
     mu_dtype = utils.canonicalize_dtype(mu_dtype)
 
     def init_fn(params):
-        mu = jax.tree_util.tree_map(  # First moment
-            lambda t: jnp.zeros_like(t, dtype=mu_dtype), params
-        )
+        mu = jax.tree_util.tree_map(lambda t: jnp.zeros_like(t, dtype=mu_dtype), params)  # First moment
         nu = jax.tree_util.tree_map(jnp.zeros_like, params)  # Second moment
         return ScaleByAdamState(count=jnp.zeros([], jnp.int32), mu=mu, nu=nu)
 
@@ -162,9 +160,7 @@ def scale_by_adam_tf_style(
         #     lambda m, v: m / (jnp.sqrt(v + eps_root) + eps), mu_hat, nu_hat)
         ### Tensorflow adam implementation
         updates = jax.tree_util.tree_map(
-            lambda m, v: (jnp.sqrt(1 - b2**count_inc) / (1 - b1**count_inc))
-            * m
-            / (jnp.sqrt(v + eps_root) + eps),
+            lambda m, v: (jnp.sqrt(1 - b2**count_inc) / (1 - b1**count_inc)) * m / (jnp.sqrt(v + eps_root) + eps),
             mu,
             nu,
         )  #
@@ -183,9 +179,7 @@ def adam_tf_style(
     mu_dtype=None,
 ):
     return combine.chain(
-        scale_by_adam_tf_style(
-            b1=b1, b2=b2, eps=eps, eps_root=eps_root, mu_dtype=mu_dtype
-        ),
+        scale_by_adam_tf_style(b1=b1, b2=b2, eps=eps, eps_root=eps_root, mu_dtype=mu_dtype),
         _scale_by_learning_rate(learning_rate),
     )
 
@@ -206,9 +200,7 @@ class RewardHead(nn.Module):
         assert x.shape[-1] == self.head_input_size
         x = nn.Dense(
             1,
-            kernel_init=nn.initializers.normal(
-                stddev=1 / np.sqrt(self.head_input_size + 1)
-            ),
+            kernel_init=nn.initializers.normal(stddev=1 / np.sqrt(self.head_input_size + 1)),
             bias_init=nn.initializers.zeros_init(),
         )(x)
         reward_gain = self.param("reward_gain", nn.initializers.ones_init(), ())
@@ -221,9 +213,7 @@ class RewardHead(nn.Module):
 class NormalizationDataset(IterableDataset):
     """A dataset for reward model normalization."""
 
-    def __init__(
-        self, generator, tokenizer, query_length, seed, start_text=None, end_text=None
-    ):
+    def __init__(self, generator, tokenizer, query_length, seed, start_text=None, end_text=None):
         self.generator = generator
         self.tokenizer = tokenizer
         self.query_length = query_length
@@ -264,12 +254,7 @@ class NormalizationDataset(IterableDataset):
 def right_padding_to_left_padding(tokens, pad_id):
     """Convert from right padding to left padding."""
     assert tokens.ndim == 2
-    return np.array(
-        [
-            [pad_id] * (row == pad_id).sum() + [x for x in row if x != pad_id]
-            for row in tokens
-        ]
-    )
+    return np.array([[pad_id] * (row == pad_id).sum() + [x for x in row if x != pad_id] for row in tokens])
 
 
 def ceil_div(a, b):
@@ -279,7 +264,7 @@ def ceil_div(a, b):
 def exact_div(a, b):
     q = a // b
     if a != q * b:
-        raise ValueError("Inexact division: %s / %s = %s" % (a, b, a / b))
+        raise ValueError(f"Inexact division: {a} / {b} = {a / b}")
     return q
 
 
@@ -371,9 +356,7 @@ def create_initial_reward_state_and_models(init_key, args):
     return state
 
 
-def set_reward_state_head_params(
-    reward_state: TrainState, gain: float = 1.0, bias: float = 0.0
-):
+def set_reward_state_head_params(reward_state: TrainState, gain: float = 1.0, bias: float = 0.0):
     """Set gain and bias of the reward head.
     Args:
       reward_state: Reward state.
@@ -385,9 +368,7 @@ def set_reward_state_head_params(
           reward_state, gain=0.1, bias=0.2)
       print(reward_state.params.head_params['params'])
     """
-    flat_head_params = traverse_util.flatten_dict(
-        reward_state.params.head_params, sep="/"
-    )
+    flat_head_params = traverse_util.flatten_dict(reward_state.params.head_params, sep="/")
 
     flat_head_params["params/reward_gain"] = jnp.array(gain, dtype=jnp.float32)
     flat_head_params["params/reward_bias"] = jnp.array(bias, dtype=jnp.float32)
@@ -423,12 +404,8 @@ def normalize(
         for _ in range(n_batches):
             data = next(iter_dataloader)
             queries = data["input_ids"]
-            queries = right_padding_to_left_padding(
-                data["input_ids"], args.pad_token_id
-            )
-            query_responses = generate(
-                pretrained_model, queries, args, generation_config
-            )
+            queries = right_padding_to_left_padding(data["input_ids"], args.pad_token_id)
+            query_responses = generate(pretrained_model, queries, args, generation_config)
             sample_queries_responses.append(query_responses)
 
         rewards = []
@@ -486,9 +463,7 @@ def prepare_left_padded_query_responses_with_labels(dataset, args):
     queries = rearrange(queries, "(q r) l -> q r l", r=args.labels.num_labels)
     # [num_queires, num_queires, max_query_length]
 
-    responses = np.array(
-        [np.stack(dataset[f"sample{i}"]) for i in range(args.labels.num_labels)]
-    )
+    responses = np.array([np.stack(dataset[f"sample{i}"]) for i in range(args.labels.num_labels)])
     # [num_response_per_query, num_queires, max_response_len]
 
     responses = rearrange(responses, "r q l -> q r l")
@@ -504,9 +479,7 @@ def prepare_left_padded_query_responses_with_labels(dataset, args):
         pad_id=args.pad_token_id,
     )
 
-    queries_responses = rearrange(
-        queries_responses, "(q r) l -> q r l", r=args.labels.num_labels
-    )
+    queries_responses = rearrange(queries_responses, "(q r) l -> q r l", r=args.labels.num_labels)
     # [num_queires, num_responses_per_query, max_query_len + max_response_len]
     return queries_responses, labels
 
@@ -537,9 +510,7 @@ def train_step(state, batch, args):
         logits = state.apply_fn(params, query_responses_ids)
         logits_reshaped = rearrange(logits, "(q r) 1 -> q r", r=args.labels.num_labels)
 
-        loss = optax.softmax_cross_entropy_with_integer_labels(
-            logits_reshaped, labels
-        ).mean()
+        loss = optax.softmax_cross_entropy_with_integer_labels(logits_reshaped, labels).mean()
 
         accuracy = (logits_reshaped.argmax(axis=1) == labels).astype("float32").mean()
         return loss, accuracy
@@ -564,9 +535,7 @@ def val_step(state, batch, args):
 
         logits_reshaped = rearrange(logits, "(q r) 1 -> q r", r=args.labels.num_labels)
 
-        loss = optax.softmax_cross_entropy_with_integer_labels(
-            logits_reshaped, labels
-        ).mean()
+        loss = optax.softmax_cross_entropy_with_integer_labels(logits_reshaped, labels).mean()
 
         accuracy = (logits_reshaped.argmax(axis=1) == labels).astype("float32").mean()
         return loss, accuracy
@@ -580,13 +549,11 @@ def val_step(state, batch, args):
 def train(args: Args):
     if args.distributed:
         jax.distributed.initialize(
-            local_device_ids=range(
-                len(args.learner_device_ids) + len(args.actor_device_ids)
-            ),
+            local_device_ids=range(len(args.learner_device_ids) + len(args.actor_device_ids)),
         )
         print(list(range(len(args.learner_device_ids) + len(args.actor_device_ids))))
 
-    args.world_size = len(jax.devices())  # Or jax.process_count()?
+    args.world_size = len(jax.devices())
     args.batch_size = int(args.local_batch_size * args.world_size)
     args.local_rank = jax.process_index()
 
@@ -609,8 +576,7 @@ def train(args: Args):
         writer = SummaryWriter(f"runs/{run_name}")
         writer.add_text(
             "hyperparameters",
-            "|param|value|\n|-|-|\n%s"
-            % ("\n".join([f"|{key}|{value}|" for key, value in vars(args).items()])),
+            "|param|value|\n|-|-|\n%s" % ("\n".join([f"|{key}|{value}|" for key, value in vars(args).items()])),
         )
         pprint(args)
     local_seed = args.seed + args.local_rank * 100003  # Prime
@@ -650,9 +616,7 @@ def train(args: Args):
         start_text=args.task.start_text,
         end_text=args.task.end_text,
     )
-    normalization_dataloader = DataLoader(
-        normalization_dataset, batch_size=args.rollout_batch_size
-    )
+    normalization_dataloader = DataLoader(normalization_dataset, batch_size=args.rollout_batch_size)
     iter_normalization_dataloader = iter(normalization_dataloader)
 
     generation_config = GenerationConfig(
@@ -699,9 +663,7 @@ def train(args: Args):
     print("Num labels found in source:", len(labeled_dataset))
     print("training on", args.labels.num_train, "in batches of", args.local_batch_size)
 
-    all_queries_responses, all_labels = prepare_left_padded_query_responses_with_labels(
-        labeled_dataset, args
-    )
+    all_queries_responses, all_labels = prepare_left_padded_query_responses_with_labels(labeled_dataset, args)
 
     assert args.labels.num_train < all_queries_responses.shape[0]
     train_queries_responses = all_queries_responses[: args.labels.num_train]
@@ -724,9 +686,7 @@ def train(args: Args):
     for global_step, train_batch in enumerate(train_iter):
         train_batch = common_utils.shard(train_batch)
         reward_state, train_metrics = p_train_step(reward_state, train_batch)
-        writer.add_scalar(
-            "train/lr", single_epoch_linear_schedule(global_step, args), global_step
-        )
+        writer.add_scalar("train/lr", single_epoch_linear_schedule(global_step, args), global_step)
 
         # gathering replicated metric data
         train_metrics = common_utils.get_metrics([train_metrics])
@@ -734,10 +694,7 @@ def train(args: Args):
         for key, value in train_metrics.items():
             writer.add_scalar(f"train/{key}", value, global_step)
 
-        if (
-            args.print_sample_output_freq > 0
-            and global_step % args.print_sample_output_freq == 0
-        ):
+        if args.print_sample_output_freq > 0 and global_step % args.print_sample_output_freq == 0:
             val_iter = get_dataloader_iter(
                 jax.random.PRNGKey(0),
                 dataset_tokens=val_queries_responses,
@@ -756,10 +713,7 @@ def train(args: Args):
                 val_metrics[key] = value.mean()
                 writer.add_scalar(f"test/{key}", val_metrics[key], global_step)
 
-            print(
-                f"gloabl_step: {global_step} | "
-                + f"test/accuracy {val_metrics['accuracy']}"
-            )
+            print(f"gloabl_step: {global_step} | " + f"test/accuracy {val_metrics['accuracy']}")
 
     reward_state = jax_utils.unreplicate(reward_state)
 

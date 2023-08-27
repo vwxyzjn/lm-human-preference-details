@@ -70,7 +70,7 @@ python -m openrlbenchmark.rlops_multi_metrics \
 ![](static/ours1.png)
 
 
-Wandb report is availible at https://wandb.ai/costa-huang/cleanrl/reports/Regression-Report-train_policy_accelerate--Vmlldzo1MTEwMzQw. Feel free to check out the logs of the runs for sample outputs.
+Wandb report is available at https://wandb.ai/costa-huang/cleanrl/reports/Regression-Report-train_policy_accelerate--Vmlldzo1MTEwMzQw. Feel free to check out the logs of the runs for sample outputs.
 
 ![](static/wandb.png)
 
