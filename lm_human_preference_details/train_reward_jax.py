@@ -3,7 +3,7 @@ import os
 import time
 from dataclasses import asdict, dataclass, field
 from types import SimpleNamespace
-from typing import Optional
+from typing import List, Optional
 
 import flax
 import flax.linen as nn
@@ -111,6 +111,16 @@ class Args:
     """Where to save the model"""
     use_tensorflow_adam: bool = True
     """Whether to use tensorflow-style Adam optimizer instead of PyTorch's"""
+
+    # distributed settings
+    local_rank: int = 0
+    """the rank of this process"""
+    learner_device_ids: List[int] = field(default_factory=lambda: [0])
+    "the device ids that script will use"
+    learner_devices: tyro.conf.Suppress[int] = None # real type is `List[str]`
+    """the devices that script will use"""
+    global_learner_decices: tyro.conf.Suppress[int] = None # real type is `List[str]`
+    """the total devices (across all nodes and machines) that script will use"""
     task: TaskHParams = field(default_factory=TaskHParams)
     labels: LabelHParams = field(default_factory=LabelHParams)
 
@@ -549,12 +559,22 @@ def val_step(state, batch, args):
 def train(args: Args):
     if args.distributed:
         jax.distributed.initialize(
-            local_device_ids=range(len(args.learner_device_ids) + len(args.actor_device_ids)),
+            local_device_ids=range(len(args.learner_device_ids)),
         )
-        print(list(range(len(args.learner_device_ids) + len(args.actor_device_ids))))
 
-    args.world_size = len(jax.devices())
-    args.batch_size = int(args.local_batch_size * args.world_size)
+    args.world_size = jax.process_count()
+    local_devices = jax.local_devices()
+    global_devices = jax.devices()
+    learner_devices = [local_devices[d_id] for d_id in args.learner_device_ids]
+    global_learner_decices = [
+        global_devices[d_id + process_index * len(local_devices)]
+        for process_index in range(args.world_size)
+        for d_id in args.learner_device_ids
+    ]
+    pprint({"global_learner_decices": global_learner_decices})
+    args.global_learner_decices = [str(item) for item in global_learner_decices]
+    args.learner_devices = [str(item) for item in learner_devices]
+    args.batch_size = int(args.local_batch_size * len(local_devices) * args.world_size)
     args.local_rank = jax.process_index()
 
     run_name = f"{args.exp_name}__{args.seed}__{int(time.time())}"
