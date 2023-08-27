@@ -396,8 +396,8 @@ def normalize(
 ):
     with torch.no_grad():
         # reset reward scales
-        reward_model.module.reward_gain.data.fill_(1.0)
-        reward_model.module.reward_bias.data.fill_(0.0)
+        accelerator.unwrap_model(reward_model).reward_gain.data.fill_(1.0)
+        accelerator.unwrap_model(reward_model).reward_bias.data.fill_(0.0)
 
         # sample queries and responses
         n_batches = ceil_div(args.local_normalize_samples, args.rollout_batch_size)
@@ -424,8 +424,8 @@ def normalize(
         gain = target_std / std
         bias = target_mean - gain * mean
         print(f"gain: {gain}, bias: {bias}")
-        reward_model.module.reward_gain.data = gain
-        reward_model.module.reward_bias.data = bias
+        accelerator.unwrap_model(reward_model).reward_gain.data = gain
+        accelerator.unwrap_model(reward_model).reward_bias.data = bias
 
         # validate normalization
         n_batches = ceil_div(args.local_normalize_samples, args.rollout_batch_size)
@@ -531,8 +531,8 @@ def train(args: Args):
         print("===Normalize reward model *before* training===")
         print(
             "before normalization. "
-            + f"Gain: {reward_model.module.reward_gain.data}"
-            + f" Bias: {reward_model.module.reward_bias.data}"
+            + f"Gain: {accelerator.unwrap_model(reward_model).reward_gain.data}"
+            + f" Bias: {accelerator.unwrap_model(reward_model).reward_bias.data}"
         )
 
         normalize(
@@ -546,8 +546,8 @@ def train(args: Args):
         )
         print(
             "after normalization. "
-            + f"Gain: {reward_model.module.reward_gain.data}"
-            + f" Bias: {reward_model.module.reward_bias.data}"
+            + f"Gain: {accelerator.unwrap_model(reward_model).reward_gain.data}"
+            + f" Bias: {accelerator.unwrap_model(reward_model).reward_bias.data}"
         )
 
     # `label` has keys `['sample0', 'query', 'best', 'sample3', 'sample1', 'sample2']`
@@ -697,8 +697,8 @@ def train(args: Args):
         print("===Normalize reward model *after* training===")
         print(
             "before normalization. "
-            + f"Gain: {reward_model.module.reward_gain.data}"
-            + f" Bias: {reward_model.module.reward_bias.data}"
+            + f"Gain: {accelerator.unwrap_model(reward_model).reward_gain.data}"
+            + f" Bias: {accelerator.unwrap_model(reward_model).reward_bias.data}"
         )
 
         normalize(
@@ -712,8 +712,8 @@ def train(args: Args):
         )
         print(
             "after normalization. "
-            + f"Gain: {reward_model.module.reward_gain.data}"
-            + f" Bias: {reward_model.module.reward_bias.data}"
+            + f"Gain: {accelerator.unwrap_model(reward_model).reward_gain.data}"
+            + f" Bias: {accelerator.unwrap_model(reward_model).reward_bias.data}"
         )
 
     # save model
