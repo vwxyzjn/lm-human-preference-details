@@ -63,9 +63,15 @@ def tldr_generator(mode, seed=0, shuffle=False):
         text = data["body"]
         yield text
 
+# for testing only
+def dummy_generator(mode, seed=0, shuffle=False):
+    while True:
+        yield "dummy"
+
 
 DATASET = {
     "books": books_generator,
     "cnndm": cnndm_generator,
     "tldr": tldr_generator,
+    "dummy": dummy_generator,
 }
