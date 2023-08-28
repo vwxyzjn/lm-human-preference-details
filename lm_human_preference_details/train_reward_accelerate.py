@@ -354,13 +354,13 @@ def exact_div(a, b):
     return q
 
 
-def generate(pretrained_model, queries, args, generation_config):
+def generate(lm_backbone, queries, args, generation_config):
     """generate in a way that does not affect padding tokens"""
     context_length = queries.shape[1]
     attention_mask = queries != args.pad_token_id
     input_ids = queries.clone()
     input_ids[~attention_mask] = 0  # set padding tokens to 0
-    output = pretrained_model.generate(
+    output = lm_backbone.generate(
         input_ids=input_ids,
         attention_mask=attention_mask,
         # position_ids=attention_mask.cumsum(1) - attention_mask.long(), # generation collapsed if this was turned on. TODO: why does generation collapse with this?
@@ -389,15 +389,15 @@ def normalize(
     args,
     accelerator,
     device,
-    pretrained_model,
+    lm_backbone,
     reward_model,
     iter_dataloader,
     generation_config,
 ):
     with torch.no_grad():
         # reset reward scales
-        reward_model.module.reward_gain.data.fill_(1.0)
-        reward_model.module.reward_bias.data.fill_(0.0)
+        accelerator.unwrap_model(reward_model).reward_gain.data.fill_(1.0)
+        accelerator.unwrap_model(reward_model).reward_bias.data.fill_(0.0)
 
         # sample queries and responses
         n_batches = ceil_div(args.local_normalize_samples, args.rollout_batch_size)
@@ -406,7 +406,7 @@ def normalize(
             data = next(iter_dataloader)
             queries = data["input_ids"].to(device)
             queries = right_padding_to_left_padding(data["input_ids"], args.pad_token_id).to(device)
-            query_responses = generate(pretrained_model, queries, args, generation_config)
+            query_responses = generate(lm_backbone, queries, args, generation_config)
             sample_queries_responses.append(query_responses)
 
         # compute reward statistics
@@ -424,8 +424,8 @@ def normalize(
         gain = target_std / std
         bias = target_mean - gain * mean
         print(f"gain: {gain}, bias: {bias}")
-        reward_model.module.reward_gain.data = gain
-        reward_model.module.reward_bias.data = bias
+        accelerator.unwrap_model(reward_model).reward_gain.data = gain
+        accelerator.unwrap_model(reward_model).reward_bias.data = bias
 
         # validate normalization
         n_batches = ceil_div(args.local_normalize_samples, args.rollout_batch_size)
@@ -434,7 +434,7 @@ def normalize(
             data = next(iter_dataloader)
             queries = data["input_ids"].to(device)
             queries = right_padding_to_left_padding(data["input_ids"], args.pad_token_id).to(device)
-            query_responses = generate(pretrained_model, queries, args, generation_config)
+            query_responses = generate(lm_backbone, queries, args, generation_config)
             sample_queries_responses.append(query_responses)
         rewards = []
         for query_responses in sample_queries_responses:
@@ -531,8 +531,8 @@ def train(args: Args):
         print("===Normalize reward model *before* training===")
         print(
             "before normalization. "
-            + f"Gain: {reward_model.module.reward_gain.data}"
-            + f" Bias: {reward_model.module.reward_bias.data}"
+            + f"Gain: {accelerator.unwrap_model(reward_model).reward_gain.data}"
+            + f" Bias: {accelerator.unwrap_model(reward_model).reward_bias.data}"
         )
 
         normalize(
@@ -546,8 +546,8 @@ def train(args: Args):
         )
         print(
             "after normalization. "
-            + f"Gain: {reward_model.module.reward_gain.data}"
-            + f" Bias: {reward_model.module.reward_bias.data}"
+            + f"Gain: {accelerator.unwrap_model(reward_model).reward_gain.data}"
+            + f" Bias: {accelerator.unwrap_model(reward_model).reward_bias.data}"
         )
 
     # `label` has keys `['sample0', 'query', 'best', 'sample3', 'sample1', 'sample2']`
@@ -697,8 +697,8 @@ def train(args: Args):
         print("===Normalize reward model *after* training===")
         print(
             "before normalization. "
-            + f"Gain: {reward_model.module.reward_gain.data}"
-            + f" Bias: {reward_model.module.reward_bias.data}"
+            + f"Gain: {accelerator.unwrap_model(reward_model).reward_gain.data}"
+            + f" Bias: {accelerator.unwrap_model(reward_model).reward_bias.data}"
         )
 
         normalize(
@@ -712,8 +712,8 @@ def train(args: Args):
         )
         print(
             "after normalization. "
-            + f"Gain: {reward_model.module.reward_gain.data}"
-            + f" Bias: {reward_model.module.reward_bias.data}"
+            + f"Gain: {accelerator.unwrap_model(reward_model).reward_gain.data}"
+            + f" Bias: {accelerator.unwrap_model(reward_model).reward_bias.data}"
         )
 
     # save model

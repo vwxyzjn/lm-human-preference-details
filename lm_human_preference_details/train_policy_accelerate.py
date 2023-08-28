@@ -382,13 +382,13 @@ def exact_div(a, b):
     return q
 
 
-def generate(pretrained_model, queries, tokenizer, generation_config):
+def generate(lm_backbone, queries, tokenizer, generation_config):
     """generate in a way that does not affect padding tokens"""
     context_length = queries.shape[1]
     attention_mask = queries != tokenizer.pad_token_id
     input_ids = queries.clone()
     input_ids[~attention_mask] = 0  # set padding tokens to 0
-    output = pretrained_model.generate(
+    output = lm_backbone.generate(
         input_ids=input_ids,
         attention_mask=attention_mask,
         # position_ids=attention_mask.cumsum(1) - attention_mask.long(), # generation collapsed if this was turned on. TODO: why does generation collapse with this?
@@ -404,7 +404,7 @@ def get_reward(reward_model, query_responses, tokenizer):
     position_ids = attention_mask.cumsum(1) - attention_mask.long()  # exclusive cumsum
     input_ids = query_responses.clone()
     input_ids[~attention_mask] = 0
-    output = reward_model.pretrained_model(
+    output = reward_model.lm_backbone(
         input_ids=input_ids,
         attention_mask=attention_mask,
         position_ids=position_ids,
@@ -490,10 +490,10 @@ def train(args: Args):
     # each class should have a separate pretrained model that do not share weights
     ref_policy = AutoModelForCausalLMWithScalarHead(AutoModelForCausalLM.from_pretrained(args.base_model)).to(device)
     policy = AutoModelForCausalLMWithScalarHead(AutoModelForCausalLM.from_pretrained(args.base_model)).to(device)
-    policy.pretrained_model.generation_config.eos_token_id = (
+    policy.lm_backbone.generation_config.eos_token_id = (
         None  # disable `pad_token_id` and `eos_token_id` because we just want to
     )
-    policy.pretrained_model.generation_config.pad_token_id = None  # generate tokens without truncation / padding
+    policy.lm_backbone.generation_config.pad_token_id = None  # generate tokens without truncation / padding
     # IMPORTANT: Layer norm produces weird gradients, which affects Adam optimizer to impact all the parameters systematically
     # see https://github.com/pytorch/pytorch/issues/104857 for more details
     if args.use_tensorflow_adam:
@@ -583,7 +583,7 @@ def train(args: Args):
             queries = data["input_ids"].to(device)
             queries = right_padding_to_left_padding(data["input_ids"], tokenizer.pad_token_id).to(device)
             query_responses = generate(
-                accelerator.unwrap_model(policy).pretrained_model,
+                accelerator.unwrap_model(policy).lm_backbone,
                 queries,
                 tokenizer,
                 generation_config,
