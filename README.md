@@ -52,9 +52,9 @@ poetry run pip install --upgrade "jax[cuda11_cudnn82]==0.4.8" -f https://storage
 
 ## Current status
 
-Currently for a reproduction, I used the same dataset, same data processing pipeline, same initial model architecture and weights (`gpt2` 124M pretrained model). Hyperparameters are exactly the same.
+Currently, for reproduction, I used the same dataset, data processing pipeline, hyperparameters, and initial model architecture and weights (`gpt2` 124M pretrained model).
 
-The following charts shows the learning curves of various metrics for `sentiment` and `descriptiveness` tasks, each with 10 random seeds.
+The following charts show the learning curves of various metrics for `sentiment` and `descriptiveness` tasks, each with 10 random seeds of [commit 46725b](https://github.com/vwxyzjn/lm-human-preference-details/commit/46725b7fc33f052e97dde4260fd26707c2592bf3).
 
 ```
 pip install openrlbenchmark==0.2.1a4
@@ -183,3 +183,6 @@ python -m openrlbenchmark.rlops_multi_metrics \
 
 ![](static/lm-human-preference.png)
 
+# Acknowledgement
+
+This work is supported by 🤗 Hugging Face's Big Science A100 cluster.
