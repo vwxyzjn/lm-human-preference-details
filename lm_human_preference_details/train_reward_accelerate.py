@@ -92,10 +92,8 @@ class Args:
     """the number of processes to use"""
     batch_size: tyro.conf.Suppress[int] = None
     """the batch size across all ranks"""
-    local_normalize_samples: int = 256
+    normalize_samples: int = 256
     """Samples used to estimate reward mean and std"""
-    normalize_samples: tyro.conf.Suppress[int] = None
-    """Samples used to estimate reward mean and std across all ranks"""
     debug_normalize: int = 0
     """Samples used to check that normalization worked"""
     normalize_before: bool = True
@@ -400,7 +398,7 @@ def normalize(
         accelerator.unwrap_model(reward_model).reward_bias.data.fill_(0.0)
 
         # sample queries and responses
-        n_batches = ceil_div(args.local_normalize_samples, args.rollout_batch_size)
+        n_batches = ceil_div(args.normalize_samples, args.rollout_batch_size)
         sample_queries_responses = []
         for _ in range(n_batches):
             data = next(iter_dataloader)
@@ -415,7 +413,7 @@ def normalize(
             rewards.append(get_reward(reward_model, query_responses, args)[1])
         rewards = torch.cat(rewards)
         rewards = accelerator.gather(rewards)
-        # shape: [args.local_normalize_samples, 1]
+        # shape: [args.normalize_samples, 1]
         mean, std = rewards.mean(), rewards.std()
         print(f"mean: {mean}, std: {std}")
 
@@ -428,7 +426,7 @@ def normalize(
         accelerator.unwrap_model(reward_model).reward_bias.data = bias
 
         # validate normalization
-        n_batches = ceil_div(args.local_normalize_samples, args.rollout_batch_size)
+        n_batches = ceil_div(args.normalize_samples, args.rollout_batch_size)
         sample_queries_responses = []
         for _ in range(n_batches):
             data = next(iter_dataloader)
