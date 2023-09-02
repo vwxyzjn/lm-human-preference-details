@@ -473,7 +473,9 @@ class RolloutStatistics:
 
 @flax.struct.dataclass
 class RLStatistics:
+    vpred: jnp.array
     vf_loss: jnp.array
+    vf_losses1: jnp.array
     vf_clipfrac: jnp.array
     pg_loss: jnp.array
     pg_clipfrac: jnp.array
@@ -519,7 +521,9 @@ def train_step(policy_state, mb_stats, args):
         loss = pg_loss + args.ppo.vf_coef * vf_loss
 
         rl_stats = RLStatistics(
+            vpred=vpred,
             vf_loss=vf_loss,
+            vf_losses1=vf_losses1,
             vf_clipfrac=vf_clipfrac,
             pg_loss=pg_loss,
             pg_clipfrac=pg_clipfrac,
@@ -791,7 +795,6 @@ def train(args: Args):
             delta = rewards[:, t] + args.ppo.gamma * nextvalues - values[:, t]
             lastgaelam = delta + args.ppo.gamma * args.ppo.lam * lastgaelam
             advantages_reversed.append(lastgaelam)
-
         advantages = jnp.stack(advantages_reversed[::-1], axis=1)
         returns = advantages + values
         advantages = whiten(advantages)
@@ -840,70 +843,135 @@ def train(args: Args):
                         f"ppo_epoch_idx",
                         ppo_epoch_idx,
                         "approxkl",
-                        rl_stats.approxkl,
+                        rl_stats.approxkl.item(),
                         "pg_loss",
-                        rl_stats.pg_loss,
+                        rl_stats.pg_loss.item(),
                         "pg_clipfrac",
-                        rl_stats.pg_clipfrac,
+                        rl_stats.pg_clipfrac.item(),
                         "ratio",
-                        rl_stats.ratio.mean(),
+                        rl_stats.ratio.mean().item(),
                     )
         writer.add_histogram("ppo/val/ratio_hist", np.array(rl_stats.ratio), update)
         kl = logprobs - ref_logprobs
         mean_kl = kl.sum(1).mean()
+        mean_entropy = (-logprobs).sum(1).mean()
+        mean_non_score_reward = non_score_reward.sum(1).mean()
+        writer.add_scalar("objective/kl_coef", np.array(kl_ctl.value), update)
+        writer.add_scalar("objective/kl", mean_kl.item(), update)
+        writer.add_scalar(
+            "objective/entropy",
+            mean_entropy.item(),
+            update,
+        )
+        writer.add_scalar(
+            "objective/non_score_reward",
+            mean_non_score_reward.item(),
+            update,
+        )
+        writer.add_scalar(
+            "objective/score_total",
+            mean_non_score_reward.item() + scores.mean().item(),
+            update,
+        )
+        writer.add_scalar(
+            "objective/scores",
+            scores.mean().item(),
+            update,
+        )
+        writer.add_scalar("ppo/loss/policy", rl_stats.pg_loss.mean().item(), update)
+        writer.add_scalar("ppo/loss/value", rl_stats.vf_loss.mean().item(), update)
+        writer.add_scalar("ppo/loss/total", rl_stats.loss.mean().item(), update)
+        writer.add_scalar(
+            "ppo/policy/entropy",
+            rl_stats.entropy.mean().item(),
+            update,
+        )
+        writer.add_scalar(
+            "ppo/policy/approxkl",
+            rl_stats.approxkl.mean().item(),
+            update,
+        )
+        writer.add_scalar(
+            "ppo/policy/clipfrac",
+            rl_stats.pg_clipfrac.mean().item(),
+            update,
+        )
         writer.add_scalar(
             "ppo/policy/approxkl_avg",
-            np.array(approxkls_stats.mean()),
+            approxkls_stats.mean().item(),
             update,
         )
         writer.add_scalar(
             "ppo/policy/clipfrac_avg",
-            np.array(clipfracs_stats.mean()),
+            clipfracs_stats.mean().item(),
             update,
         )
         writer.add_scalar(
             "ppo/loss/policy_avg",
-            np.array(pg_losses_stats.mean()),
+            pg_losses_stats.mean().item(),
             update,
         )
         writer.add_scalar(
             "ppo/loss/value_avg",
-            np.array(vf_losses_stats.mean()),
+            vf_losses_stats.mean().item(),
             update,
         )
         writer.add_scalar(
             "ppo/val/clipfrac_avg",
-            np.array(vf_clipfrac_stats.mean()),
+            vf_clipfrac_stats.mean().item(),
             update,
         )
         writer.add_scalar(
             "ppo/policy/entropy_avg",
-            np.array(entropies_stats.mean()),
+            entropies_stats.mean().item(),
             update,
         )
         writer.add_scalar(
             "ppo/returns/mean",
-            np.array(return_mean.mean()),
+            return_mean.item(),
             update,
         )
-
+        writer.add_scalar("ppo/returns/var",return_var.item(), update)
+        writer.add_scalar("ppo/val/vpred", rl_stats.vpred.mean().item(), update)
+        writer.add_scalar(
+            "ppo/val/error",
+            rl_stats.vf_losses1.mean().item(),
+            update,
+        )
+        writer.add_scalar(
+            "ppo/val/clipfrac",
+            rl_stats.vf_clipfrac.mean().item(),
+            update,
+        )
+        writer.add_scalar("ppo/val/mean", value_mean.item(), update)
+        writer.add_scalar("ppo/val/var", value_var.item(), update)
+        writer.add_scalar("ppo/val/ratio", rl_stats.ratio.mean().item(), update)
+        writer.add_scalar(
+            "ppo/val/advantage",
+            advantages.mean().item(),
+            update,
+        )
         writer.add_scalar(
             "ppo/val/num_eos_tokens",
             (responses == tokenizer.eos_token_id).sum().item(),
             update,
         )
 
-        writer.add_scalar(
-            "ppo/lr",
-            linear_schedule(np.array(policy_state.step - 1), args),
-            update,
-        )
-
+        lrnow = linear_schedule(policy_state.step - 1, args)
+        writer.add_scalar("ppo/lr", lrnow.item(), update)
         writer.add_scalar("ppo/episode", global_step, update)
-        kl_ctl.update(mean_kl.item(), args.ppo.batch_size)
+        kl_ctl.update(mean_kl, args.ppo.batch_size)
 
     # save model
-    # TODO
+    if args.local_rank == 0:
+        if args.save_path:
+            ckpt = {"policy_model": policy_state, "args": vars(args)}
+            orbax_checkpointer = orbax.checkpoint.PyTreeCheckpointer()
+            save_args = orbax_utils.save_args_from_target(ckpt)
+            orbax_checkpointer.save(args.save_path, ckpt, save_args=save_args, force=True)
+
+        if args.local_rank == 0 and args.track:
+            wandb.finish()
 
 
 if __name__ == "__main__":
