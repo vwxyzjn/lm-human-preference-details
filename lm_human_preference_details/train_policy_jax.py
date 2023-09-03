@@ -611,13 +611,44 @@ def train(args: Args):
     p_whiten_no_shift_mean = jax.pmap(functools.partial(whiten, shift_mean=False))
     p_whiten_shift_mean = jax.pmap(functools.partial(whiten, shift_mean=True))
     p_reward_forward = jax.pmap(reward_forward)
-    p_policy_generate = jax.pmap(policy_generate)
-    p_policy_forward = jax.pmap(policy_forward)
+    # p_policy_generate = jax.pmap(policy_generate)
+    # p_policy_forward = jax.pmap(policy_forward)
     p_train_step = jax.pmap(
         functools.partial(train_step, args=args),
         axis_name="batch",
         donate_argnums=(0,),
     )
+
+    @jax.pmap
+    def p_get_response_values_and_logprobs(policy_state_params, queries):
+        query_responses = policy_generate(
+            params=policy_state_params.lm_backbone_params,
+            input_ids=queries,
+        )
+        # query_responses: [local_batch_size, query_length + response_length]
+        responses = query_responses[:, args.task.query_length :]
+
+        output, full_values = policy_forward(policy_state_params, query_responses)
+        values = full_values[:, args.task.query_length - 1 : -1].squeeze(-1)
+        # values: [local_batch_size, response_length]
+        logits = output.logits[:, args.task.query_length - 1 : -1, :]
+        # logits: [local_batch_size, response_length, vocab_size]
+        logits /= args.task.temperature
+        all_logprobs = jax.nn.log_softmax(logits, axis=-1)
+        # all_logprobs: [local_batch_size, response_length, vocab_size]
+        logprobs = jnp.take_along_axis(all_logprobs, responses[..., None], -1).squeeze(-1)
+        # logprobs: [local_batch_size, response_length]
+
+        ref_output, _ = policy_forward(ref_policy_params, query_responses)
+        ref_logits = ref_output.logits[:, args.task.query_length - 1 : -1, :]
+        # ref_logits: [local_batch_size, response_length, vocab_size]
+        ref_logits /= args.task.temperature
+        ref_all_logprobs = jax.nn.log_softmax(ref_logits, axis=-1)
+        ref_logprobs = jnp.take_along_axis(ref_all_logprobs, responses[..., None], -1).squeeze(-1)
+        # ref_logprobs: [local_batch_size, response_length]
+        return query_responses, values, logprobs, ref_logprobs
+
+    # p_get_response_values_and_logprobs = jax.pmap(get_response_values_and_logprobs)
 
     if args.use_tensorflow_adam:
         adam = adam_tf_style
@@ -633,7 +664,7 @@ def train(args: Args):
 
     policy_state = TrainState.create(apply_fn=policy_forward, params=policy_params, tx=optimizer)
     policy_state = jax_utils.replicate(policy_state)
-    ref_policy_params = jax_utils.replicate(ref_policy_params)
+    # ref_policy_params = jax_utils.replicate(ref_policy_params)
 
     del policy_params
 
@@ -700,33 +731,41 @@ def train(args: Args):
         queries = common_utils.shard(queries)
         # queries: [num_device, local_batch_size, query_length]
 
-        query_responses = p_policy_generate(
-            params=policy_state.params.lm_backbone_params,
-            input_ids=queries,
-        )
-        # query_responses: [num_device, local_batch_size, query_length + response_length]
+        query_responses, values, logprobs, ref_logprobs = p_get_response_values_and_logprobs(
+            policy_state.params, queries)
         responses = query_responses[..., args.task.query_length :]
 
-        output, full_values = p_policy_forward(policy_state.params, query_responses)
-        values = full_values[:, :, args.task.query_length - 1 : -1].squeeze(-1)
         # values: [num_device, local_batch_size, response_length]
-        logits = output.logits[:, :, args.task.query_length - 1 : -1, :]
-        # logits: [num_device, local_batch_size, response_length, vocab_size]
-        logits /= args.task.temperature
-        all_logprobs = jax.nn.log_softmax(logits, axis=-1)
-        # all_logprobs: [num_device, local_batch_size, response_length, vocab_size]
-        logprobs = jnp.take_along_axis(all_logprobs, responses[..., None], -1).squeeze(-1)
         # logprobs: [num_device, local_batch_size, response_length]
-        del output, logits, all_logprobs
-
-        ref_output, _ = p_policy_forward(ref_policy_params, query_responses)
-        ref_logits = ref_output.logits[:, :, args.task.query_length - 1 : -1, :]
-        # ref_logits: [num_device, local_batch_size, response_length, vocab_size]
-        ref_logits /= args.task.temperature
-        ref_all_logprobs = jax.nn.log_softmax(ref_logits, axis=-1)
-        ref_logprobs = jnp.take_along_axis(ref_all_logprobs, responses[..., None], -1).squeeze(-1)
         # ref_logprobs: [num_device, local_batch_size, response_length]
-        del ref_output, ref_logits, ref_all_logprobs
+
+        # query_responses = p_policy_generate(
+        #     params=policy_state.params.lm_backbone_params,
+        #     input_ids=queries,
+        # )
+        # # query_responses: [num_device, local_batch_size, query_length + response_length]
+        # responses = query_responses[..., args.task.query_length :]
+
+        # output, full_values = p_policy_forward(policy_state.params, query_responses)
+        # values = full_values[:, :, args.task.query_length - 1 : -1].squeeze(-1)
+        # # values: [num_device, local_batch_size, response_length]
+        # logits = output.logits[:, :, args.task.query_length - 1 : -1, :]
+        # # logits: [num_device, local_batch_size, response_length, vocab_size]
+        # logits /= args.task.temperature
+        # all_logprobs = jax.nn.log_softmax(logits, axis=-1)
+        # # all_logprobs: [num_device, local_batch_size, response_length, vocab_size]
+        # logprobs = jnp.take_along_axis(all_logprobs, responses[..., None], -1).squeeze(-1)
+        # # logprobs: [num_device, local_batch_size, response_length]
+        # del output, logits, all_logprobs
+
+        # ref_output, _ = p_policy_forward(ref_policy_params, query_responses)
+        # ref_logits = ref_output.logits[:, :, args.task.query_length - 1 : -1, :]
+        # # ref_logits: [num_device, local_batch_size, response_length, vocab_size]
+        # ref_logits /= args.task.temperature
+        # ref_all_logprobs = jax.nn.log_softmax(ref_logits, axis=-1)
+        # ref_logprobs = jnp.take_along_axis(ref_all_logprobs, responses[..., None], -1).squeeze(-1)
+        # # ref_logprobs: [num_device, local_batch_size, response_length]
+        # del ref_output, ref_logits, ref_all_logprobs
 
         # **Response Processing**
         # 1. truncate at the first occurrence of `truncate_token` that appears at or after
