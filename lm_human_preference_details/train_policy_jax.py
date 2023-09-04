@@ -384,7 +384,7 @@ def prepare_policy_forward_and_policy_generate(args, tokenizer):
     # disable `pad_token_id` and `eos_token_id` because we just want to
     # generate tokens without truncation / padding
     lm_backbone.generation_config.eos_token_id = None
-    lm_backbone.generation_config.pad_token_id = None
+    lm_backbone.generation_config.pad_token_id = tokenizer.pad_token_id #None
     scalar_head = ScalarHead(head_input_size=lm_backbone.config.hidden_size)
 
     generation_config = GenerationConfig(
@@ -394,7 +394,6 @@ def prepare_policy_forward_and_policy_generate(args, tokenizer):
         top_k=0.0,
         top_p=1.0,
         do_sample=True,
-        eos_token_id=None,
         pad_token_id=tokenizer.pad_token_id,
     )
 
@@ -430,10 +429,11 @@ def prepare_policy_forward_and_policy_generate(args, tokenizer):
 
     def policy_generate(
         params: LMBackboneWithScalarHeadParams,
-        input_ids: jnp.ndarray,
+        queries: jnp.ndarray,
     ):
+        input_ids = queries
         attention_mask = input_ids != tokenizer.pad_token_id
-        input_ids = jnp.where(attention_mask, input_ids, 0)
+        input_ids = jnp.where(attention_mask, queries, 0)
         output = lm_backbone.generate(
             params=params["params"],
             input_ids=input_ids,
@@ -442,7 +442,7 @@ def prepare_policy_forward_and_policy_generate(args, tokenizer):
             return_dict_in_generate=True,
         )
         context_length = input_ids.shape[1]
-        return jnp.concatenate((input_ids, output.sequences[:, context_length:]), axis=1)
+        return jnp.concatenate((queries, output.sequences[:, context_length:]), axis=1)
 
     key = jax.random.PRNGKey(args.seed)
     key, init_key = jax.random.split(key, 2)
@@ -486,6 +486,7 @@ def train_step(policy_state, mb_stats, args):
     def loss(params):
         # mb_stats.query_responses: [local_micro_batch_size, query_length + response_length]
         output, vpred_temp = policy_state.apply_fn(params, mb_stats.query_responses)
+
         # vpred_temp: [local_micro_batch_size, query_length + response_length, 1]
         vpred = jnp.squeeze(vpred_temp[:, args.task.query_length - 1 : -1, :], axis=-1)
         # vpred: [local_micro_batch_size, response_length]
@@ -611,8 +612,6 @@ def train(args: Args):
     p_whiten_no_shift_mean = jax.pmap(functools.partial(whiten, shift_mean=False))
     p_whiten_shift_mean = jax.pmap(functools.partial(whiten, shift_mean=True))
     p_reward_forward = jax.pmap(reward_forward)
-    # p_policy_generate = jax.pmap(policy_generate)
-    # p_policy_forward = jax.pmap(policy_forward)
     p_train_step = jax.pmap(
         functools.partial(train_step, args=args),
         axis_name="batch",
@@ -623,7 +622,7 @@ def train(args: Args):
     def p_get_response_values_and_logprobs(policy_state_params, queries):
         query_responses = policy_generate(
             params=policy_state_params.lm_backbone_params,
-            input_ids=queries,
+            queries=queries,
         )
         # query_responses: [local_batch_size, query_length + response_length]
         responses = query_responses[:, args.task.query_length :]
@@ -648,8 +647,6 @@ def train(args: Args):
         # ref_logprobs: [local_batch_size, response_length]
         return query_responses, values, logprobs, ref_logprobs
 
-    # p_get_response_values_and_logprobs = jax.pmap(get_response_values_and_logprobs)
-
     if args.use_tensorflow_adam:
         adam = adam_tf_style
     else:
@@ -664,7 +661,6 @@ def train(args: Args):
 
     policy_state = TrainState.create(apply_fn=policy_forward, params=policy_params, tx=optimizer)
     policy_state = jax_utils.replicate(policy_state)
-    # ref_policy_params = jax_utils.replicate(ref_policy_params)
 
     del policy_params
 
@@ -734,38 +730,6 @@ def train(args: Args):
         query_responses, values, logprobs, ref_logprobs = p_get_response_values_and_logprobs(
             policy_state.params, queries)
         responses = query_responses[..., args.task.query_length :]
-
-        # values: [num_device, local_batch_size, response_length]
-        # logprobs: [num_device, local_batch_size, response_length]
-        # ref_logprobs: [num_device, local_batch_size, response_length]
-
-        # query_responses = p_policy_generate(
-        #     params=policy_state.params.lm_backbone_params,
-        #     input_ids=queries,
-        # )
-        # # query_responses: [num_device, local_batch_size, query_length + response_length]
-        # responses = query_responses[..., args.task.query_length :]
-
-        # output, full_values = p_policy_forward(policy_state.params, query_responses)
-        # values = full_values[:, :, args.task.query_length - 1 : -1].squeeze(-1)
-        # # values: [num_device, local_batch_size, response_length]
-        # logits = output.logits[:, :, args.task.query_length - 1 : -1, :]
-        # # logits: [num_device, local_batch_size, response_length, vocab_size]
-        # logits /= args.task.temperature
-        # all_logprobs = jax.nn.log_softmax(logits, axis=-1)
-        # # all_logprobs: [num_device, local_batch_size, response_length, vocab_size]
-        # logprobs = jnp.take_along_axis(all_logprobs, responses[..., None], -1).squeeze(-1)
-        # # logprobs: [num_device, local_batch_size, response_length]
-        # del output, logits, all_logprobs
-
-        # ref_output, _ = p_policy_forward(ref_policy_params, query_responses)
-        # ref_logits = ref_output.logits[:, :, args.task.query_length - 1 : -1, :]
-        # # ref_logits: [num_device, local_batch_size, response_length, vocab_size]
-        # ref_logits /= args.task.temperature
-        # ref_all_logprobs = jax.nn.log_softmax(ref_logits, axis=-1)
-        # ref_logprobs = jnp.take_along_axis(ref_all_logprobs, responses[..., None], -1).squeeze(-1)
-        # # ref_logprobs: [num_device, local_batch_size, response_length]
-        # del ref_output, ref_logits, ref_all_logprobs
 
         # **Response Processing**
         # 1. truncate at the first occurrence of `truncate_token` that appears at or after
@@ -842,6 +806,9 @@ def train(args: Args):
                 + f"[yellow]{tokenizer.decode(postprocessed_responses[0][0], skip_special_tokens=True)}[/]\n\n"
                 + f"[red]score: {scores[0][0]}, kl: {kl[0][0].sum().item()}, total reward: {scores[0][0] - kl_ctl.value * sample_kl} [/]"
             )
+            # if kl[0][0].sum().item() < 0:
+            console.print(f"[grey][bold]{'logprobs:'} {jnp.exp(logprobs[0][0]) }")
+            console.print(f"[grey][bold]{'ref_logprobs:'} {jnp.exp(ref_logprobs[0][0])}")
         except Exception as e:
             print(e)
         del postprocessed_query_responses
@@ -994,7 +961,7 @@ def train(args: Args):
         lrnow = common_utils.get_metrics([lrnow])
         writer.add_scalar("ppo/lr", lrnow.item(), update)
         writer.add_scalar("ppo/episode", global_step, update)
-        kl_ctl.update(mean_kl, args.ppo.batch_size)
+        kl_ctl.update(mean_kl.item(), args.ppo.batch_size)
 
     # save model
     if args.local_rank == 0:
