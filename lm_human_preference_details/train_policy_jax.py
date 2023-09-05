@@ -384,7 +384,7 @@ def prepare_policy_forward_and_policy_generate(args, tokenizer):
     # disable `pad_token_id` and `eos_token_id` because we just want to
     # generate tokens without truncation / padding
     lm_backbone.generation_config.eos_token_id = None
-    lm_backbone.generation_config.pad_token_id = tokenizer.pad_token_id #None
+    lm_backbone.generation_config.pad_token_id = tokenizer.pad_token_id
     scalar_head = ScalarHead(head_input_size=lm_backbone.config.hidden_size)
 
     generation_config = GenerationConfig(
@@ -727,8 +727,7 @@ def train(args: Args):
         queries = common_utils.shard(queries)
         # queries: [num_device, local_batch_size, query_length]
 
-        query_responses, values, logprobs, ref_logprobs = p_get_response_values_and_logprobs(
-            policy_state.params, queries)
+        query_responses, values, logprobs, ref_logprobs = p_get_response_values_and_logprobs(policy_state.params, queries)
         responses = query_responses[..., args.task.query_length :]
 
         # **Response Processing**
@@ -796,7 +795,6 @@ def train(args: Args):
             rewards = p_whiten_no_shift_mean(rewards)
         try:
             sample_kl = kl[0][0].sum().item()
-            # postprocessed_responses = postprocessed_query_responses[..., args.task.query_length :]
             console.print(
                 f"[green][bold]{'Query'}:[/]\n"
                 + f"[green]{ tokenizer.decode(queries[0][0], skip_special_tokens=True)}[/]\n\n"
@@ -806,9 +804,6 @@ def train(args: Args):
                 + f"[yellow]{tokenizer.decode(postprocessed_responses[0][0], skip_special_tokens=True)}[/]\n\n"
                 + f"[red]score: {scores[0][0]}, kl: {kl[0][0].sum().item()}, total reward: {scores[0][0] - kl_ctl.value * sample_kl} [/]"
             )
-            # if kl[0][0].sum().item() < 0:
-            console.print(f"[grey][bold]{'logprobs:'} {jnp.exp(logprobs[0][0]) }")
-            console.print(f"[grey][bold]{'ref_logprobs:'} {jnp.exp(ref_logprobs[0][0])}")
         except Exception as e:
             print(e)
         del postprocessed_query_responses
