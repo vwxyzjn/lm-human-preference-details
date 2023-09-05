@@ -904,7 +904,6 @@ def train(args: Args):
         writer.add_scalar("ppo/policy/approxkl_avg", approxkls_stats.mean().item(), update)
         writer.add_scalar(
             "ppo/val/clipfrac_avg",
-            # TODO: change the name to pg_clipfrac_avg and distinguish it from vf_clipfrac_avg?
             pg_clipfracs_stats.mean().item(),
             update,
         )
