@@ -89,7 +89,9 @@ class Args:
     """the learning rate"""
     eps: float = 1e-5
     """the epsilon for AdamW"""
-    rollout_batch_size: int = 512
+    local_rollout_batch_size: int = 64
+    """per rank rollout batch size"""
+    rollout_batch_size: tyro.conf.Suppress[int] = None
     """rollout batch size"""
     world_size: tyro.conf.Suppress[int] = None
     """the number of processes to use"""
@@ -400,9 +402,6 @@ def normalize(
     iter_dataloader,
     generation_config,
 ):
-    # number of minibatches for computing the normalization statistics
-    n_batches = ceil_div(args.normalize_samples, args.rollout_batch_size)
-
     # reset reward scales
     reward_state = set_reward_state_head_params(reward_state, gain=1.0, bias=0.0)
 
@@ -416,6 +415,9 @@ def normalize(
     )
     p_apply_fn = jax.pmap(reward_state.apply_fn)
 
+    # number of minibatches for computing the normalization statistics
+    n_batches = ceil_div(args.local_normalize_samples, args.local_rollout_batch_size)
+
     def get_normalization_stats(reward_state):
         """compute mean and std of rewards"""
 
@@ -428,6 +430,7 @@ def normalize(
             query_responses = p_generate(queries)
             sample_queries_responses.append(query_responses)
 
+        # compute reward statistics
         rewards = []
         for query_responses in sample_queries_responses:
             rewards.append(
@@ -582,7 +585,8 @@ def train(args: Args):
     args.global_learner_decices = [str(item) for item in global_learner_decices]
     args.learner_devices = [str(item) for item in learner_devices]
     args.batch_size = int(args.local_batch_size * len(local_devices) * args.world_size)
-    args.normalize_samples =  int(args.local_normalize_samples * len(local_devices) * args.world_size)
+    args.rollout_batch_size = int(args.local_rollout_batch_size * len(local_devices) * args.world_size)
+    args.normalize_samples = int(args.local_normalize_samples * len(local_devices) * args.world_size)
 
     args.local_rank = jax.process_index()
 
