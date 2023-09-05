@@ -86,7 +86,7 @@ class Args:
     """the learning rate"""
     eps: float = 1e-5
     """the epsilon for AdamW"""
-    local_rollout_batch_size: int = 64
+    local_rollout_batch_size: int = 512
     """per rank rollout batch size"""
     rollout_batch_size: tyro.conf.Suppress[int] = None
     """rollout batch size"""
@@ -397,7 +397,6 @@ def normalize(
     generation_config,
 ):
     with torch.no_grad():
-
         # reset reward scales
         accelerator.unwrap_model(reward_model).reward_gain.data.fill_(1.0)
         accelerator.unwrap_model(reward_model).reward_bias.data.fill_(0.0)
@@ -455,6 +454,7 @@ def train(args: Args):
     )
     args.world_size = accelerator.num_processes
     args.batch_size = int(args.local_batch_size * args.world_size)
+    args.rollout_batch_size = int(args.local_rollout_batch_size * args.world_size)
 
     args.local_micro_batch_size = exact_div(args.local_batch_size, args.gradient_accumulation_steps)
 
