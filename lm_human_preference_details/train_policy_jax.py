@@ -957,6 +957,7 @@ def train(args: Args):
         writer.add_scalar("ppo/episode", global_step, update)
         kl_ctl.update(mean_kl.item(), args.ppo.batch_size)
 
+    policy_state = jax_utils.unreplicate(policy_state)
     # save model
     if args.local_rank == 0:
         if args.save_path:
