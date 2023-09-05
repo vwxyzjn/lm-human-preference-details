@@ -95,8 +95,10 @@ class Args:
     """the number of processes to use"""
     batch_size: tyro.conf.Suppress[int] = None
     """the batch size across all ranks"""
-    normalize_samples: int = 256
+    local_normalize_samples: int = 256
     """Samples used to estimate reward mean and std"""
+    normalize_samples: tyro.conf.Suppress[int] = None
+    """Samples used to estimate reward mean and std across all ranks"""
     debug_normalize: int = 0
     """Samples used to check that normalization worked"""
     normalize_before: bool = True
@@ -580,6 +582,8 @@ def train(args: Args):
     args.global_learner_decices = [str(item) for item in global_learner_decices]
     args.learner_devices = [str(item) for item in learner_devices]
     args.batch_size = int(args.local_batch_size * len(local_devices) * args.world_size)
+    args.normalize_samples =  int(args.local_normalize_samples * len(local_devices) * args.world_size)
+
     args.local_rank = jax.process_index()
 
     run_name = f"{args.exp_name}__{args.seed}__{int(time.time())}"
