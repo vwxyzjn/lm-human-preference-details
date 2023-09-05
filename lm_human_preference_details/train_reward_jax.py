@@ -89,7 +89,9 @@ class Args:
     """the learning rate"""
     eps: float = 1e-5
     """the epsilon for AdamW"""
-    rollout_batch_size: int = 512
+    local_rollout_batch_size: int = 512
+    """per rank rollout batch size"""
+    rollout_batch_size: tyro.conf.Suppress[int] = None
     """rollout batch size"""
     world_size: tyro.conf.Suppress[int] = None
     """the number of processes to use"""
@@ -107,7 +109,7 @@ class Args:
     """Whether, after training, to normalize the rewards on the ref policy to mean 0, var 1 (so the KL coefficient always has the same meaning)."""
     print_sample_output_freq: int = 10
     """How often to print sample output"""
-    save_path: str = "models/reward.pt"
+    save_path: str = "models/"
     """Where to save the model"""
     use_tensorflow_adam: bool = True
     """Whether to use tensorflow-style Adam optimizer instead of PyTorch's"""
@@ -117,9 +119,9 @@ class Args:
     """the rank of this process"""
     learner_device_ids: List[int] = field(default_factory=lambda: [0])
     "the device ids that script will use"
-    learner_devices: tyro.conf.Suppress[int] = None # real type is `List[str]`
+    learner_devices: tyro.conf.Suppress[int] = None  # real type is `List[str]`
     """the devices that script will use"""
-    global_learner_decices: tyro.conf.Suppress[int] = None # real type is `List[str]`
+    global_learner_decices: tyro.conf.Suppress[int] = None  # real type is `List[str]`
     """the total devices (across all nodes and machines) that script will use"""
     task: TaskHParams = field(default_factory=TaskHParams)
     labels: LabelHParams = field(default_factory=LabelHParams)
@@ -278,8 +280,7 @@ def exact_div(a, b):
     return q
 
 
-# TODO: pmap `generate` to accelerate reward model normalization?
-def generate(lm_backbone, queries, args, generation_config):
+def generate(queries, lm_backbone, args, generation_config):
     """generate in a way that does not affect padding tokens"""
     context_length = queries.shape[1]
     attention_mask = queries != args.pad_token_id
@@ -380,8 +381,8 @@ def set_reward_state_head_params(reward_state: TrainState, gain: float = 1.0, bi
     """
     flat_head_params = traverse_util.flatten_dict(reward_state.params.head_params, sep="/")
 
-    flat_head_params["params/reward_gain"] = jnp.array(gain, dtype=jnp.float32)
-    flat_head_params["params/reward_bias"] = jnp.array(bias, dtype=jnp.float32)
+    flat_head_params["params/reward_gain"] = flat_head_params["params/reward_gain"].at[:].set(gain)
+    flat_head_params["params/reward_bias"] = flat_head_params["params/reward_bias"].at[:].set(bias)
 
     unflat_head_params = freeze(traverse_util.unflatten_dict(flat_head_params, sep="/"))
 
@@ -401,11 +402,21 @@ def normalize(
     iter_dataloader,
     generation_config,
 ):
-    # number of minibatches for computing the normalization statistics
-    n_batches = ceil_div(args.local_normalize_samples, args.rollout_batch_size)
-
     # reset reward scales
     reward_state = set_reward_state_head_params(reward_state, gain=1.0, bias=0.0)
+
+    p_generate = jax.pmap(
+        functools.partial(
+            generate,
+            lm_backbone=lm_backbone,
+            args=args,
+            generation_config=generation_config,
+        ),
+    )
+    p_apply_fn = jax.pmap(reward_state.apply_fn)
+
+    # number of minibatches for computing the normalization statistics
+    n_batches = ceil_div(args.local_normalize_samples, args.local_rollout_batch_size)
 
     def get_normalization_stats(reward_state):
         """compute mean and std of rewards"""
@@ -415,22 +426,21 @@ def normalize(
             data = next(iter_dataloader)
             queries = data["input_ids"]
             queries = right_padding_to_left_padding(data["input_ids"], args.pad_token_id)
-            query_responses = generate(lm_backbone, queries, args, generation_config)
+            queries = common_utils.shard(queries)
+            query_responses = p_generate(queries)
             sample_queries_responses.append(query_responses)
 
+        # compute reward statistics
         rewards = []
         for query_responses in sample_queries_responses:
             rewards.append(
-                reward_state.apply_fn(
+                p_apply_fn(
                     reward_state.params,
                     query_responses,
                 )
             )
-        # Here, len(rewards) = n_batches
-        # each rewards[i] is a (args.rollout_batch_size, 1) array.
 
         rewards = np.concatenate(rewards)
-        # shape: [args.local_normalize_samples, 1]
         mean, std = rewards.mean(), rewards.std()
         print(f"mean: {mean}, std: {std}")
         return mean, std
@@ -575,6 +585,9 @@ def train(args: Args):
     args.global_learner_decices = [str(item) for item in global_learner_decices]
     args.learner_devices = [str(item) for item in learner_devices]
     args.batch_size = int(args.local_batch_size * len(local_devices) * args.world_size)
+    args.rollout_batch_size = int(args.local_rollout_batch_size * len(local_devices) * args.world_size)
+    args.normalize_samples = int(args.local_normalize_samples * len(local_devices) * args.world_size)
+
     args.local_rank = jax.process_index()
 
     run_name = f"{args.exp_name}__{args.seed}__{int(time.time())}"
@@ -636,7 +649,7 @@ def train(args: Args):
         start_text=args.task.start_text,
         end_text=args.task.end_text,
     )
-    normalization_dataloader = DataLoader(normalization_dataset, batch_size=args.rollout_batch_size)
+    normalization_dataloader = DataLoader(normalization_dataset, batch_size=args.local_rollout_batch_size * len(local_devices))
     iter_normalization_dataloader = iter(normalization_dataloader)
 
     generation_config = GenerationConfig(
@@ -648,6 +661,8 @@ def train(args: Args):
         do_sample=True,
         pad_token_id=args.pad_token_id,
     )
+
+    reward_state = jax_utils.replicate(reward_state)
 
     if args.normalize_before:
         print("===Normalize reward model *before* training===")
@@ -671,8 +686,6 @@ def train(args: Args):
             + f"Gain: {reward_state.params.head_params['params']['reward_gain']}"
             + f" Bias: {reward_state.params.head_params['params']['reward_bias']}"
         )
-
-    reward_state = jax_utils.replicate(reward_state)
 
     # `labeled_dataset` has keys
     # `['sample0', 'query', 'best', 'sample3', 'sample1', 'sample2']`
@@ -735,8 +748,6 @@ def train(args: Args):
 
             print(f"gloabl_step: {global_step} | " + f"test/accuracy {val_metrics['accuracy']}")
 
-    reward_state = jax_utils.unreplicate(reward_state)
-
     if args.normalize_after:
         print("===Normalize reward model *after* training===")
         print(
@@ -757,6 +768,8 @@ def train(args: Args):
             + f"Gain: {reward_state.params.head_params['params']['reward_gain']}"
             + f" Bias: {reward_state.params.head_params['params']['reward_bias']}"
         )
+
+    reward_state = jax_utils.unreplicate(reward_state)
 
     # save model
     if args.save_path and args.local_rank == 0:

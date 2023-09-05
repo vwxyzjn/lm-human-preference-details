@@ -86,7 +86,9 @@ class Args:
     """the learning rate"""
     eps: float = 1e-5
     """the epsilon for AdamW"""
-    rollout_batch_size: int = 512
+    local_rollout_batch_size: int = 512
+    """per rank rollout batch size"""
+    rollout_batch_size: tyro.conf.Suppress[int] = None
     """rollout batch size"""
     world_size: tyro.conf.Suppress[int] = None
     """the number of processes to use"""
@@ -398,9 +400,8 @@ def normalize(
         # reset reward scales
         accelerator.unwrap_model(reward_model).reward_gain.data.fill_(1.0)
         accelerator.unwrap_model(reward_model).reward_bias.data.fill_(0.0)
-
-        # sample queries and responses
-        n_batches = ceil_div(args.local_normalize_samples, args.rollout_batch_size)
+        # number of minibatches for computing the normalization statistics
+        n_batches = ceil_div(args.local_normalize_samples, args.local_rollout_batch_size)
         sample_queries_responses = []
         for _ in range(n_batches):
             data = next(iter_dataloader)
@@ -415,7 +416,6 @@ def normalize(
             rewards.append(get_reward(reward_model, query_responses, args)[1])
         rewards = torch.cat(rewards)
         rewards = accelerator.gather(rewards)
-        # shape: [args.local_normalize_samples, 1]
         mean, std = rewards.mean(), rewards.std()
         print(f"mean: {mean}, std: {std}")
 
@@ -428,7 +428,7 @@ def normalize(
         accelerator.unwrap_model(reward_model).reward_bias.data = bias
 
         # validate normalization
-        n_batches = ceil_div(args.local_normalize_samples, args.rollout_batch_size)
+        n_batches = ceil_div(args.local_normalize_samples, args.local_rollout_batch_size)
         sample_queries_responses = []
         for _ in range(n_batches):
             data = next(iter_dataloader)
@@ -454,6 +454,8 @@ def train(args: Args):
     )
     args.world_size = accelerator.num_processes
     args.batch_size = int(args.local_batch_size * args.world_size)
+    args.rollout_batch_size = int(args.local_rollout_batch_size * args.world_size)
+
     args.local_micro_batch_size = exact_div(args.local_batch_size, args.gradient_accumulation_steps)
 
     console = Console(force_terminal=True)
@@ -514,7 +516,7 @@ def train(args: Args):
         start_text=args.task.start_text,
         end_text=args.task.end_text,
     )
-    normalization_dataloader = DataLoader(normalization_dataset, batch_size=args.rollout_batch_size)
+    normalization_dataloader = DataLoader(normalization_dataset, batch_size=args.local_rollout_batch_size)
     reward_model, optimizer, normalization_dataloader = accelerator.prepare(reward_model, optimizer, normalization_dataloader)
     iter_normalization_dataloader = iter(normalization_dataloader)
 
