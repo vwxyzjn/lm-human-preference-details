@@ -89,7 +89,7 @@ class Args:
     """the learning rate"""
     eps: float = 1e-5
     """the epsilon for AdamW"""
-    local_rollout_batch_size: int = 64
+    local_rollout_batch_size: int = 512
     """per rank rollout batch size"""
     rollout_batch_size: tyro.conf.Suppress[int] = None
     """rollout batch size"""
@@ -649,7 +649,7 @@ def train(args: Args):
         start_text=args.task.start_text,
         end_text=args.task.end_text,
     )
-    normalization_dataloader = DataLoader(normalization_dataset, batch_size=args.rollout_batch_size)
+    normalization_dataloader = DataLoader(normalization_dataset, batch_size=args.rollout_batch_size * len(local_devices))
     iter_normalization_dataloader = iter(normalization_dataloader)
 
     generation_config = GenerationConfig(
