@@ -5,7 +5,7 @@ from dataclasses import asdict, dataclass, field
 from types import SimpleNamespace
 from typing import List, Optional
 
-import einops
+# import einops
 import flax
 import flax.linen as nn
 import jax
@@ -301,9 +301,14 @@ class MyDataset(IterableDataset):
             yield output
 
 
+# def right_padding_to_left_padding(tokens, pad_id):
+#     # Convert from right padding to left padding.
+#     return np.array([[pad_id] * (row == pad_id).sum() + [x for x in row if x != pad_id] for row in tokens])
 def right_padding_to_left_padding(tokens, pad_id):
-    # Convert from right padding to left padding.
-    return np.array([[pad_id] * (row == pad_id).sum() + [x for x in row if x != pad_id] for row in tokens])
+    def pad_row(row):
+      mask = 1 - (row == pad_id) # 1 if not pad_id, 0 if pad_id
+      return row[jnp.argsort(mask)] # use the fact that jnp.argsort is stable by default
+    return jax.vmap(pad_row)(tokens)
 
 
 def ceil_div(a, b):
@@ -464,10 +469,8 @@ class RolloutStatistics:
     returns: jnp.array
     values: jnp.array
     advantage: jnp.array
-    responses: jnp.array
     query_responses: jnp.array
     logprobs: jnp.array
-
 
 @flax.struct.dataclass
 class RLStatistics:
@@ -475,7 +478,7 @@ class RLStatistics:
     entropy: jnp.array
     pg_loss: jnp.array
     pg_clipfrac: jnp.array
-    vf_losses1: jnp.array
+    vf_loss1: jnp.array
     vf_loss: jnp.array
     vf_clipfrac: jnp.array
     ratio: jnp.array
@@ -502,15 +505,15 @@ def train_step(policy_state, mb_stats, args):
 
         logits = output.logits[:, args.task.query_length - 1 : -1, :]
         logits /= args.task.temperature
-        new_logprobs = -optax.softmax_cross_entropy_with_integer_labels(logits, mb_stats.responses)
+        responses = mb_stats.query_responses[:, args.task.query_length:]
+        new_logprobs = -optax.softmax_cross_entropy_with_integer_labels(logits, responses)
 
         logprobs_diff = new_logprobs - mb_stats.logprobs
         ratio = jnp.exp(logprobs_diff)
-        pg_losses = -mb_stats.advantage * ratio
+        pg_losses1 = -mb_stats.advantage * ratio
         pg_losses2 = -mb_stats.advantage * jnp.clip(ratio, 1.0 - args.ppo.cliprange, 1.0 + args.ppo.cliprange)
-
-        pg_loss = jnp.maximum(pg_losses, pg_losses2).mean()
-        pg_clipfrac = (pg_losses2 > pg_losses).astype(jnp.float32).mean()
+        pg_loss = jnp.maximum(pg_losses1, pg_losses2).mean()
+        pg_clipfrac = (pg_losses2 > pg_losses1).astype(jnp.float32).mean()
 
         pd = jax.nn.softmax(logits, axis=-1)
         entropy = jax.nn.logsumexp(logits, axis=-1) - jnp.sum(pd * logits, axis=-1)
@@ -519,15 +522,15 @@ def train_step(policy_state, mb_stats, args):
         loss = pg_loss + args.ppo.vf_coef * vf_loss
 
         rl_stats = RLStatistics(
-            vf_loss=vf_loss,
-            vf_clipfrac=vf_clipfrac,
-            pg_loss=pg_loss,
-            pg_clipfrac=pg_clipfrac,
             approxkl=approxkl,
-            loss=loss,
             entropy=entropy.mean(),
             ratio=ratio.mean(),
-            vf_losses1=vf_losses1.mean(),
+            pg_loss=pg_loss,
+            pg_clipfrac=pg_clipfrac,
+            vf_loss1=vf_losses1.mean(),
+            vf_loss=vf_loss,
+            vf_clipfrac=vf_clipfrac,
+            loss=loss,
         )
         rl_stats = jax.lax.pmean(rl_stats, "batch")
         return loss, rl_stats
@@ -609,44 +612,6 @@ def train(args: Args):
     policy_forward, policy_generate, policy_params = prepare_policy_forward_and_policy_generate(args, tokenizer)
     _, _, ref_policy_params = prepare_policy_forward_and_policy_generate(args, tokenizer)
 
-    p_whiten_no_shift_mean = jax.pmap(functools.partial(whiten, shift_mean=False))
-    p_whiten_shift_mean = jax.pmap(functools.partial(whiten, shift_mean=True))
-    p_reward_forward = jax.pmap(reward_forward)
-    p_train_step = jax.pmap(
-        functools.partial(train_step, args=args),
-        axis_name="batch",
-        donate_argnums=(0,),
-    )
-
-    @jax.pmap
-    def p_get_response_values_and_logprobs(policy_state_params, queries):
-        query_responses = policy_generate(
-            params=policy_state_params.lm_backbone_params,
-            queries=queries,
-        )
-        # query_responses: [local_batch_size, query_length + response_length]
-        responses = query_responses[:, args.task.query_length :]
-
-        output, full_values = policy_forward(policy_state_params, query_responses)
-        values = full_values[:, args.task.query_length - 1 : -1].squeeze(-1)
-        # values: [local_batch_size, response_length]
-        logits = output.logits[:, args.task.query_length - 1 : -1, :]
-        # logits: [local_batch_size, response_length, vocab_size]
-        logits /= args.task.temperature
-        all_logprobs = jax.nn.log_softmax(logits, axis=-1)
-        # all_logprobs: [local_batch_size, response_length, vocab_size]
-        logprobs = jnp.take_along_axis(all_logprobs, responses[..., None], -1).squeeze(-1)
-        # logprobs: [local_batch_size, response_length]
-
-        ref_output, _ = policy_forward(ref_policy_params, query_responses)
-        ref_logits = ref_output.logits[:, args.task.query_length - 1 : -1, :]
-        # ref_logits: [local_batch_size, response_length, vocab_size]
-        ref_logits /= args.task.temperature
-        ref_all_logprobs = jax.nn.log_softmax(ref_logits, axis=-1)
-        ref_logprobs = jnp.take_along_axis(ref_all_logprobs, responses[..., None], -1).squeeze(-1)
-        # ref_logprobs: [local_batch_size, response_length]
-        return query_responses, values, logprobs, ref_logprobs
-
     if args.use_tensorflow_adam:
         adam = adam_tf_style
     else:
@@ -676,37 +641,142 @@ def train(args: Args):
     iter_dataloader = iter(dataloader)
     kl_ctl = AdaptiveKLController(args.rewards.kl_coef, hparams=args.rewards.adaptive_kl)
 
+
+    @jax.pmap
+    def p_rollout(policy_state_params, input_ids):
+        queries = right_padding_to_left_padding(input_ids, tokenizer.pad_token_id)
+
+        query_responses = policy_generate(
+            params=policy_state_params.lm_backbone_params,
+            queries=queries,
+        )
+        # query_responses: [local_batch_size, query_length + response_length]
+        responses = query_responses[:, args.task.query_length :]
+
+        output, full_values = policy_forward(policy_state_params, query_responses)
+        values = full_values[:, args.task.query_length - 1 : -1].squeeze(-1)
+        # values: [local_batch_size, response_length]
+        logits = output.logits[:, args.task.query_length - 1 : -1, :]
+        # logits: [local_batch_size, response_length, vocab_size]
+        logits /= args.task.temperature
+        all_logprobs = jax.nn.log_softmax(logits, axis=-1)
+        # all_logprobs: [local_batch_size, response_length, vocab_size]
+        logprobs = jnp.take_along_axis(all_logprobs, responses[..., None], -1).squeeze(-1)
+        # logprobs: [local_batch_size, response_length]
+
+        ref_output, _ = policy_forward(ref_policy_params, query_responses)
+        ref_logits = ref_output.logits[:, args.task.query_length - 1 : -1, :]
+        # ref_logits: [local_batch_size, response_length, vocab_size]
+        ref_logits /= args.task.temperature
+        ref_all_logprobs = jax.nn.log_softmax(ref_logits, axis=-1)
+        ref_logprobs = jnp.take_along_axis(ref_all_logprobs, responses[..., None], -1).squeeze(-1)
+        # ref_logprobs: [local_batch_size, response_length]
+
+        # **Response Processing**
+        # 1. truncate at the first occurrence of `truncate_token` that appears at or after
+        # position truncate_after in the responses
+        # https://github.com/openai/lm-human-preferences/blob/cbfd210bb8b08f6bc5c26878c10984b90f516c66/lm_human_preferences/train_policy.py#L378
+        truncate_token_mask = responses == args.task.truncate_token
+        truncate_after_or_token_mask = jnp.concatenate(
+            [
+                jnp.zeros_like(truncate_token_mask)[:, : args.task.truncate_after],
+                truncate_token_mask[:, args.task.truncate_after :],
+            ],
+            axis=1,
+        )
+        truncate_mask = (jnp.cumsum(truncate_after_or_token_mask, axis=1) - truncate_after_or_token_mask).astype("bool")
+        postprocessed_responses = jnp.where(
+            truncate_mask,
+            jnp.full_like(responses, tokenizer.pad_token_id),
+            responses,
+        )
+
+        # 2. run reward model on the truncated responses
+        postprocessed_query_responses = jnp.concatenate((queries, postprocessed_responses), axis=1)
+        postprocessed_query_responses = right_padding_to_left_padding(postprocessed_query_responses, tokenizer.pad_token_id)
+        scores = reward_forward(query_responses_ids=postprocessed_query_responses).flatten()
+
+
+        # 3. filter response. Ensure that the sample contains truncate_token
+        # responses not passing that filter will receive a low (fixed) score
+        # only query humans on responses that pass that filter
+        matches_token = postprocessed_responses[:, args.task.truncate_after :] == args.task.truncate_token
+        filter_mask = jnp.any(matches_token, axis=-1)
+
+        scores = jnp.where(
+            filter_mask,
+            scores,
+            jnp.full_like(scores, args.task.penalty_reward_value),
+        )
+
+        # 4. compute rewards
+        kl = logprobs - ref_logprobs
+        non_score_reward = -kl_ctl.value * kl
+        rewards = non_score_reward
+        rewards = rewards.at[:, -1].add(scores)
+
+        # 5. whiten rewards
+        if args.ppo.whiten_rewards:
+            rewards = whiten(rewards, shift_mean=False)
+
+        # 6. compute advantages and returns
+        # lastgaelam = 0
+        # advantages_reversed = []
+        # gen_length = args.task.response_length
+        # for t in reversed(range(gen_length)):
+        #     nextvalues = values[:, t + 1] if t < gen_length - 1 else 0.0
+        #     delta = rewards[:, t] + args.ppo.gamma * nextvalues - values[:, t]
+        #     lastgaelam = delta + args.ppo.gamma * args.ppo.lam * lastgaelam
+        #     advantages_reversed.append(lastgaelam)
+        # advantages_forloop = jnp.stack(advantages_reversed[::-1], axis=1)
+
+        def compute_gae_once(carry, inp):
+            advantages = carry
+            nextdone, nextvalues, curvalues, reward = inp
+            nextnonterminal = 1.0 - nextdone
+
+            delta = reward + args.ppo.gamma * nextvalues * nextnonterminal - curvalues
+            advantages = delta + args.ppo.gamma * args.ppo.lam * nextnonterminal * advantages
+            return advantages, advantages
+
+        extended_values = jnp.concatenate(
+            (values, jnp.zeros((args.ppo.local_batch_size, 1))), axis=1
+        )
+        dones = jnp.zeros_like(rewards)
+        dones = dones.at[:, -1].set(1.0)
+
+        advantages_scan = jnp.zeros((args.ppo.local_batch_size,))
+        _, advantages_scan = jax.lax.scan(
+            compute_gae_once,
+            advantages_scan,
+            (dones.T, extended_values[:, 1:].T, extended_values[:, :-1].T, rewards.T),
+            reverse=True
+        )
+
+        advantages_scan = advantages_scan.T
+        # print(f'advantages_scan.shape, {advantages_scan.shape}')
+        # jax.debug.print("advantages_scan: {x}", x=advantages_scan)
+        # print(f'advantages_forloop.shape, {advantages_forloop.shape}')
+        # jax.debug.print("advantages_forloop: {x}", x=advantages_forloop)
+        # jax.debug.print("diff: {x}", x=advantages_scan - advantages_forloop)
+        # jax.debug.print("diff norm: {x}", x= jnp.sum( (advantages_scan - advantages_forloop) ** 2) )
+
+        advantages = advantages_scan
+        returns = advantages + values
+        advantages = whiten(advantages)
+
+        return returns, advantages, values, query_responses, logprobs, kl, scores
+
+    p_train_step = jax.pmap(
+        functools.partial(train_step, args=args),
+        axis_name="batch",
+        donate_argnums=(0,),
+    )
+
+
     print("===training policy===")
     global_step = 0
     approxkls_stats = np.zeros(
-        (
-            args.ppo.noptepochs,
-            args.ppo.nminibatches,
-            args.ppo.gradient_accumulation_steps,
-        ),
-    )
-    pg_clipfracs_stats = np.zeros(
-        (
-            args.ppo.noptepochs,
-            args.ppo.nminibatches,
-            args.ppo.gradient_accumulation_steps,
-        ),
-    )
-    pg_losses_stats = np.zeros(
-        (
-            args.ppo.noptepochs,
-            args.ppo.nminibatches,
-            args.ppo.gradient_accumulation_steps,
-        ),
-    )
-    vf_losses_stats = np.zeros(
-        (
-            args.ppo.noptepochs,
-            args.ppo.nminibatches,
-            args.ppo.gradient_accumulation_steps,
-        ),
-    )
-    vf_clipfrac_stats = np.zeros(
         (
             args.ppo.noptepochs,
             args.ppo.nminibatches,
@@ -720,115 +790,68 @@ def train(args: Args):
             args.ppo.gradient_accumulation_steps,
         ),
     )
+    ratios_stats = np.zeros(
+        (
+            args.ppo.noptepochs,
+            args.ppo.nminibatches,
+            args.ppo.gradient_accumulation_steps,
+        ),
+    )
+    pg_losses_stats = np.zeros(
+        (
+            args.ppo.noptepochs,
+            args.ppo.nminibatches,
+            args.ppo.gradient_accumulation_steps,
+        ),
+    )
+    pg_clipfracs_stats = np.zeros(
+        (
+            args.ppo.noptepochs,
+            args.ppo.nminibatches,
+            args.ppo.gradient_accumulation_steps,
+        ),
+    )
+    vf_losses_stats = np.zeros(
+        (
+            args.ppo.noptepochs,
+            args.ppo.nminibatches,
+            args.ppo.gradient_accumulation_steps,
+        ),
+    )
+    vf_losses1_stats = np.zeros(
+        (
+            args.ppo.noptepochs,
+            args.ppo.nminibatches,
+            args.ppo.gradient_accumulation_steps,
+        ),
+    )
+    vf_clipfracs_stats = np.zeros(
+        (
+            args.ppo.noptepochs,
+            args.ppo.nminibatches,
+            args.ppo.gradient_accumulation_steps,
+        ),
+    )
+    losses_stats = np.zeros(
+        (
+            args.ppo.noptepochs,
+            args.ppo.nminibatches,
+            args.ppo.gradient_accumulation_steps,
+        ),
+    )
+
+
     for update in range(1, args.ppo.num_updates + 1):
         global_step += 1 * args.ppo.batch_size
         data = next(iter_dataloader)
-        queries = right_padding_to_left_padding(data["input_ids"], tokenizer.pad_token_id)
-        queries = common_utils.shard(queries)
+        # queries = right_padding_to_left_padding(data["input_ids"], tokenizer.pad_token_id)
+        input_ids = common_utils.shard(data["input_ids"].numpy())
         # queries: [num_device, local_batch_size, query_length]
 
-        query_responses, values, logprobs, ref_logprobs = p_get_response_values_and_logprobs(policy_state.params, queries)
-        responses = query_responses[..., args.task.query_length :]
-
-        # **Response Processing**
-        # 1. truncate at the first occurrence of `truncate_token` that appears at or after
-        # position truncate_after in the responses
-        # https://github.com/openai/lm-human-preferences/blob/cbfd210bb8b08f6bc5c26878c10984b90f516c66/lm_human_preferences/train_policy.py#L378
-        truncate_token_mask = responses == args.task.truncate_token
-        # truncate_token_mask: [num_device, local_batch_size, response_length]
-        truncate_after_or_token_mask = jnp.concatenate(
-            [
-                jnp.zeros_like(truncate_token_mask)[:, :, : args.task.truncate_after],
-                truncate_token_mask[:, :, args.task.truncate_after :],
-            ],
-            axis=-1,
+        returns, advantages, values, query_responses, logprobs, kl, scores = p_rollout(
+            policy_state_params=policy_state.params, input_ids=input_ids
         )
-        truncate_mask = (jnp.cumsum(truncate_after_or_token_mask, axis=-1) - truncate_after_or_token_mask).astype("bool")
-        postprocessed_responses = jnp.where(
-            truncate_mask,
-            jnp.full_like(responses, tokenizer.pad_token_id),
-            responses,
-        )
-        # postprocessed_responses: [num_device, local_batch_size, response_length]
-        del truncate_token_mask, truncate_after_or_token_mask, truncate_mask
 
-        # 2. run reward model on the truncated responses
-        postprocessed_query_responses = np.concatenate((queries, postprocessed_responses), axis=-1)
-        # postprocessed_query_responses: [num_device, local_batch_size, query_length + response_length]
-        postprocessed_query_responses = einops.rearrange(
-            right_padding_to_left_padding(
-                einops.rearrange(postprocessed_query_responses, "d b l -> (d b) l"), tokenizer.pad_token_id
-            ),
-            "(d b) l -> d b l",
-            d=len(args.learner_devices),
-        )
-        scores = p_reward_forward(query_responses_ids=postprocessed_query_responses).squeeze(-1)
-        # scores: [num_device, local_batch_size]
-
-        # 3. filter response. Ensure that the sample contains truncate_token
-        # responses not passing that filter will receive a low (fixed) score
-        # only query humans on responses that pass that filter
-        matches_token = postprocessed_responses[..., args.task.truncate_after :] == args.task.truncate_token
-        # matches_token: [num_device, local_batch_size, response_length - args.task.truncate_after]
-
-        filter_mask = jnp.any(matches_token, axis=-1)
-        # filter_mask: [num_device, local_batch_size]
-
-        scores = jnp.where(
-            filter_mask,
-            scores,
-            jnp.full_like(scores, args.task.penalty_reward_value),
-        )
-        # scores: [num_device, local_batch_size]
-        del matches_token, filter_mask
-
-        # 4. compute rewards
-        kl = logprobs - ref_logprobs
-        # kl: [num_device, local_batch_size, response_length]
-        non_score_reward = -kl_ctl.value * kl
-        rewards = non_score_reward
-        rewards = rewards.at[..., -1].add(scores)
-        # rewards: [num_device, local_batch_size, response_length]
-
-        # 5. whiten rewards
-        if args.ppo.whiten_rewards:
-            rewards = p_whiten_no_shift_mean(rewards)
-        try:
-            sample_kl = kl[0][0].sum().item()
-            console.print(
-                f"[green][bold]{'Query'}:[/]\n"
-                + f"[green]{ tokenizer.decode(queries[0][0], skip_special_tokens=True)}[/]\n\n"
-                + f"[blue][bold]{'Raw response'}:[/]\n"
-                + f"[blue]{tokenizer.decode(responses[0][0], skip_special_tokens=True)}[/]\n\n"
-                + f"[yellow][bold]{'Processed response'}:[/]\n"
-                + f"[yellow]{tokenizer.decode(postprocessed_responses[0][0], skip_special_tokens=True)}[/]\n\n"
-                + f"[red]score: {scores[0][0]}, kl: {kl[0][0].sum().item()}, total reward: {scores[0][0] - kl_ctl.value * sample_kl} [/]"
-            )
-        except Exception as e:
-            print(e)
-        del postprocessed_query_responses
-
-        # 6. compute advantages and returns
-        lastgaelam = 0
-        advantages_reversed = []
-        gen_length = args.task.response_length
-
-        for t in reversed(range(gen_length)):
-            nextvalues = values[..., t + 1] if t < gen_length - 1 else 0.0
-            delta = rewards[..., t] + args.ppo.gamma * nextvalues - values[..., t]
-            lastgaelam = delta + args.ppo.gamma * args.ppo.lam * lastgaelam
-            advantages_reversed.append(lastgaelam)
-            # advantages_reversed is a list of 2D arrays
-            # Each array has the shape [num_devices, local_batch_size]
-
-        advantages = jnp.stack(advantages_reversed[::-1], axis=-1)
-        # advantages: [num_device, local_batch_size, response_length]
-        returns = advantages + values
-        # returns: [num_device, local_batch_size, response_length]
-        advantages = p_whiten_shift_mean(advantages)
-
-        return_mean, return_var = returns.mean(), returns.var()
-        value_mean, value_var = values.mean(), values.var()
 
         # Do multiple epochs of PPO training, with a fresh random shuffle in each epoch
         for ppo_epoch_idx in range(args.ppo.noptepochs):
@@ -844,14 +867,12 @@ def train(args: Args):
                     mb_returns = returns[:, micro_batch_inds, :]
                     mb_advantage = advantages[:, micro_batch_inds, :]
                     mb_values = values[:, micro_batch_inds, :]
-                    mb_responses = responses[:, micro_batch_inds, :]
                     mb_query_responses = query_responses[:, micro_batch_inds, :]
                     mb_logprobs = logprobs[:, micro_batch_inds, :]
                     mb_stats = RolloutStatistics(
                         returns=mb_returns,
-                        values=mb_values,
                         advantage=mb_advantage,
-                        responses=mb_responses,
+                        values=mb_values,
                         query_responses=mb_query_responses,
                         logprobs=mb_logprobs,
                     )
@@ -861,11 +882,14 @@ def train(args: Args):
                     rl_stats = common_utils.get_metrics([rl_stats])
 
                     approxkls_stats[ppo_epoch_idx, minibatch_idx, gradient_accumulation_idx] = rl_stats.approxkl
-                    pg_clipfracs_stats[ppo_epoch_idx, minibatch_idx, gradient_accumulation_idx] = rl_stats.pg_clipfrac
-                    pg_losses_stats[ppo_epoch_idx, minibatch_idx, gradient_accumulation_idx] = rl_stats.pg_loss
-                    vf_losses_stats[ppo_epoch_idx, minibatch_idx, gradient_accumulation_idx] = rl_stats.vf_loss
-                    vf_clipfrac_stats[ppo_epoch_idx, minibatch_idx, gradient_accumulation_idx] = rl_stats.vf_clipfrac
                     entropies_stats[ppo_epoch_idx, minibatch_idx, gradient_accumulation_idx] = rl_stats.entropy
+                    ratios_stats[ppo_epoch_idx, minibatch_idx, gradient_accumulation_idx] = rl_stats.ratio
+                    vf_losses1_stats[ppo_epoch_idx, minibatch_idx, gradient_accumulation_idx] = rl_stats.vf_loss1
+                    vf_losses_stats[ppo_epoch_idx, minibatch_idx, gradient_accumulation_idx] = rl_stats.vf_loss
+                    vf_clipfracs_stats[ppo_epoch_idx, minibatch_idx, gradient_accumulation_idx] = rl_stats.vf_clipfrac
+                    pg_losses_stats[ppo_epoch_idx, minibatch_idx, gradient_accumulation_idx] = rl_stats.pg_loss
+                    pg_clipfracs_stats[ppo_epoch_idx, minibatch_idx, gradient_accumulation_idx] = rl_stats.pg_clipfrac
+                    losses_stats[ppo_epoch_idx, minibatch_idx, gradient_accumulation_idx] = rl_stats.loss
 
                     gradient_accumulation_idx += 1
                 minibatch_idx += 1
@@ -883,7 +907,23 @@ def train(args: Args):
                         rl_stats.ratio.item(),
                     )
 
+        try:
+            sample_kl = kl[0][0].sum().item()
+            sample_score = scores[0][0].item()
+            sample_query_response = query_responses[0][0]
+            console.print(
+                f"[green][bold]{'Query'}:[/]\n"
+                + f"[green]{ tokenizer.decode(sample_query_response[:args.task.query_length], skip_special_tokens=True)}[/]\n\n"
+                + f"[yellow][bold]{'Response'}:[/]\n"
+                + f"[yellow]{tokenizer.decode(sample_query_response[args.task.query_length:], skip_special_tokens=True)}[/]\n\n"
+                + f"[red]score: {sample_score}, kl: {sample_kl}, total reward: {sample_score - kl_ctl.value * sample_kl} [/]"
+            )
+        except Exception as e:
+            print(e)
+
         # Rollout metrics
+        non_score_reward = -kl_ctl.value * kl
+
         mean_kl = kl.sum(-1).mean()
         mean_entropy = (-logprobs).sum(-1).mean()
         mean_non_score_reward = non_score_reward.sum(-1).mean()
@@ -893,19 +933,21 @@ def train(args: Args):
         writer.add_scalar("objective/non_score_reward", mean_non_score_reward.item(), update)
         writer.add_scalar("objective/score_total", mean_non_score_reward.item() + scores.mean().item(), update)
         writer.add_scalar("objective/scores", scores.mean().item(), update)
-        writer.add_scalar("ppo/returns/mean", return_mean.item(), update)
-        writer.add_scalar("ppo/returns/var", return_var.item(), update)
-        writer.add_scalar("ppo/val/mean", value_mean.item(), update)
-        writer.add_scalar("ppo/val/var", value_var.item(), update)
+        writer.add_scalar("ppo/returns/mean", returns.mean().item(), update)
+        writer.add_scalar("ppo/returns/var", returns.var().item(), update)
+        writer.add_scalar("ppo/val/mean", values.mean().item(), update)
+        writer.add_scalar("ppo/val/var", values.var().item(), update)
         writer.add_scalar("ppo/val/advantage", advantages.mean().item(), update)
-        writer.add_scalar("ppo/val/num_eos_tokens", (responses == tokenizer.eos_token_id).sum().item(), update)
+        writer.add_scalar(
+            "ppo/val/num_eos_tokens",
+            (query_responses[:, :, args.task.query_length :] == tokenizer.eos_token_id).sum().item(),
+            update)
 
         # RL metrics aggregated at the batch level
-        writer.add_scalar("ppo/policy/approxkl_avg", approxkls_stats.mean().item(), update)
         writer.add_scalar(
-            "ppo/val/clipfrac_avg",
-            pg_clipfracs_stats.mean().item(),
-            update,
+            "ppo/policy/approxkl_avg",
+            approxkls_stats.mean().item(),
+            update
         )
         writer.add_scalar(
             "ppo/policy/entropy_avg",
@@ -918,35 +960,18 @@ def train(args: Args):
             update,
         )
         writer.add_scalar(
+            "ppo/policy/clipfrac_avg",
+            pg_clipfracs_stats.mean().item(),
+            update,
+        )
+        writer.add_scalar(
             "ppo/loss/value_avg",
             vf_losses_stats.mean().item(),
             update,
         )
-
-        # RL metrics directly from the microbatch level.
-        # TODO: Convert them to batch-level aggregations for consistency?
-        # (some metrics are repetitive with the batch level ones)
-        writer.add_scalar("ppo/loss/policy", rl_stats.pg_loss.item(), update)
-        writer.add_scalar("ppo/loss/value", rl_stats.vf_loss.item(), update)
-        writer.add_scalar("ppo/loss/total", rl_stats.loss.item(), update)
         writer.add_scalar(
-            "ppo/policy/clipfrac",
-            rl_stats.pg_clipfrac.item(),
-            update,
-        )
-        writer.add_scalar(
-            "ppo/policy/approxkl",
-            rl_stats.approxkl.item(),
-            update,
-        )
-        writer.add_scalar(
-            "ppo/policy/entropy",
-            rl_stats.entropy.item(),
-            update,
-        )
-        writer.add_scalar(
-            "ppo/val/error",
-            rl_stats.vf_losses1.item(),
+            "ppo/val/clipfrac_avg",
+            vf_clipfracs_stats.mean().item(),
             update,
         )
 
