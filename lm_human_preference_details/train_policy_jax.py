@@ -6,6 +6,7 @@ from types import SimpleNamespace
 from typing import List, Optional
 
 # import einops
+from clu import metrics
 import flax
 import flax.linen as nn
 import jax
@@ -473,19 +474,19 @@ class RolloutStatistics:
     logprobs: jnp.array
 
 @flax.struct.dataclass
-class RLStatistics:
-    approxkl: jnp.array
-    entropy: jnp.array
-    pg_loss: jnp.array
-    pg_clipfrac: jnp.array
-    vf_loss1: jnp.array
-    vf_loss: jnp.array
-    vf_clipfrac: jnp.array
-    ratio: jnp.array
-    loss: jnp.array
+class RLStatistics(metrics.Collection):
+    approxkl : metrics.Average.from_output('approxkl')
+    entropy: metrics.Average.from_output('entropy')
+    pg_loss: metrics.Average.from_output('pg_loss')
+    pg_clipfrac: metrics.Average.from_output('pg_clipfrac')
+    vf_loss1: metrics.Average.from_output('vf_loss1')
+    vf_loss: metrics.Average.from_output('vf_loss')
+    vf_clipfrac: metrics.Average.from_output('vf_clipfrac')
+    ratio: metrics.Average.from_output('ratio')
+    loss: metrics.Average.from_output('loss')
 
 
-def train_step(policy_state, mb_stats, args):
+def train_step(policy_state, mb_stats, rl_stats, args):
     def loss(params):
         # mb_stats.query_responses: [local_micro_batch_size, query_length + response_length]
         output, vpred_temp = policy_state.apply_fn(params, mb_stats.query_responses)
@@ -521,7 +522,7 @@ def train_step(policy_state, mb_stats, args):
         approxkl = 0.5 * ((logprobs_diff) ** 2).mean()
         loss = pg_loss + args.ppo.vf_coef * vf_loss
 
-        rl_stats = RLStatistics(
+        current_rl_stats = dict(
             approxkl=approxkl,
             entropy=entropy.mean(),
             ratio=ratio.mean(),
@@ -532,13 +533,18 @@ def train_step(policy_state, mb_stats, args):
             vf_clipfrac=vf_clipfrac,
             loss=loss,
         )
-        rl_stats = jax.lax.pmean(rl_stats, "batch")
-        return loss, rl_stats
+        # rl_stats = jax.lax.pmean(rl_stats, "batch")
+        return loss, current_rl_stats
 
     grad_fn = jax.value_and_grad(loss, has_aux=True)
-    (loss, rl_stats), grads = grad_fn(policy_state.params)
+    (loss, current_rl_stats), grads = grad_fn(policy_state.params)
     grads = jax.lax.pmean(grads, "batch")
     policy_state = policy_state.apply_gradients(grads=grads)
+
+    rl_stats = rl_stats.merge(
+        RLStatistics.gather_from_model_output(**current_rl_stats)
+    )
+
     return policy_state, rl_stats
 
 
@@ -643,17 +649,17 @@ def train(args: Args):
 
 
     @jax.pmap
-    def p_rollout(policy_state_params, input_ids):
+    def p_rollout(policy_state, input_ids):
         queries = right_padding_to_left_padding(input_ids, tokenizer.pad_token_id)
 
         query_responses = policy_generate(
-            params=policy_state_params.lm_backbone_params,
+            params=policy_state.params.lm_backbone_params,
             queries=queries,
         )
         # query_responses: [local_batch_size, query_length + response_length]
         responses = query_responses[:, args.task.query_length :]
 
-        output, full_values = policy_forward(policy_state_params, query_responses)
+        output, full_values = policy_forward(policy_state.params, query_responses)
         values = full_values[:, args.task.query_length - 1 : -1].squeeze(-1)
         # values: [local_batch_size, response_length]
         logits = output.logits[:, args.task.query_length - 1 : -1, :]
@@ -720,16 +726,6 @@ def train(args: Args):
             rewards = whiten(rewards, shift_mean=False)
 
         # 6. compute advantages and returns
-        # lastgaelam = 0
-        # advantages_reversed = []
-        # gen_length = args.task.response_length
-        # for t in reversed(range(gen_length)):
-        #     nextvalues = values[:, t + 1] if t < gen_length - 1 else 0.0
-        #     delta = rewards[:, t] + args.ppo.gamma * nextvalues - values[:, t]
-        #     lastgaelam = delta + args.ppo.gamma * args.ppo.lam * lastgaelam
-        #     advantages_reversed.append(lastgaelam)
-        # advantages_forloop = jnp.stack(advantages_reversed[::-1], axis=1)
-
         def compute_gae_once(carry, inp):
             advantages = carry
             nextdone, nextvalues, curvalues, reward = inp
@@ -745,23 +741,15 @@ def train(args: Args):
         dones = jnp.zeros_like(rewards)
         dones = dones.at[:, -1].set(1.0)
 
-        advantages_scan = jnp.zeros((args.ppo.local_batch_size,))
-        _, advantages_scan = jax.lax.scan(
+        advantages = jnp.zeros((args.ppo.local_batch_size,))
+        _, advantages = jax.lax.scan(
             compute_gae_once,
-            advantages_scan,
+            advantages,
             (dones.T, extended_values[:, 1:].T, extended_values[:, :-1].T, rewards.T),
             reverse=True
         )
 
-        advantages_scan = advantages_scan.T
-        # print(f'advantages_scan.shape, {advantages_scan.shape}')
-        # jax.debug.print("advantages_scan: {x}", x=advantages_scan)
-        # print(f'advantages_forloop.shape, {advantages_forloop.shape}')
-        # jax.debug.print("advantages_forloop: {x}", x=advantages_forloop)
-        # jax.debug.print("diff: {x}", x=advantages_scan - advantages_forloop)
-        # jax.debug.print("diff norm: {x}", x= jnp.sum( (advantages_scan - advantages_forloop) ** 2) )
-
-        advantages = advantages_scan
+        advantages = advantages.T
         returns = advantages + values
         advantages = whiten(advantages)
 
@@ -776,70 +764,6 @@ def train(args: Args):
 
     print("===training policy===")
     global_step = 0
-    approxkls_stats = np.zeros(
-        (
-            args.ppo.noptepochs,
-            args.ppo.nminibatches,
-            args.ppo.gradient_accumulation_steps,
-        ),
-    )
-    entropies_stats = np.zeros(
-        (
-            args.ppo.noptepochs,
-            args.ppo.nminibatches,
-            args.ppo.gradient_accumulation_steps,
-        ),
-    )
-    ratios_stats = np.zeros(
-        (
-            args.ppo.noptepochs,
-            args.ppo.nminibatches,
-            args.ppo.gradient_accumulation_steps,
-        ),
-    )
-    pg_losses_stats = np.zeros(
-        (
-            args.ppo.noptepochs,
-            args.ppo.nminibatches,
-            args.ppo.gradient_accumulation_steps,
-        ),
-    )
-    pg_clipfracs_stats = np.zeros(
-        (
-            args.ppo.noptepochs,
-            args.ppo.nminibatches,
-            args.ppo.gradient_accumulation_steps,
-        ),
-    )
-    vf_losses_stats = np.zeros(
-        (
-            args.ppo.noptepochs,
-            args.ppo.nminibatches,
-            args.ppo.gradient_accumulation_steps,
-        ),
-    )
-    vf_losses1_stats = np.zeros(
-        (
-            args.ppo.noptepochs,
-            args.ppo.nminibatches,
-            args.ppo.gradient_accumulation_steps,
-        ),
-    )
-    vf_clipfracs_stats = np.zeros(
-        (
-            args.ppo.noptepochs,
-            args.ppo.nminibatches,
-            args.ppo.gradient_accumulation_steps,
-        ),
-    )
-    losses_stats = np.zeros(
-        (
-            args.ppo.noptepochs,
-            args.ppo.nminibatches,
-            args.ppo.gradient_accumulation_steps,
-        ),
-    )
-
 
     for update in range(1, args.ppo.num_updates + 1):
         global_step += 1 * args.ppo.batch_size
@@ -849,9 +773,9 @@ def train(args: Args):
         # queries: [num_device, local_batch_size, query_length]
 
         returns, advantages, values, query_responses, logprobs, kl, scores = p_rollout(
-            policy_state_params=policy_state.params, input_ids=input_ids
+            policy_state=policy_state, input_ids=input_ids
         )
-
+        rl_stats = jax_utils.replicate(RLStatistics.empty())
 
         # Do multiple epochs of PPO training, with a fresh random shuffle in each epoch
         for ppo_epoch_idx in range(args.ppo.noptepochs):
@@ -877,34 +801,22 @@ def train(args: Args):
                         logprobs=mb_logprobs,
                     )
 
-                    # before training step
-                    policy_state, rl_stats = p_train_step(policy_state, mb_stats)
-                    rl_stats = common_utils.get_metrics([rl_stats])
-
-                    approxkls_stats[ppo_epoch_idx, minibatch_idx, gradient_accumulation_idx] = rl_stats.approxkl
-                    entropies_stats[ppo_epoch_idx, minibatch_idx, gradient_accumulation_idx] = rl_stats.entropy
-                    ratios_stats[ppo_epoch_idx, minibatch_idx, gradient_accumulation_idx] = rl_stats.ratio
-                    vf_losses1_stats[ppo_epoch_idx, minibatch_idx, gradient_accumulation_idx] = rl_stats.vf_loss1
-                    vf_losses_stats[ppo_epoch_idx, minibatch_idx, gradient_accumulation_idx] = rl_stats.vf_loss
-                    vf_clipfracs_stats[ppo_epoch_idx, minibatch_idx, gradient_accumulation_idx] = rl_stats.vf_clipfrac
-                    pg_losses_stats[ppo_epoch_idx, minibatch_idx, gradient_accumulation_idx] = rl_stats.pg_loss
-                    pg_clipfracs_stats[ppo_epoch_idx, minibatch_idx, gradient_accumulation_idx] = rl_stats.pg_clipfrac
-                    losses_stats[ppo_epoch_idx, minibatch_idx, gradient_accumulation_idx] = rl_stats.loss
-
+                    policy_state, rl_stats = p_train_step(policy_state, mb_stats, rl_stats)
                     gradient_accumulation_idx += 1
                 minibatch_idx += 1
                 if args.local_rank == 0:
+                    unreplicated_rl_stats = rl_stats.unreplicate().compute()
                     console.print(
                         f"ppo_epoch_idx",
                         ppo_epoch_idx,
                         "approxkl",
-                        rl_stats.approxkl.item(),
+                        unreplicated_rl_stats['approxkl'].item(),
                         "pg_loss",
-                        rl_stats.pg_loss.item(),
+                        unreplicated_rl_stats['pg_loss'].item(),
                         "pg_clipfrac",
-                        rl_stats.pg_clipfrac.item(),
+                        unreplicated_rl_stats['pg_clipfrac'].item(),
                         "ratio",
-                        rl_stats.ratio.item(),
+                        unreplicated_rl_stats['ratio'].item(),
                     )
 
         try:
@@ -922,6 +834,7 @@ def train(args: Args):
             print(e)
 
         # Rollout metrics
+        rl_stats = rl_stats.unreplicate().compute()
         non_score_reward = -kl_ctl.value * kl
 
         mean_kl = kl.sum(-1).mean()
@@ -946,33 +859,48 @@ def train(args: Args):
         # RL metrics aggregated at the batch level
         writer.add_scalar(
             "ppo/policy/approxkl_avg",
-            approxkls_stats.mean().item(),
+            rl_stats['approxkl'].item(),
             update
         )
         writer.add_scalar(
             "ppo/policy/entropy_avg",
-            entropies_stats.mean().item(),
+            rl_stats['entropy'].item(),
             update,
         )
         writer.add_scalar(
             "ppo/loss/policy_avg",
-            pg_losses_stats.mean().item(),
+            rl_stats['pg_loss'].item(),
             update,
         )
         writer.add_scalar(
             "ppo/policy/clipfrac_avg",
-            pg_clipfracs_stats.mean().item(),
+            rl_stats['pg_clipfrac'].item(),
+            update,
+        )
+        writer.add_scalar(
+            "ppo/val/error",
+            rl_stats['vf_loss1'].item(),
             update,
         )
         writer.add_scalar(
             "ppo/loss/value_avg",
-            vf_losses_stats.mean().item(),
+            rl_stats['vf_loss'].item(),
             update,
         )
         writer.add_scalar(
             "ppo/val/clipfrac_avg",
-            vf_clipfracs_stats.mean().item(),
+            rl_stats['vf_clipfrac'].item(),
             update,
+        )
+        writer.add_scalar(
+            "ppo/val/ratio_avg",
+            rl_stats['ratio'].item(),
+            update,
+        )
+        writer.add_scalar(
+            "ppo/loss/total",
+            rl_stats['loss'].item(),
+            update
         )
 
         # Logging learning rate and learning progress
