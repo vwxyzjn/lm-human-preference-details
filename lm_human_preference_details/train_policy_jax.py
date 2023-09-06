@@ -681,7 +681,7 @@ def train(args: Args):
         args.rewards.kl_coef, hparams=args.rewards.adaptive_kl
     )
 
-    def train_update(policy_state, input_ids, rl_stats):
+    def train_update(policy_state, input_ids, rl_stats, kl_ctl_value):
         queries = right_padding_to_left_padding(input_ids, tokenizer.pad_token_id)
 
         query_responses = policy_generate(
@@ -764,7 +764,8 @@ def train(args: Args):
 
         # 4. compute rewards
         kl = logprobs - ref_logprobs
-        non_score_reward = -kl_ctl.value * kl
+        # non_score_reward = -kl_ctl.value * kl
+        non_score_reward = -kl_ctl_value * kl
         rewards = non_score_reward
         rewards = rewards.at[:, -1].add(scores)
 
@@ -906,7 +907,10 @@ def train(args: Args):
             scores,
             rl_stats,
         ) = p_train_update(
-            policy_state=policy_state, input_ids=input_ids, rl_stats=rl_stats
+            policy_state=policy_state,
+            input_ids=input_ids,
+            rl_stats=rl_stats,
+            kl_ctl_value=jax_utils.replicate(kl_ctl.value),
         )
 
         try:
