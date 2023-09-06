@@ -12,6 +12,7 @@ import torch.nn.functional as F
 import torch.optim as optim
 import tyro
 from accelerate import Accelerator
+from accelerate.state import AcceleratorState
 from rich.console import Console
 from rich.pretty import pprint
 from torch.utils.data import DataLoader, IterableDataset
@@ -104,6 +105,8 @@ class Args:
 
     base_model: str = "gpt2"
     """the name of the pretrained model to use"""
+    deepspeed: bool = False
+    """Whether to use deepspeed to train the model"""
     print_sample_output_freq: int = 0
     """How often to print sample output"""
     save_path: str = "models/policy.pt"
@@ -480,16 +483,17 @@ def train(args: Args):
     tokenizer = AutoTokenizer.from_pretrained(
         args.base_model,
         padding_side="right",
+        trust_remote_code=True,
     )
     # we use the padding token manually but do not resize the token embedding of the model
     tokenizer.add_special_tokens({"pad_token": "[PAD]"})
-    reward_model = AutoModelForCausalLMWithRewardHead(AutoModelForCausalLM.from_pretrained(args.base_model)).to(device)
+    reward_model = AutoModelForCausalLMWithRewardHead(AutoModelForCausalLM.from_pretrained(args.base_model, trust_remote_code=True))
     if args.rewards.trained_model:
         reward_model.load_state_dict(torch.load(args.rewards.trained_model, map_location=device))
         print(f"loaded pretrained reward model from {args.rewards.trained_model}")
     # each class should have a separate pretrained model that do not share weights
-    ref_policy = AutoModelForCausalLMWithScalarHead(AutoModelForCausalLM.from_pretrained(args.base_model)).to(device)
-    policy = AutoModelForCausalLMWithScalarHead(AutoModelForCausalLM.from_pretrained(args.base_model)).to(device)
+    ref_policy = AutoModelForCausalLMWithScalarHead(AutoModelForCausalLM.from_pretrained(args.base_model, trust_remote_code=True))
+    policy = AutoModelForCausalLMWithScalarHead(AutoModelForCausalLM.from_pretrained(args.base_model, trust_remote_code=True))
     policy.lm_backbone.generation_config.eos_token_id = (
         None  # disable `pad_token_id` and `eos_token_id` because we just want to
     )
@@ -510,6 +514,37 @@ def train(args: Args):
     )
     dataloader = DataLoader(dataset, batch_size=args.ppo.local_batch_size)
     policy, optimizer, dataloader = accelerator.prepare(policy, optimizer, dataloader)
+    if args.deepspeed:
+        import deepspeed
+
+        deepspeed_states = AcceleratorState().deepspeed_plugin
+        deepspeed_states.deepspeed_config['train_micro_batch_size_per_gpu'] = args.ppo.local_micro_batch_size
+        deepspeed_states.deepspeed_config['checkpoint'] = {'use_node_local_storage': True}
+        off_load_device = "cpu"
+        stage = 3
+        eval_ds_config = {
+            "train_micro_batch_size_per_gpu": deepspeed_states.deepspeed_config['train_micro_batch_size_per_gpu'],
+            "steps_per_print": 10,
+            # "zero_optimization": {
+            #     "stage": stage,
+            #     "stage3_param_persistence_threshold": 1e4,
+            #     "offload_param": {
+            #         "device": off_load_device
+            #     }
+            # },
+            "bf16": {
+                "enabled": True
+            },
+            "prescale_gradients": False,
+            "wall_clock_breakdown": False
+        }
+        reward_model, *_ = deepspeed.initialize(model=reward_model, config=eval_ds_config)
+        reward_model.eval()
+        ref_policy, *_ = deepspeed.initialize(model=ref_policy, config=eval_ds_config)
+        ref_policy.eval()
+    else:
+        ref_policy = ref_policy.to(device)
+        reward_model = reward_model.to(device)
     iter_dataloader = iter(dataloader)
     kl_ctl = AdaptiveKLController(args.rewards.kl_coef, hparams=args.rewards.adaptive_kl)
     # WARNING: even with `max_new_tokens` and `min_new_tokens` set to the same value, the number of tokens generated
@@ -755,7 +790,8 @@ def train(args: Args):
                     )
 
         with torch.no_grad():
-            writer.add_histogram("ppo/val/ratio_hist", ratio, update)
+            if not args.deepspeed: # for some reason there is a OOM with the `writer.add_histogram`
+                writer.add_histogram("ppo/val/ratio_hist", ratio, update)
             kl = logprobs - ref_logprobs
             mean_kl = kl.sum(1).mean()
             mean_entropy = (-logprobs).sum(1).mean()
@@ -873,6 +909,7 @@ def train(args: Args):
             writer.add_scalar("ppo/lr", lrnow, update)
             writer.add_scalar("ppo/episode", global_step, update)
             kl_ctl.update(mean_kl.item(), args.ppo.batch_size)
+            del kl, mean_kl, mean_entropy, mean_non_score_reward, scores
 
     # save model
     if args.save_path:
