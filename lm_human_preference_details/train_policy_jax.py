@@ -5,7 +5,6 @@ from dataclasses import asdict, dataclass, field
 from types import SimpleNamespace
 from typing import List, Optional
 
-# import einops
 from clu import metrics
 import flax
 import flax.linen as nn
@@ -302,13 +301,10 @@ class MyDataset(IterableDataset):
             yield output
 
 
-# def right_padding_to_left_padding(tokens, pad_id):
-#     # Convert from right padding to left padding.
-#     return np.array([[pad_id] * (row == pad_id).sum() + [x for x in row if x != pad_id] for row in tokens])
 def right_padding_to_left_padding(tokens, pad_id):
     def pad_row(row):
       mask = 1 - (row == pad_id) # 1 if not pad_id, 0 if pad_id
-      return row[jnp.argsort(mask)] # use the fact that jnp.argsort is stable by default
+      return row[jnp.argsort(mask)] # uses the fact that jnp.argsort is stable by default
     return jax.vmap(pad_row)(tokens)
 
 
@@ -533,7 +529,6 @@ def train_step(policy_state, mb_stats, rl_stats, args):
             vf_clipfrac=vf_clipfrac,
             loss=loss,
         )
-        # rl_stats = jax.lax.pmean(rl_stats, "batch")
         return loss, current_rl_stats
 
     grad_fn = jax.value_and_grad(loss, has_aux=True)
@@ -648,8 +643,7 @@ def train(args: Args):
     kl_ctl = AdaptiveKLController(args.rewards.kl_coef, hparams=args.rewards.adaptive_kl)
 
 
-    @jax.pmap
-    def p_rollout(policy_state, input_ids):
+    def train_update(policy_state, input_ids, rl_stats):
         queries = right_padding_to_left_padding(input_ids, tokenizer.pad_token_id)
 
         query_responses = policy_generate(
@@ -753,14 +747,37 @@ def train(args: Args):
         returns = advantages + values
         advantages = whiten(advantages)
 
-        return returns, advantages, values, query_responses, logprobs, kl, scores
+        # Do multiple epochs of PPO training, with a fresh random shuffle in each epoch
+        # TODO: use jax.lax.scan
+        for ppo_epoch_idx in range(args.ppo.noptepochs):
+            b_inds = np.random.permutation(args.ppo.local_batch_size)
+            for mini_batch_start in range(0, args.ppo.local_batch_size, args.ppo.local_mini_batch_size):
+                mini_batch_end = mini_batch_start + args.ppo.local_mini_batch_size
+                mini_batch_inds = b_inds[mini_batch_start:mini_batch_end]
+                for micro_batch_start in range(0, args.ppo.local_mini_batch_size, args.ppo.local_micro_batch_size):
+                    micro_batch_end = micro_batch_start + args.ppo.local_micro_batch_size
+                    micro_batch_inds = mini_batch_inds[micro_batch_start:micro_batch_end]
+                    mb_returns = returns[micro_batch_inds, :]
+                    mb_advantage = advantages[micro_batch_inds, :]
+                    mb_values = values[micro_batch_inds, :]
+                    mb_query_responses = query_responses[micro_batch_inds, :]
+                    mb_logprobs = logprobs[micro_batch_inds, :]
+                    mb_stats = RolloutStatistics(
+                        returns=mb_returns,
+                        advantage=mb_advantage,
+                        values=mb_values,
+                        query_responses=mb_query_responses,
+                        logprobs=mb_logprobs,
+                    )
+                    policy_state, rl_stats = train_step(policy_state, mb_stats, rl_stats, args)
 
-    p_train_step = jax.pmap(
-        functools.partial(train_step, args=args),
+        return policy_state, returns, advantages, values, query_responses, logprobs, kl, scores, rl_stats
+
+    p_train_update = jax.pmap(
+        train_update,
         axis_name="batch",
         donate_argnums=(0,),
     )
-
 
     print("===training policy===")
     global_step = 0
@@ -772,52 +789,54 @@ def train(args: Args):
         input_ids = common_utils.shard(data["input_ids"].numpy())
         # queries: [num_device, local_batch_size, query_length]
 
-        returns, advantages, values, query_responses, logprobs, kl, scores = p_rollout(
-            policy_state=policy_state, input_ids=input_ids
-        )
         rl_stats = jax_utils.replicate(RLStatistics.empty())
+        policy_state, returns, advantages, values, query_responses, logprobs, kl, scores, rl_stats = p_train_update(
+            policy_state=policy_state, input_ids=input_ids, rl_stats=rl_stats
+        )
 
-        # Do multiple epochs of PPO training, with a fresh random shuffle in each epoch
-        for ppo_epoch_idx in range(args.ppo.noptepochs):
-            b_inds = np.random.permutation(args.ppo.local_batch_size)
-            minibatch_idx = 0
-            for mini_batch_start in range(0, args.ppo.local_batch_size, args.ppo.local_mini_batch_size):
-                mini_batch_end = mini_batch_start + args.ppo.local_mini_batch_size
-                mini_batch_inds = b_inds[mini_batch_start:mini_batch_end]
-                gradient_accumulation_idx = 0
-                for micro_batch_start in range(0, args.ppo.local_mini_batch_size, args.ppo.local_micro_batch_size):
-                    micro_batch_end = micro_batch_start + args.ppo.local_micro_batch_size
-                    micro_batch_inds = mini_batch_inds[micro_batch_start:micro_batch_end]
-                    mb_returns = returns[:, micro_batch_inds, :]
-                    mb_advantage = advantages[:, micro_batch_inds, :]
-                    mb_values = values[:, micro_batch_inds, :]
-                    mb_query_responses = query_responses[:, micro_batch_inds, :]
-                    mb_logprobs = logprobs[:, micro_batch_inds, :]
-                    mb_stats = RolloutStatistics(
-                        returns=mb_returns,
-                        advantage=mb_advantage,
-                        values=mb_values,
-                        query_responses=mb_query_responses,
-                        logprobs=mb_logprobs,
-                    )
 
-                    policy_state, rl_stats = p_train_step(policy_state, mb_stats, rl_stats)
-                    gradient_accumulation_idx += 1
-                minibatch_idx += 1
-                if args.local_rank == 0:
-                    unreplicated_rl_stats = rl_stats.unreplicate().compute()
-                    console.print(
-                        f"ppo_epoch_idx",
-                        ppo_epoch_idx,
-                        "approxkl",
-                        unreplicated_rl_stats['approxkl'].item(),
-                        "pg_loss",
-                        unreplicated_rl_stats['pg_loss'].item(),
-                        "pg_clipfrac",
-                        unreplicated_rl_stats['pg_clipfrac'].item(),
-                        "ratio",
-                        unreplicated_rl_stats['ratio'].item(),
-                    )
+        # returns, advantages, values, query_responses, logprobs, kl, scores = p_rollout(
+        #     policy_state=policy_state, input_ids=input_ids
+        # )
+        # rl_stats = jax_utils.replicate(RLStatistics.empty())
+
+        # # Do multiple epochs of PPO training, with a fresh random shuffle in each epoch
+        # for ppo_epoch_idx in range(args.ppo.noptepochs):
+        #     b_inds = np.random.permutation(args.ppo.local_batch_size)
+        #     for mini_batch_start in range(0, args.ppo.local_batch_size, args.ppo.local_mini_batch_size):
+        #         mini_batch_end = mini_batch_start + args.ppo.local_mini_batch_size
+        #         mini_batch_inds = b_inds[mini_batch_start:mini_batch_end]
+        #         for micro_batch_start in range(0, args.ppo.local_mini_batch_size, args.ppo.local_micro_batch_size):
+        #             micro_batch_end = micro_batch_start + args.ppo.local_micro_batch_size
+        #             micro_batch_inds = mini_batch_inds[micro_batch_start:micro_batch_end]
+        #             mb_returns = returns[:, micro_batch_inds, :]
+        #             mb_advantage = advantages[:, micro_batch_inds, :]
+        #             mb_values = values[:, micro_batch_inds, :]
+        #             mb_query_responses = query_responses[:, micro_batch_inds, :]
+        #             mb_logprobs = logprobs[:, micro_batch_inds, :]
+        #             mb_stats = RolloutStatistics(
+        #                 returns=mb_returns,
+        #                 advantage=mb_advantage,
+        #                 values=mb_values,
+        #                 query_responses=mb_query_responses,
+        #                 logprobs=mb_logprobs,
+        #             )
+
+        #             policy_state, rl_stats = p_train_step(policy_state, mb_stats, rl_stats)
+                # if args.local_rank == 0:
+                #     unreplicated_rl_stats = rl_stats.unreplicate().compute()
+                #     console.print(
+                #         f"ppo_epoch_idx",
+                #         ppo_epoch_idx,
+                #         "approxkl",
+                #         unreplicated_rl_stats['approxkl'].item(),
+                #         "pg_loss",
+                #         unreplicated_rl_stats['pg_loss'].item(),
+                #         "pg_clipfrac",
+                #         unreplicated_rl_stats['pg_clipfrac'].item(),
+                #         "ratio",
+                #         unreplicated_rl_stats['ratio'].item(),
+                #     )
 
         try:
             sample_kl = kl[0][0].sum().item()
