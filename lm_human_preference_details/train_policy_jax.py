@@ -764,7 +764,6 @@ def train(args: Args):
 
         # 4. compute rewards
         kl = logprobs - ref_logprobs
-        # non_score_reward = -kl_ctl.value * kl
         non_score_reward = -kl_ctl_value * kl
         rewards = non_score_reward
         rewards = rewards.at[:, -1].add(scores)
