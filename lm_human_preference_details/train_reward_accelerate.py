@@ -448,7 +448,10 @@ def normalize(
 def train(args: Args):
     accelerator = Accelerator(
         kwargs_handlers=[
-            DistributedDataParallelKwargs(broadcast_buffers=False)
+            DistributedDataParallelKwargs(
+                broadcast_buffers=False,
+                find_unused_parameters=True,
+            )
         ],  # this is needed to avoid https://github.com/pytorch/pytorch/issues/22095#issuecomment-505099500
         gradient_accumulation_steps=args.gradient_accumulation_steps,
     )
