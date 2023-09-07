@@ -1,5 +1,6 @@
 import functools
 import os
+import copy
 import time
 from dataclasses import asdict, dataclass, field
 from types import SimpleNamespace
@@ -563,16 +564,14 @@ def train_step(
     return policy_state, rl_stats
 
 
-def linear_schedule(optimizer_step, args):
-    """anneal learning rate linearly to reach 0 after one epoch."""
-    update = 1 + optimizer_step // (
-        args.ppo.noptepochs
-        * args.ppo.nminibatches
-        * args.ppo.gradient_accumulation_steps
+def linear_schedule(count, args):
+    # anneal learning rate linearly
+    frac = (
+        1.0
+        - (count // (args.ppo.nminibatches * args.ppo.noptepochs))
+        / args.ppo.num_updates
     )
-    frac = 1.0 - (update - 1.0) / args.ppo.num_updates
-    lrnow = frac * args.ppo.lr
-    return lrnow
+    return args.ppo.lr * frac
 
 
 def train(args: Args):
@@ -646,21 +645,19 @@ def train(args: Args):
         policy_generate,
         policy_params,
     ) = prepare_policy_forward_and_policy_generate(args, tokenizer)
-    _, _, ref_policy_params = prepare_policy_forward_and_policy_generate(
-        args, tokenizer
-    )
+    ref_policy_params = copy.deepcopy(policy_params)
 
     if args.use_tensorflow_adam:
         adam = adam_tf_style
     else:
         adam = optax.adam
 
-    optimizer = adam(
-        learning_rate=functools.partial(linear_schedule, args=args),
-        eps=args.ppo.eps,
+    optimizer = optax.MultiSteps(
+        optax.inject_hyperparams(adam)(
+            learning_rate=functools.partial(linear_schedule, args=args),
+        ),
+        every_k_schedule=args.ppo.gradient_accumulation_steps,
     )
-
-    optimizer = optax.MultiSteps(optimizer, args.ppo.gradient_accumulation_steps)
 
     policy_state = TrainState.create(
         apply_fn=policy_forward, params=policy_params, tx=optimizer
@@ -868,17 +865,27 @@ def train(args: Args):
             length=args.ppo.noptepochs,
         )
 
-        return (
-            policy_state,
-            returns,
-            advantages,
-            values,
-            query_responses,
-            logprobs,
-            kl,
-            scores,
-            rl_stats,
+        rollout_stats = dict(
+            mean_kl=jax.lax.pmean(kl.sum(-1).mean(), "batch"),
+            mean_entropy=jax.lax.pmean((-logprobs).sum(-1).mean(), "batch"),
+            mean_non_score_reward=jax.lax.pmean(
+                non_score_reward.sum(-1).mean(), "batch"
+            ),
+            mean_scores=jax.lax.pmean(scores.mean(), "batch"),
+            mean_returns=jax.lax.pmean(returns.mean(), "batch"),
+            var_returns=jax.lax.pmean(returns.var(), "batch"),
+            mean_values=jax.lax.pmean(values.mean(), "batch"),
+            var_values=jax.lax.pmean(values.var(), "batch"),
+            mean_advantages=jax.lax.pmean(advantages.mean(), "batch"),
         )
+        rl_stats = jax.lax.pmean(rl_stats.compute(), "batch")
+
+        samples_to_print = dict(
+            query_response=query_responses[0],
+            kl=kl[0].sum(),
+            scores=scores[0].sum(),
+        )
+        return policy_state, rollout_stats, rl_stats, samples_to_print
 
     p_train_update = jax.pmap(
         train_update,
@@ -890,32 +897,22 @@ def train(args: Args):
     global_step = 0
 
     for update in range(1, args.ppo.num_updates + 1):
-        global_step += 1 * args.ppo.batch_size
+        global_step += args.ppo.batch_size
         data = next(iter_dataloader)
         input_ids = common_utils.shard(data["input_ids"].numpy())
 
         rl_stats = jax_utils.replicate(RLStatistics.empty())
-        (
-            policy_state,
-            returns,
-            advantages,
-            values,
-            query_responses,
-            logprobs,
-            kl,
-            scores,
-            rl_stats,
-        ) = p_train_update(
+        policy_state, rollout_stats, rl_stats, samples_to_print = p_train_update(
             policy_state=policy_state,
             input_ids=input_ids,
             rl_stats=rl_stats,
-            kl_ctl_value=jax_utils.replicate(kl_ctl.value),
+            kl_ctl_value=np.array([kl_ctl.value] * input_ids.shape[0]),
         )
 
         try:
-            sample_kl = kl[0][0].sum().item()
-            sample_score = scores[0][0].item()
-            sample_query_response = query_responses[0][0]
+            sample_kl = samples_to_print["kl"][0].item()
+            sample_score = samples_to_print["scores"][0].item()
+            sample_query_response = samples_to_print["query_response"][0]
             console.print(
                 f"[green][bold]{'Query'}:[/]\n"
                 + f"[green]{ tokenizer.decode(sample_query_response[:args.task.query_length], skip_special_tokens=True)}[/]\n\n"
@@ -927,36 +924,39 @@ def train(args: Args):
             print(e)
 
         # Rollout metrics
-        rl_stats = rl_stats.unreplicate().compute()
-        non_score_reward = -kl_ctl.value * kl
-
-        mean_kl = kl.sum(-1).mean()
-        mean_entropy = (-logprobs).sum(-1).mean()
-        mean_non_score_reward = non_score_reward.sum(-1).mean()
-        writer.add_scalar("objective/kl_coef", np.array(kl_ctl.value), update)
-        writer.add_scalar("objective/kl", mean_kl.item(), update)
-        writer.add_scalar("objective/entropy", mean_entropy.item(), update)
+        rollout_stats = common_utils.get_metrics([rollout_stats])
+        writer.add_scalar("objective/kl", rollout_stats["mean_kl"].item(), update)
         writer.add_scalar(
-            "objective/non_score_reward", mean_non_score_reward.item(), update
+            "objective/entropy", rollout_stats["mean_entropy"].item(), update
+        )
+        writer.add_scalar(
+            "objective/non_score_reward",
+            rollout_stats["mean_non_score_reward"].item(),
+            update,
         )
         writer.add_scalar(
             "objective/score_total",
-            mean_non_score_reward.item() + scores.mean().item(),
+            rollout_stats["mean_non_score_reward"].item()
+            + rollout_stats["mean_scores"].item(),
             update,
         )
-        writer.add_scalar("objective/scores", scores.mean().item(), update)
-        writer.add_scalar("ppo/returns/mean", returns.mean().item(), update)
-        writer.add_scalar("ppo/returns/var", returns.var().item(), update)
-        writer.add_scalar("ppo/val/mean", values.mean().item(), update)
-        writer.add_scalar("ppo/val/var", values.var().item(), update)
-        writer.add_scalar("ppo/val/advantage", advantages.mean().item(), update)
         writer.add_scalar(
-            "ppo/val/num_eos_tokens",
-            (query_responses[:, :, args.task.query_length :] == tokenizer.eos_token_id).sum().item(),
-            update,
+            "objective/scores", rollout_stats["mean_scores"].item(), update
+        )
+        writer.add_scalar(
+            "ppo/returns/mean", rollout_stats["mean_returns"].item(), update
+        )
+        writer.add_scalar("ppo/returns/var", rollout_stats["var_returns"].item(), update)
+
+        writer.add_scalar("ppo/val/mean", rollout_stats["mean_values"].item(), update)
+        writer.add_scalar("ppo/val/var", rollout_stats["var_values"].item(), update)
+
+        writer.add_scalar(
+            "ppo/val/advantage", rollout_stats["mean_advantages"].item(), update
         )
 
         # RL metrics aggregated at the batch level
+        rl_stats = common_utils.get_metrics([rl_stats])
         writer.add_scalar(
             "ppo/policy/approxkl_avg", rl_stats["approxkl"].item(), update
         )
@@ -998,11 +998,16 @@ def train(args: Args):
         writer.add_scalar("ppo/loss/total", rl_stats["loss"].item(), update)
 
         # Logging learning rate and learning progress
-        lrnow = linear_schedule(policy_state.step - 1, args)
-        lrnow = common_utils.get_metrics([lrnow])
-        writer.add_scalar("ppo/lr", lrnow.item(), update)
+        writer.add_scalar(
+            "ppo/lr",
+            policy_state.opt_state.inner_opt_state.hyperparams["learning_rate"][
+                0
+            ].item(),
+            update,
+        )
         writer.add_scalar("ppo/episode", global_step, update)
-        kl_ctl.update(mean_kl.item(), args.ppo.batch_size)
+        writer.add_scalar("objective/kl_coef", np.array(kl_ctl.value), update)
+        kl_ctl.update(rollout_stats["mean_kl"].item(), args.ppo.batch_size)
 
     policy_state = jax_utils.unreplicate(policy_state)
     # save model
