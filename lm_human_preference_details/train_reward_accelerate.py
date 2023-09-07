@@ -620,8 +620,9 @@ def train(args: Args):
             with torch.no_grad():
                 # eval on test_label, some duplicate code (I don't want to make the training loop into a function...)
                 test_accuracies = []
-                new_all_inds = np.arange(len(label))
-                for start in range(args.labels.num_train, len(label), args.batch_size):
+                len_labels = (len(label) // args.batch_size) * args.batch_size  # in case the last batch is not full
+                new_all_inds = np.arange(len_labels)
+                for start in range(args.labels.num_train, len_labels, args.batch_size):
                     end = start + args.batch_size
                     b_inds_all = new_all_inds[start:end]
                     b_inds = b_inds_all[accelerator.process_index :: accelerator.num_processes]  #  multi-GPU slicing
