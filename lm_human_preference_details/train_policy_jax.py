@@ -319,7 +319,6 @@ def numpy_collate(batch):
         transposed = zip(*batch)
         return [numpy_collate(samples) for samples in transposed]
     else:
-        print(type(batch[0]))
         return np.array(batch)
 
 
