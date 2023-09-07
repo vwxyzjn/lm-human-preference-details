@@ -306,10 +306,22 @@ class MyDataset(IterableDataset):
                 {"input_ids": tokens},
                 padding="max_length",
                 max_length=self.query_length,
-                return_tensors="pt",
-                return_attention_mask=True,
+                return_tensors="np",
+                return_attention_mask=False,
             )
-            yield output
+            yield output['input_ids']
+
+
+def numpy_collate(batch):
+    if isinstance(batch[0], np.ndarray):
+        return np.stack(batch)
+    elif isinstance(batch[0], (tuple,list)):
+        transposed = zip(*batch)
+        return [numpy_collate(samples) for samples in transposed]
+    else:
+        print(type(batch[0]))
+        return np.array(batch)
+
 
 
 def right_padding_to_left_padding(tokens, pad_id):
@@ -672,7 +684,7 @@ def train(args: Args):
         start_text=args.task.start_text,
         end_text=args.task.end_text,
     )
-    dataloader = DataLoader(dataset, batch_size=args.ppo.batch_size)
+    dataloader = DataLoader(dataset, batch_size=args.ppo.batch_size, collate_fn=numpy_collate,)
     iter_dataloader = iter(dataloader)
     kl_ctl = AdaptiveKLController(
         args.rewards.kl_coef, hparams=args.rewards.adaptive_kl
@@ -898,9 +910,8 @@ def train(args: Args):
 
     for update in range(1, args.ppo.num_updates + 1):
         global_step += args.ppo.batch_size
-        data = next(iter_dataloader)
-        input_ids = common_utils.shard(data["input_ids"].numpy())
-
+        input_ids = next(iter_dataloader)
+        input_ids = common_utils.shard(input_ids)
         rl_stats = jax_utils.replicate(RLStatistics.empty())
         policy_state, rollout_stats, rl_stats, samples_to_print = p_train_update(
             policy_state=policy_state,
