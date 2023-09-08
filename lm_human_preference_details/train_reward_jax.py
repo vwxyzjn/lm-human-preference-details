@@ -257,10 +257,20 @@ class NormalizationDataset(IterableDataset):
                 {"input_ids": tokens},
                 padding="max_length",
                 max_length=self.query_length,
-                return_tensors="pt",
-                return_attention_mask=True,
+                return_tensors="np",
+                return_attention_mask=False,
             )
-            yield output
+            yield output['input_ids']
+
+
+def numpy_collate(batch):
+    if isinstance(batch[0], np.ndarray):
+        return np.stack(batch)
+    elif isinstance(batch[0], (tuple,list)):
+        transposed = zip(*batch)
+        return [numpy_collate(samples) for samples in transposed]
+    else:
+        return np.array(batch)
 
 
 def right_padding_to_left_padding(tokens, pad_id):
@@ -345,12 +355,13 @@ def create_initial_reward_state_and_models(init_key, args):
     else:
         adam = optax.adam
 
-    optimizer = adam(
-        learning_rate=functools.partial(single_epoch_linear_schedule, args=args),
-        eps=args.eps,
+    optimizer = optax.MultiSteps(
+        optax.inject_hyperparams(adam)(
+            learning_rate=functools.partial(single_epoch_linear_schedule, args=args),
+        ),
+        every_k_schedule=args.gradient_accumulation_steps,
     )
 
-    optimizer = optax.MultiSteps(optimizer, args.gradient_accumulation_steps)
     state = TrainState.create(
         apply_fn=get_reward,
         params=RewardModelParams(
@@ -423,9 +434,8 @@ def normalize(
 
         sample_queries_responses = []
         for _ in range(n_batches):
-            data = next(iter_dataloader)
-            queries = data["input_ids"]
-            queries = right_padding_to_left_padding(data["input_ids"], args.pad_token_id)
+            queries = next(iter_dataloader)
+            queries = right_padding_to_left_padding(queries, args.pad_token_id)
             queries = common_utils.shard(queries)
             query_responses = p_generate(queries)
             sample_queries_responses.append(query_responses)
@@ -649,7 +659,11 @@ def train(args: Args):
         start_text=args.task.start_text,
         end_text=args.task.end_text,
     )
-    normalization_dataloader = DataLoader(normalization_dataset, batch_size=args.local_rollout_batch_size * len(local_devices))
+    normalization_dataloader = DataLoader(
+        normalization_dataset,
+        batch_size=args.local_rollout_batch_size * len(local_devices),
+        collate_fn=numpy_collate
+    )
     iter_normalization_dataloader = iter(normalization_dataloader)
 
     generation_config = GenerationConfig(
@@ -719,8 +733,10 @@ def train(args: Args):
     for global_step, train_batch in enumerate(train_iter):
         train_batch = common_utils.shard(train_batch)
         reward_state, train_metrics = p_train_step(reward_state, train_batch)
-        writer.add_scalar("train/lr", single_epoch_linear_schedule(global_step, args), global_step)
-
+        writer.add_scalar(
+            "train/lr",
+            reward_state.opt_state.inner_opt_state.hyperparams["learning_rate"][0].item(),
+        )
         # gathering replicated metric data
         train_metrics = common_utils.get_metrics([train_metrics])
 
