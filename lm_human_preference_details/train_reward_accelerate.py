@@ -11,6 +11,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 import tyro
+import transformers
 from accelerate import Accelerator
 from accelerate.utils import DistributedDataParallelKwargs, broadcast
 from datasets import load_dataset
@@ -450,7 +451,6 @@ def train(args: Args):
         kwargs_handlers=[
             DistributedDataParallelKwargs(
                 broadcast_buffers=False,
-                find_unused_parameters=True,
             )
         ],  # this is needed to avoid https://github.com/pytorch/pytorch/issues/22095#issuecomment-505099500
         gradient_accumulation_steps=args.gradient_accumulation_steps,
@@ -508,6 +508,10 @@ def train(args: Args):
         None  # disable `pad_token_id` and `eos_token_id` because we just want to
     )
     reward_model.lm_backbone.generation_config.pad_token_id = None  # generate tokens without truncation / padding
+    # make sure the `lm_head` or `embed_out` does not require gradients, otherwise
+    # pytorch DDP complains; see https://gist.github.com/vwxyzjn/45fc8706dfb3cf33695f0f57cc44a533
+    if isinstance(reward_model.lm_backbone, transformers.GPTNeoXForCausalLM):
+        reward_model.lm_backbone.embed_out.requires_grad_(False)
     if args.use_tensorflow_adam:
         optimizer = AdamTensorFlowStyle(reward_model.parameters(), lr=args.lr, eps=args.eps)
     else:
