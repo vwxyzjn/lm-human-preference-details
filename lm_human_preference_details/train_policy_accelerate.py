@@ -487,12 +487,16 @@ def train(args: Args):
     )
     # we use the padding token manually but do not resize the token embedding of the model
     tokenizer.add_special_tokens({"pad_token": "[PAD]"})
-    reward_model = AutoModelForCausalLMWithRewardHead(AutoModelForCausalLM.from_pretrained(args.base_model, trust_remote_code=True))
+    reward_model = AutoModelForCausalLMWithRewardHead(
+        AutoModelForCausalLM.from_pretrained(args.base_model, trust_remote_code=True)
+    )
     if args.rewards.trained_model:
         reward_model.load_state_dict(torch.load(args.rewards.trained_model, map_location=device))
         print(f"loaded pretrained reward model from {args.rewards.trained_model}")
     # each class should have a separate pretrained model that do not share weights
-    ref_policy = AutoModelForCausalLMWithScalarHead(AutoModelForCausalLM.from_pretrained(args.base_model, trust_remote_code=True))
+    ref_policy = AutoModelForCausalLMWithScalarHead(
+        AutoModelForCausalLM.from_pretrained(args.base_model, trust_remote_code=True)
+    )
     policy = AutoModelForCausalLMWithScalarHead(AutoModelForCausalLM.from_pretrained(args.base_model, trust_remote_code=True))
     policy.lm_backbone.generation_config.eos_token_id = (
         None  # disable `pad_token_id` and `eos_token_id` because we just want to
@@ -518,12 +522,10 @@ def train(args: Args):
         import deepspeed
 
         deepspeed_states = AcceleratorState().deepspeed_plugin
-        deepspeed_states.deepspeed_config['train_micro_batch_size_per_gpu'] = args.ppo.local_micro_batch_size
-        deepspeed_states.deepspeed_config['checkpoint'] = {'use_node_local_storage': True}
-        off_load_device = "cpu"
-        stage = 3
+        deepspeed_states.deepspeed_config["train_micro_batch_size_per_gpu"] = args.ppo.local_micro_batch_size
+        deepspeed_states.deepspeed_config["checkpoint"] = {"use_node_local_storage": True}
         eval_ds_config = {
-            "train_micro_batch_size_per_gpu": deepspeed_states.deepspeed_config['train_micro_batch_size_per_gpu'],
+            "train_micro_batch_size_per_gpu": deepspeed_states.deepspeed_config["train_micro_batch_size_per_gpu"],
             "steps_per_print": 10,
             # "zero_optimization": {
             #     "stage": stage,
@@ -532,11 +534,9 @@ def train(args: Args):
             #         "device": off_load_device
             #     }
             # },
-            "bf16": {
-                "enabled": True
-            },
+            "bf16": {"enabled": True},
             "prescale_gradients": False,
-            "wall_clock_breakdown": False
+            "wall_clock_breakdown": False,
         }
         reward_model, *_ = deepspeed.initialize(model=reward_model, config=eval_ds_config)
         reward_model.eval()
@@ -560,54 +560,13 @@ def train(args: Args):
 
     print("===training policy===")
     global_step = 0
-    approxkls_stats = torch.zeros(
-        (
-            args.ppo.noptepochs,
-            args.ppo.nminibatches,
-            args.ppo.gradient_accumulation_steps,
-        ),
-        device=device,
-    )
-    clipfracs_stats = torch.zeros(
-        (
-            args.ppo.noptepochs,
-            args.ppo.nminibatches,
-            args.ppo.gradient_accumulation_steps,
-        ),
-        device=device,
-    )
-    pg_losses_stats = torch.zeros(
-        (
-            args.ppo.noptepochs,
-            args.ppo.nminibatches,
-            args.ppo.gradient_accumulation_steps,
-        ),
-        device=device,
-    )
-    vf_losses_stats = torch.zeros(
-        (
-            args.ppo.noptepochs,
-            args.ppo.nminibatches,
-            args.ppo.gradient_accumulation_steps,
-        ),
-        device=device,
-    )
-    vf_clipfrac_stats = torch.zeros(
-        (
-            args.ppo.noptepochs,
-            args.ppo.nminibatches,
-            args.ppo.gradient_accumulation_steps,
-        ),
-        device=device,
-    )
-    entropies_stats = torch.zeros(
-        (
-            args.ppo.noptepochs,
-            args.ppo.nminibatches,
-            args.ppo.gradient_accumulation_steps,
-        ),
-        device=device,
-    )
+    stats_shape = (args.ppo.noptepochs, args.ppo.nminibatches, args.ppo.gradient_accumulation_steps)
+    approxkls_stats = torch.zeros(stats_shape, device=device)
+    clipfracs_stats = torch.zeros(stats_shape, device=device)
+    pg_losses_stats = torch.zeros(stats_shape, device=device)
+    vf_losses_stats = torch.zeros(stats_shape, device=device)
+    vf_clipfrac_stats = torch.zeros(stats_shape, device=device)
+    entropies_stats = torch.zeros(stats_shape, device=device)
     for update in range(1, args.ppo.num_updates + 1):
         global_step += 1 * args.ppo.batch_size
         frac = 1.0 - (update - 1.0) / args.ppo.num_updates
@@ -790,7 +749,7 @@ def train(args: Args):
                     )
 
         with torch.no_grad():
-            if not args.deepspeed: # for some reason there is a OOM with the `writer.add_histogram`
+            if not args.deepspeed:  # for some reason there is a OOM with the `writer.add_histogram`
                 writer.add_histogram("ppo/val/ratio_hist", ratio, update)
             kl = logprobs - ref_logprobs
             mean_kl = kl.sum(1).mean()
@@ -798,114 +757,36 @@ def train(args: Args):
             mean_non_score_reward = non_score_reward.sum(1).mean()
             writer.add_scalar("objective/kl_coef", kl_ctl.value, update)
             writer.add_scalar("objective/kl", accelerator.gather(mean_kl).mean().item(), update)
+            writer.add_scalar("objective/entropy", accelerator.gather(mean_entropy).mean().item(), update)
+            writer.add_scalar("objective/non_score_reward", accelerator.gather(mean_non_score_reward).mean().item(), update)
             writer.add_scalar(
-                "objective/entropy",
-                accelerator.gather(mean_entropy).mean().item(),
-                update,
+                "objective/score_total", accelerator.gather(mean_non_score_reward + scores.mean()).mean().item(), update
             )
-            writer.add_scalar(
-                "objective/non_score_reward",
-                accelerator.gather(mean_non_score_reward).mean().item(),
-                update,
-            )
-            writer.add_scalar(
-                "objective/score_total",
-                accelerator.gather(mean_non_score_reward + scores.mean()).mean().item(),
-                update,
-            )
-            writer.add_scalar(
-                "objective/scores",
-                accelerator.gather(scores.mean()).mean().item(),
-                update,
-            )
+            writer.add_scalar("objective/scores", accelerator.gather(scores.mean()).mean().item(), update)
             writer.add_scalar("ppo/loss/policy", accelerator.gather(pg_loss).mean().item(), update)
             writer.add_scalar("ppo/loss/value", accelerator.gather(vf_loss).mean().item(), update)
             writer.add_scalar("ppo/loss/total", accelerator.gather(loss).mean().item(), update)
-            writer.add_scalar(
-                "ppo/policy/entropy",
-                accelerator.gather(entropy.mean()).mean().item(),
-                update,
-            )
-            writer.add_scalar(
-                "ppo/policy/approxkl",
-                accelerator.gather(approxkl).mean().item(),
-                update,
-            )
-            writer.add_scalar(
-                "ppo/policy/clipfrac",
-                accelerator.gather(pg_clipfrac).mean().item(),
-                update,
-            )
-            writer.add_scalar(
-                "ppo/policy/approxkl_avg",
-                accelerator.gather(approxkls_stats).mean().item(),
-                update,
-            )
-            writer.add_scalar(
-                "ppo/policy/clipfrac_avg",
-                accelerator.gather(clipfracs_stats).mean().item(),
-                update,
-            )
-            writer.add_scalar(
-                "ppo/loss/policy_avg",
-                accelerator.gather(pg_losses_stats).mean().item(),
-                update,
-            )
-            writer.add_scalar(
-                "ppo/loss/value_avg",
-                accelerator.gather(vf_losses_stats).mean().item(),
-                update,
-            )
-            writer.add_scalar(
-                "ppo/val/clipfrac_avg",
-                accelerator.gather(vf_clipfrac_stats).mean().item(),
-                update,
-            )
-            writer.add_scalar(
-                "ppo/policy/entropy_avg",
-                accelerator.gather(entropies_stats).mean().item(),
-                update,
-            )
-            writer.add_scalar(
-                "ppo/returns/mean",
-                accelerator.gather(return_mean).mean().item(),
-                update,
-            )
+            writer.add_scalar("ppo/policy/entropy", accelerator.gather(entropy.mean()).mean().item(), update)
+            writer.add_scalar("ppo/policy/approxkl", accelerator.gather(approxkl).mean().item(), update)
+            writer.add_scalar("ppo/policy/clipfrac", accelerator.gather(pg_clipfrac).mean().item(), update)
+            writer.add_scalar("ppo/policy/approxkl_avg", accelerator.gather(approxkls_stats).mean().item(), update)
+            writer.add_scalar("ppo/policy/clipfrac_avg", accelerator.gather(clipfracs_stats).mean().item(), update)
+            writer.add_scalar("ppo/loss/policy_avg", accelerator.gather(pg_losses_stats).mean().item(), update)
+            writer.add_scalar("ppo/loss/value_avg", accelerator.gather(vf_losses_stats).mean().item(), update)
+            writer.add_scalar("ppo/val/clipfrac_avg", accelerator.gather(vf_clipfrac_stats).mean().item(), update)
+            writer.add_scalar("ppo/policy/entropy_avg", accelerator.gather(entropies_stats).mean().item(), update)
+            writer.add_scalar("ppo/returns/mean", accelerator.gather(return_mean).mean().item(), update)
             writer.add_scalar("ppo/returns/var", accelerator.gather(return_var).mean().item(), update)
             writer.add_scalar("ppo/val/vpred", accelerator.gather(vpred.mean()).mean().item(), update)
-            writer.add_scalar(
-                "ppo/val/error",
-                accelerator.gather(vf_losses1.mean()).mean().item(),
-                update,
-            )
-            writer.add_scalar(
-                "ppo/val/clipfrac",
-                accelerator.gather(vf_clipfrac).mean().item(),
-                update,
-            )
+            writer.add_scalar("ppo/val/error", accelerator.gather(vf_losses1.mean()).mean().item(), update)
+            writer.add_scalar("ppo/val/clipfrac", accelerator.gather(vf_clipfrac).mean().item(), update)
             writer.add_scalar("ppo/val/mean", accelerator.gather(value_mean).mean().item(), update)
             writer.add_scalar("ppo/val/var", accelerator.gather(value_var).mean().item(), update)
             writer.add_scalar("ppo/val/ratio", accelerator.gather(ratio.mean()).mean().item(), update)
-            writer.add_scalar(
-                "ppo/val/ratio_var",
-                accelerator.gather(ratio.mean()).var().item(),
-                update,
-            )
-            writer.add_scalar(
-                "ppo/val/advantage",
-                accelerator.gather(advantages.mean()).mean().item(),
-                update,
-            )
-            writer.add_scalar(
-                "ppo/val/advantage_var",
-                accelerator.gather(advantages.mean()).var().item(),
-                update,
-            )
-            writer.add_scalar(
-                "ppo/val/num_eos_tokens",
-                (responses == tokenizer.eos_token_id).sum().item(),
-                update,
-            )
+            writer.add_scalar("ppo/val/ratio_var", accelerator.gather(ratio.mean()).var().item(), update)
+            writer.add_scalar("ppo/val/advantage", accelerator.gather(advantages.mean()).mean().item(), update)
+            writer.add_scalar("ppo/val/advantage_var", accelerator.gather(advantages.mean()).var().item(), update)
+            writer.add_scalar("ppo/val/num_eos_tokens", (responses == tokenizer.eos_token_id).sum().item(), update)
             writer.add_scalar("ppo/lr", lrnow, update)
             writer.add_scalar("ppo/episode", global_step, update)
             kl_ctl.update(mean_kl.item(), args.ppo.batch_size)

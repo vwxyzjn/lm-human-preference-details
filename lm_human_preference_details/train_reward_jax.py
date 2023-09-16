@@ -649,7 +649,10 @@ def train(args: Args):
         start_text=args.task.start_text,
         end_text=args.task.end_text,
     )
-    normalization_dataloader = DataLoader(normalization_dataset, batch_size=args.local_rollout_batch_size * len(local_devices))
+    normalization_dataloader = DataLoader(
+        normalization_dataset,
+        batch_size=args.local_rollout_batch_size * len(local_devices),
+    )
     iter_normalization_dataloader = iter(normalization_dataloader)
 
     generation_config = GenerationConfig(
