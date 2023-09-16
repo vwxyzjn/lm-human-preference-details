@@ -25,6 +25,7 @@ chex = "0.1.5"
 orbax = "0.1.4"
 einops = "^0.6.1"
 black = "^23.7.0"
+clu = "^0.0.9"
 
 
 [tool.poetry.group.dev.dependencies]
