@@ -10,8 +10,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-import tyro
 import transformers
+import tyro
 from accelerate import Accelerator
 from accelerate.utils import DistributedDataParallelKwargs, broadcast
 from datasets import load_dataset

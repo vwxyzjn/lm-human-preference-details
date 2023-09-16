@@ -260,13 +260,13 @@ class NormalizationDataset(IterableDataset):
                 return_tensors="np",
                 return_attention_mask=False,
             )
-            yield output['input_ids']
+            yield output["input_ids"]
 
 
 def numpy_collate(batch):
     if isinstance(batch[0], np.ndarray):
         return np.stack(batch)
-    elif isinstance(batch[0], (tuple,list)):
+    elif isinstance(batch[0], (tuple, list)):
         transposed = zip(*batch)
         return [numpy_collate(samples) for samples in transposed]
     else:
@@ -660,9 +660,7 @@ def train(args: Args):
         end_text=args.task.end_text,
     )
     normalization_dataloader = DataLoader(
-        normalization_dataset,
-        batch_size=args.local_rollout_batch_size * len(local_devices),
-        collate_fn=numpy_collate
+        normalization_dataset, batch_size=args.local_rollout_batch_size * len(local_devices), collate_fn=numpy_collate
     )
     iter_normalization_dataloader = iter(normalization_dataloader)
 
