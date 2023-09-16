@@ -695,7 +695,6 @@ def train(args: Args):
                 rewards = whiten(rewards, shift_mean=False)
             try:
                 sample_kl = kl[0].sum().item()
-                postprocessed_responses = postprocessed_query_responses[:, context_length:]
                 console.print(
                     f"[green][bold]{'Query'}:[/]\n"
                     + f"[green]{tokenizer.decode(queries[0], skip_special_tokens=True)}[/]\n\n"
