@@ -3,7 +3,7 @@ import random
 import time
 from dataclasses import asdict, dataclass, field
 from types import SimpleNamespace
-from typing import Optional
+from typing import List, Optional
 
 import numpy as np
 import pandas as pd
@@ -17,6 +17,12 @@ from accelerate.state import AcceleratorState
 from rich.console import Console
 from rich.pretty import pprint
 from rich.table import Table
+from torch import Tensor, optim
+from torch.optim.optimizer import (
+    _dispatch_sqrt,
+    _get_value,
+    _use_grad_for_differentiable,
+)
 from torch.utils.data import DataLoader, IterableDataset
 from torch.utils.tensorboard import SummaryWriter
 from transformers import AutoModelForCausalLM, AutoTokenizer, GenerationConfig
@@ -109,7 +115,7 @@ class Args:
     """the name of the pretrained model to use"""
     deepspeed: bool = False
     """Whether to use deepspeed to train the model"""
-    print_sample_output_freq: int = 0
+    print_sample_output_freq: int = 10
     """How often to print sample output"""
     save_path: str = "models/policy.pt"
     """Where to save the model"""
@@ -128,16 +134,6 @@ def print_rich_table(title: str, df: pd.DataFrame, console: Console) -> Table:
         table.add_row(*row.astype(str).tolist())
     console.rule(f"[bold red]{title}")
     console.print(table)
-
-
-from typing import List, Optional
-
-from torch import Tensor, optim
-from torch.optim.optimizer import (
-    _dispatch_sqrt,
-    _get_value,
-    _use_grad_for_differentiable,
-)
 
 
 def _single_tensor_adam(
@@ -534,6 +530,8 @@ def train(args: Args):
         import deepspeed
 
         deepspeed_states = AcceleratorState().deepspeed_plugin
+        # deepspeed_states.deepspeed_config["train_micro_batch_size_per_gpu"] = args.ppo.local_micro_batch_size
+        # deepspeed_states.deepspeed_config["checkpoint"] = {"use_node_local_storage": True}
         eval_ds_config = {
             "train_micro_batch_size_per_gpu": deepspeed_states.deepspeed_config["train_micro_batch_size_per_gpu"],
             # "steps_per_print": 10,
@@ -662,38 +660,40 @@ def train(args: Args):
             # 5. whiten rewards
             if args.ppo.whiten_rewards:
                 rewards = whiten(rewards, shift_mean=False)
-            try:
-                all_decode_queries = tokenizer.batch_decode(queries, skip_special_tokens=True)
-                all_postprocessed_query_responses = tokenizer.batch_decode(
-                    postprocessed_query_responses, skip_special_tokens=True
-                )
-                all_postprocessed_responses = [
-                    x[len(y) :] for x, y in zip(all_postprocessed_query_responses, all_decode_queries)
-                ]
+            
+            if args.print_sample_output_freq > 0 and (update - 1) % args.print_sample_output_freq == 0:
+                try:
+                    all_decode_queries = tokenizer.batch_decode(queries, skip_special_tokens=True)
+                    all_postprocessed_query_responses = tokenizer.batch_decode(
+                        postprocessed_query_responses, skip_special_tokens=True
+                    )
+                    all_postprocessed_responses = [
+                        x[len(y) :] for x, y in zip(all_postprocessed_query_responses, all_decode_queries)
+                    ]
 
-                kl_sum = kl.sum(axis=1)
-                all_df = pd.DataFrame(
-                    {
-                        "query": all_decode_queries,
-                        "response": all_postprocessed_responses,
-                        "score": scores.float().cpu().numpy(),
-                        "kl": kl_sum.float().cpu().numpy(),
-                        "reward": (scores - kl_ctl.value * kl_sum).float().cpu().numpy(),
-                    }
+                    kl_sum = kl.sum(axis=1)
+                    all_df = pd.DataFrame(
+                        {
+                            "query": all_decode_queries,
+                            "response": all_postprocessed_responses,
+                            "score": scores.float().cpu().numpy(),
+                            "kl": kl_sum.float().cpu().numpy(),
+                            "reward": (scores - kl_ctl.value * kl_sum).float().cpu().numpy(),
+                        }
+                    )
+                    if accelerator.is_main_process and args.track:
+                        wandb.log({"query_responses": wandb.Table(dataframe=all_df)}, step=update)
+                    print_rich_table("stuff", all_df[:4], console)
+                except Exception as e:
+                    print(e)
+                del (
+                    all_decode_queries,
+                    all_postprocessed_query_responses,
+                    all_postprocessed_responses,
+                    kl_sum,
+                    all_df,
                 )
-                if accelerator.is_main_process and args.track:
-                    wandb.log({"query_responses": wandb.Table(dataframe=all_df)}, step=global_step)
-                print_rich_table("stuff", all_df[:4], console)
-            except Exception as e:
-                print(e)
-            del (
-                postprocessed_query_responses,
-                all_decode_queries,
-                all_postprocessed_query_responses,
-                all_postprocessed_responses,
-                kl_sum,
-                all_df,
-            )
+            del postprocessed_query_responses
             torch.cuda.empty_cache()
 
             # 6. compute advantages and returns
