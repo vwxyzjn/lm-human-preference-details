@@ -739,12 +739,8 @@ def train(args: Args):
                 kl = logprobs - ref_logprobs
                 kl_sum = kl.sum(axis=1)
                 all_decode_queries = tokenizer.batch_decode(queries, skip_special_tokens=True)
-                all_query_responses = tokenizer.batch_decode(
-                    query_responses, skip_special_tokens=True
-                )
-                all_responses = [
-                    x[len(y) :] for x, y in zip(all_query_responses, all_decode_queries)
-                ]
+                all_query_responses = tokenizer.batch_decode(query_responses, skip_special_tokens=True)
+                all_responses = [x[len(y) :] for x, y in zip(all_query_responses, all_decode_queries)]
                 all_df = pd.DataFrame(
                     {
                         "query": all_decode_queries,
