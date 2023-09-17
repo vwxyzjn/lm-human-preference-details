@@ -114,7 +114,8 @@ if __name__ == "__main__":
             slurm_template = f.read()
         slurm_template = slurm_template.replace("{{array}}", f"0-{len(commands) - 1}%{args.workers}")
         slurm_template = slurm_template.replace(
-            "{{seeds}}", f"({' '.join([str(args.start_seed + int(seed)) for seed in range(args.num_seeds)])})"
+            "{{seeds}}",
+            f"({' '.join([str(args.start_seed + int(seed)) for seed in range(args.num_seeds)])})",
         )
         slurm_template = slurm_template.replace("{{len_seeds}}", f"{args.num_seeds}")
         slurm_template = slurm_template.replace("{{command}}", args.command)

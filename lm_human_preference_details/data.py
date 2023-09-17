@@ -63,6 +63,7 @@ def tldr_generator(mode, seed=0, shuffle=False):
         text = data["body"]
         yield text
 
+
 # for testing only
 def dummy_generator(mode, seed=0, shuffle=False):
     while True:

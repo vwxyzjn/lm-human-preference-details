@@ -1,5 +1,6 @@
 import jax
 from jax import config
+
 config.update("jax_enable_x64", True)
 import jax.numpy as jnp
 import numpy as np
@@ -41,9 +42,7 @@ def test_compute_gae():
             advantages = delta + ppo_gamma * ppo_lam * nextnonterminal * advantages
             return advantages, advantages
 
-        extended_values = jnp.concatenate(
-            (values, jnp.zeros((values.shape[0], 1))), axis=1
-        )
+        extended_values = jnp.concatenate((values, jnp.zeros((values.shape[0], 1))), axis=1)
         dones = jnp.zeros_like(rewards)
         dones = dones.at[:, -1].set(1.0)
 

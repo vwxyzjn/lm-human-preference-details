@@ -6,16 +6,20 @@ from types import SimpleNamespace
 from typing import List, Optional
 
 import numpy as np
+import pandas as pd
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
+import transformers
 import tyro
 from accelerate import Accelerator
+from accelerate.state import AcceleratorState
 from accelerate.utils import DistributedDataParallelKwargs, broadcast
 from datasets import load_dataset
 from rich.console import Console
 from rich.pretty import pprint
+from rich.table import Table
 from torch import Tensor, optim
 from torch.optim.optimizer import (
     _dispatch_sqrt,
@@ -74,6 +78,8 @@ class Args:
 
     base_model: str = "gpt2"
     """the name of the pretrained model to use"""
+    deepspeed: bool = False
+    """Whether to use deepspeed to train the model"""
     label_dataset: str = "sentiment/offline_5k.json"
     """the name of the dataset to use for labels in `https://huggingface.co/datasets/vwxyzjn/lm-human-preferences`"""
     local_batch_size: int = 4
@@ -115,6 +121,16 @@ class Args:
 
 
 OPENAI_PAD_TOKEN_ID = 50259
+
+
+def print_rich_table(title: str, df: pd.DataFrame, console: Console) -> Table:
+    table = Table(show_lines=True)
+    for column in df.columns:
+        table.add_column(column)
+    for _, row in df.iterrows():
+        table.add_row(*row.astype(str).tolist())
+    console.rule(f"[bold red]{title}")
+    console.print(table)
 
 
 def _single_tensor_adam(
@@ -448,7 +464,9 @@ def normalize(
 def train(args: Args):
     accelerator = Accelerator(
         kwargs_handlers=[
-            DistributedDataParallelKwargs(broadcast_buffers=False)
+            DistributedDataParallelKwargs(
+                broadcast_buffers=False,
+            )
         ],  # this is needed to avoid https://github.com/pytorch/pytorch/issues/22095#issuecomment-505099500
         gradient_accumulation_steps=args.gradient_accumulation_steps,
     )
@@ -481,8 +499,8 @@ def train(args: Args):
             "|param|value|\n|-|-|\n%s" % ("\n".join([f"|{key}|{value}|" for key, value in vars(args).items()])),
         )
         pprint(args)
-    local_seed = args.seed + accelerator.process_index * 100003  # Prime
     device = accelerator.device
+    local_seed = args.seed + accelerator.process_index * 100003  # Prime
     random.seed(local_seed)
     np.random.seed(local_seed)
     torch.manual_seed(local_seed)
@@ -490,12 +508,17 @@ def train(args: Args):
     tokenizer = AutoTokenizer.from_pretrained(
         args.base_model,
         padding_side="right",
+        trust_remote_code=True,
     )
     # we use the padding token manually but do not resize the token embedding of the model
     tokenizer.add_special_tokens({"pad_token": "[PAD]"})
     args.pad_token_id = tokenizer.pad_token_id
-    untrained_model = AutoModelForCausalLMWithRewardHead(AutoModelForCausalLM.from_pretrained(args.base_model)).to(device)
-    reward_model = AutoModelForCausalLMWithRewardHead(AutoModelForCausalLM.from_pretrained(args.base_model)).to(device)
+    untrained_model = AutoModelForCausalLMWithRewardHead(
+        AutoModelForCausalLM.from_pretrained(args.base_model, trust_remote_code=True)
+    )
+    reward_model = AutoModelForCausalLMWithRewardHead(
+        AutoModelForCausalLM.from_pretrained(args.base_model, trust_remote_code=True)
+    )
     untrained_model.lm_backbone.generation_config.eos_token_id = (
         None  # disable `pad_token_id` and `eos_token_id` because we just want to
     )
@@ -504,6 +527,10 @@ def train(args: Args):
         None  # disable `pad_token_id` and `eos_token_id` because we just want to
     )
     reward_model.lm_backbone.generation_config.pad_token_id = None  # generate tokens without truncation / padding
+    # make sure the `lm_head` or `embed_out` does not require gradients, otherwise
+    # pytorch DDP complains; see https://gist.github.com/vwxyzjn/45fc8706dfb3cf33695f0f57cc44a533
+    if isinstance(reward_model.lm_backbone, transformers.GPTNeoXForCausalLM):
+        reward_model.lm_backbone.embed_out.requires_grad_(False)
     if args.use_tensorflow_adam:
         optimizer = AdamTensorFlowStyle(reward_model.parameters(), lr=args.lr, eps=args.eps)
     else:
@@ -518,6 +545,31 @@ def train(args: Args):
     )
     normalization_dataloader = DataLoader(normalization_dataset, batch_size=args.local_rollout_batch_size)
     reward_model, optimizer, normalization_dataloader = accelerator.prepare(reward_model, optimizer, normalization_dataloader)
+    if args.deepspeed:
+        import deepspeed
+
+        deepspeed_states = AcceleratorState().deepspeed_plugin
+        # deepspeed_states.deepspeed_config["train_micro_batch_size_per_gpu"] = args.ppo.local_micro_batch_size
+        # deepspeed_states.deepspeed_config["checkpoint"] = {"use_node_local_storage": True}
+        eval_ds_config = {
+            "train_micro_batch_size_per_gpu": deepspeed_states.deepspeed_config["train_micro_batch_size_per_gpu"],
+            # "steps_per_print": 10,
+            # "zero_optimization": {
+            #     "stage": stage,
+            #     "stage3_param_persistence_threshold": 1e4,
+            #     "offload_param": {
+            #         "device": off_load_device
+            #     }
+            # },
+            "bf16": {"enabled": True},
+            "prescale_gradients": False,
+            "wall_clock_breakdown": False,
+        }
+        untrained_model, *_ = deepspeed.initialize(model=untrained_model, config=eval_ds_config)
+        untrained_model.eval()
+    else:
+        untrained_model = untrained_model.to(device)
+
     iter_normalization_dataloader = iter(normalization_dataloader)
 
     generation_config = GenerationConfig(
@@ -619,8 +671,9 @@ def train(args: Args):
             with torch.no_grad():
                 # eval on test_label, some duplicate code (I don't want to make the training loop into a function...)
                 test_accuracies = []
-                new_all_inds = np.arange(len(label))
-                for start in range(args.labels.num_train, len(label), args.batch_size):
+                len_labels = (len(label) // args.batch_size) * args.batch_size  # in case the last batch is not full
+                new_all_inds = np.arange(len_labels)
+                for start in range(args.labels.num_train, len_labels, args.batch_size):
                     end = start + args.batch_size
                     b_inds_all = new_all_inds[start:end]
                     b_inds = b_inds_all[accelerator.process_index :: accelerator.num_processes]  #  multi-GPU slicing
@@ -683,14 +736,28 @@ def train(args: Args):
                 del output, logits, all_logprobs
                 torch.cuda.empty_cache()
 
-                print(f"global_step {global_step}:")
                 kl = logprobs - ref_logprobs
-                console.print(
-                    f"[green]{tokenizer.decode(queries[0], skip_special_tokens=True)}[/]"
-                    f"\n[blue]{tokenizer.decode(responses[0], skip_special_tokens=True)}[/]"
-                    f"\n[red]reward: {reward[0].item()}[/]"
-                    f"\n[red]kl: {kl[0].sum().item()}[/]"
-                    f"\n[red]average kl: {kl.sum(1).mean().item()}[/]"
+                kl_sum = kl.sum(axis=1)
+                all_decode_queries = tokenizer.batch_decode(queries, skip_special_tokens=True)
+                all_query_responses = tokenizer.batch_decode(query_responses, skip_special_tokens=True)
+                all_responses = [x[len(y) :] for x, y in zip(all_query_responses, all_decode_queries)]
+                all_df = pd.DataFrame(
+                    {
+                        "query": all_decode_queries,
+                        "response": all_responses,
+                        "kl": kl_sum.float().cpu().numpy(),
+                    }
+                )
+                if accelerator.is_main_process and args.track:
+                    wandb.log({"query_responses": wandb.Table(dataframe=all_df)}, step=global_step)
+                print_rich_table(f"Sample Output at Step {global_step}", all_df[:4], console)
+                del (
+                    query_responses,
+                    all_decode_queries,
+                    all_query_responses,
+                    all_responses,
+                    kl_sum,
+                    all_df,
                 )
                 writer.add_scalar("train/kl", kl.sum(1).mean().item(), global_step)
 

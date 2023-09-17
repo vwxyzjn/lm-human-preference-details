@@ -3,17 +3,26 @@ import random
 import time
 from dataclasses import asdict, dataclass, field
 from types import SimpleNamespace
-from typing import Optional
+from typing import List, Optional
 
 import numpy as np
+import pandas as pd
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 import tyro
 from accelerate import Accelerator
+from accelerate.state import AcceleratorState
 from rich.console import Console
 from rich.pretty import pprint
+from rich.table import Table
+from torch import Tensor, optim
+from torch.optim.optimizer import (
+    _dispatch_sqrt,
+    _get_value,
+    _use_grad_for_differentiable,
+)
 from torch.utils.data import DataLoader, IterableDataset
 from torch.utils.tensorboard import SummaryWriter
 from transformers import AutoModelForCausalLM, AutoTokenizer, GenerationConfig
@@ -104,7 +113,9 @@ class Args:
 
     base_model: str = "gpt2"
     """the name of the pretrained model to use"""
-    print_sample_output_freq: int = 0
+    deepspeed: bool = False
+    """Whether to use deepspeed to train the model"""
+    print_sample_output_freq: int = 10
     """How often to print sample output"""
     save_path: str = "models/policy.pt"
     """Where to save the model"""
@@ -115,14 +126,14 @@ class Args:
     ppo: PpoHParams = field(default_factory=PpoHParams)
 
 
-from typing import List, Optional
-
-from torch import Tensor, optim
-from torch.optim.optimizer import (
-    _dispatch_sqrt,
-    _get_value,
-    _use_grad_for_differentiable,
-)
+def print_rich_table(title: str, df: pd.DataFrame, console: Console) -> Table:
+    table = Table(show_lines=True)
+    for column in df.columns:
+        table.add_column(column)
+    for _, row in df.iterrows():
+        table.add_row(*row.astype(str).tolist())
+    console.rule(f"[bold red]{title}")
+    console.print(table)
 
 
 def _single_tensor_adam(
@@ -480,16 +491,21 @@ def train(args: Args):
     tokenizer = AutoTokenizer.from_pretrained(
         args.base_model,
         padding_side="right",
+        trust_remote_code=True,
     )
     # we use the padding token manually but do not resize the token embedding of the model
     tokenizer.add_special_tokens({"pad_token": "[PAD]"})
-    reward_model = AutoModelForCausalLMWithRewardHead(AutoModelForCausalLM.from_pretrained(args.base_model)).to(device)
+    reward_model = AutoModelForCausalLMWithRewardHead(
+        AutoModelForCausalLM.from_pretrained(args.base_model, trust_remote_code=True)
+    )
     if args.rewards.trained_model:
         reward_model.load_state_dict(torch.load(args.rewards.trained_model, map_location=device))
         print(f"loaded pretrained reward model from {args.rewards.trained_model}")
     # each class should have a separate pretrained model that do not share weights
-    ref_policy = AutoModelForCausalLMWithScalarHead(AutoModelForCausalLM.from_pretrained(args.base_model)).to(device)
-    policy = AutoModelForCausalLMWithScalarHead(AutoModelForCausalLM.from_pretrained(args.base_model)).to(device)
+    ref_policy = AutoModelForCausalLMWithScalarHead(
+        AutoModelForCausalLM.from_pretrained(args.base_model, trust_remote_code=True)
+    )
+    policy = AutoModelForCausalLMWithScalarHead(AutoModelForCausalLM.from_pretrained(args.base_model, trust_remote_code=True))
     policy.lm_backbone.generation_config.eos_token_id = (
         None  # disable `pad_token_id` and `eos_token_id` because we just want to
     )
@@ -510,6 +526,33 @@ def train(args: Args):
     )
     dataloader = DataLoader(dataset, batch_size=args.ppo.local_batch_size)
     policy, optimizer, dataloader = accelerator.prepare(policy, optimizer, dataloader)
+    if args.deepspeed:
+        import deepspeed
+
+        deepspeed_states = AcceleratorState().deepspeed_plugin
+        # deepspeed_states.deepspeed_config["train_micro_batch_size_per_gpu"] = args.ppo.local_micro_batch_size
+        # deepspeed_states.deepspeed_config["checkpoint"] = {"use_node_local_storage": True}
+        eval_ds_config = {
+            "train_micro_batch_size_per_gpu": deepspeed_states.deepspeed_config["train_micro_batch_size_per_gpu"],
+            # "steps_per_print": 10,
+            # "zero_optimization": {
+            #     "stage": stage,
+            #     "stage3_param_persistence_threshold": 1e4,
+            #     "offload_param": {
+            #         "device": off_load_device
+            #     }
+            # },
+            "bf16": {"enabled": True},
+            "prescale_gradients": False,
+            "wall_clock_breakdown": False,
+        }
+        reward_model, *_ = deepspeed.initialize(model=reward_model, config=eval_ds_config)
+        reward_model.eval()
+        ref_policy, *_ = deepspeed.initialize(model=ref_policy, config=eval_ds_config)
+        ref_policy.eval()
+    else:
+        ref_policy = ref_policy.to(device)
+        reward_model = reward_model.to(device)
     iter_dataloader = iter(dataloader)
     kl_ctl = AdaptiveKLController(args.rewards.kl_coef, hparams=args.rewards.adaptive_kl)
     # WARNING: even with `max_new_tokens` and `min_new_tokens` set to the same value, the number of tokens generated
@@ -525,54 +568,13 @@ def train(args: Args):
 
     print("===training policy===")
     global_step = 0
-    approxkls_stats = torch.zeros(
-        (
-            args.ppo.noptepochs,
-            args.ppo.nminibatches,
-            args.ppo.gradient_accumulation_steps,
-        ),
-        device=device,
-    )
-    clipfracs_stats = torch.zeros(
-        (
-            args.ppo.noptepochs,
-            args.ppo.nminibatches,
-            args.ppo.gradient_accumulation_steps,
-        ),
-        device=device,
-    )
-    pg_losses_stats = torch.zeros(
-        (
-            args.ppo.noptepochs,
-            args.ppo.nminibatches,
-            args.ppo.gradient_accumulation_steps,
-        ),
-        device=device,
-    )
-    vf_losses_stats = torch.zeros(
-        (
-            args.ppo.noptepochs,
-            args.ppo.nminibatches,
-            args.ppo.gradient_accumulation_steps,
-        ),
-        device=device,
-    )
-    vf_clipfrac_stats = torch.zeros(
-        (
-            args.ppo.noptepochs,
-            args.ppo.nminibatches,
-            args.ppo.gradient_accumulation_steps,
-        ),
-        device=device,
-    )
-    entropies_stats = torch.zeros(
-        (
-            args.ppo.noptepochs,
-            args.ppo.nminibatches,
-            args.ppo.gradient_accumulation_steps,
-        ),
-        device=device,
-    )
+    stats_shape = (args.ppo.noptepochs, args.ppo.nminibatches, args.ppo.gradient_accumulation_steps)
+    approxkls_stats = torch.zeros(stats_shape, device=device)
+    clipfracs_stats = torch.zeros(stats_shape, device=device)
+    pg_losses_stats = torch.zeros(stats_shape, device=device)
+    vf_losses_stats = torch.zeros(stats_shape, device=device)
+    vf_clipfrac_stats = torch.zeros(stats_shape, device=device)
+    entropies_stats = torch.zeros(stats_shape, device=device)
     for update in range(1, args.ppo.num_updates + 1):
         global_step += 1 * args.ppo.batch_size
         frac = 1.0 - (update - 1.0) / args.ppo.num_updates
@@ -658,19 +660,39 @@ def train(args: Args):
             # 5. whiten rewards
             if args.ppo.whiten_rewards:
                 rewards = whiten(rewards, shift_mean=False)
-            try:
-                sample_kl = kl[0].sum().item()
-                console.print(
-                    f"[green][bold]{'Query'}:[/]\n"
-                    + f"[green]{ tokenizer.decode(queries[0], skip_special_tokens=True)}[/]\n\n"
-                    + f"[blue][bold]{'Raw response'}:[/]\n"
-                    + f"[blue]{tokenizer.decode(responses[0], skip_special_tokens=True)}[/]\n\n"
-                    + f"[yellow][bold]{'Processed response'}:[/]\n"
-                    + f"[yellow]{tokenizer.decode(postprocessed_responses[0], skip_special_tokens=True)}[/]\n\n"
-                    + f"[red]score: {scores[0]}, kl: {kl[0].sum().item()}, total reward: {scores[0] - kl_ctl.value * sample_kl} [/]"
+
+            if args.print_sample_output_freq > 0 and (update - 1) % args.print_sample_output_freq == 0:
+                try:
+                    all_decode_queries = tokenizer.batch_decode(queries, skip_special_tokens=True)
+                    all_postprocessed_query_responses = tokenizer.batch_decode(
+                        postprocessed_query_responses, skip_special_tokens=True
+                    )
+                    all_postprocessed_responses = [
+                        x[len(y) :] for x, y in zip(all_postprocessed_query_responses, all_decode_queries)
+                    ]
+
+                    kl_sum = kl.sum(axis=1)
+                    all_df = pd.DataFrame(
+                        {
+                            "query": all_decode_queries,
+                            "response": all_postprocessed_responses,
+                            "score": scores.float().cpu().numpy(),
+                            "kl": kl_sum.float().cpu().numpy(),
+                            "reward": (scores - kl_ctl.value * kl_sum).float().cpu().numpy(),
+                        }
+                    )
+                    if accelerator.is_main_process and args.track:
+                        wandb.log({"query_responses": wandb.Table(dataframe=all_df)}, step=update)
+                    print_rich_table("stuff", all_df[:4], console)
+                except Exception as e:
+                    print(e)
+                del (
+                    all_decode_queries,
+                    all_postprocessed_query_responses,
+                    all_postprocessed_responses,
+                    kl_sum,
+                    all_df,
                 )
-            except Exception as e:
-                print(e)
             del postprocessed_query_responses
             torch.cuda.empty_cache()
 
@@ -733,8 +755,8 @@ def train(args: Args):
                         accelerator.backward(loss)
                         optimizer.step()
                         optimizer.zero_grad()
-                        pd = torch.nn.functional.softmax(logits, dim=-1)
-                        entropy = torch.logsumexp(logits, dim=-1) - torch.sum(pd * logits, dim=-1)
+                        prob_dist = torch.nn.functional.softmax(logits, dim=-1)
+                        entropy = torch.logsumexp(logits, dim=-1) - torch.sum(prob_dist * logits, dim=-1)
                         approxkl = 0.5 * (logprobs_diff**2).mean()
                         with torch.no_grad():
                             approxkls_stats[ppo_epoch_idx, minibatch_idx, gradient_accumulation_idx] = approxkl
@@ -760,124 +782,48 @@ def train(args: Args):
                     )
 
         with torch.no_grad():
-            writer.add_histogram("ppo/val/ratio_hist", ratio, update)
+            if not args.deepspeed:  # for some reason there is a OOM with the `writer.add_histogram`
+                writer.add_histogram("ppo/val/ratio_hist", ratio, update)
             kl = logprobs - ref_logprobs
             mean_kl = kl.sum(1).mean()
             mean_entropy = (-logprobs).sum(1).mean()
             mean_non_score_reward = non_score_reward.sum(1).mean()
             writer.add_scalar("objective/kl_coef", kl_ctl.value, update)
             writer.add_scalar("objective/kl", accelerator.gather(mean_kl).mean().item(), update)
+            writer.add_scalar("objective/entropy", accelerator.gather(mean_entropy).mean().item(), update)
+            writer.add_scalar("objective/non_score_reward", accelerator.gather(mean_non_score_reward).mean().item(), update)
             writer.add_scalar(
-                "objective/entropy",
-                accelerator.gather(mean_entropy).mean().item(),
-                update,
+                "objective/score_total", accelerator.gather(mean_non_score_reward + scores.mean()).mean().item(), update
             )
-            writer.add_scalar(
-                "objective/non_score_reward",
-                accelerator.gather(mean_non_score_reward).mean().item(),
-                update,
-            )
-            writer.add_scalar(
-                "objective/score_total",
-                accelerator.gather(mean_non_score_reward + scores.mean()).mean().item(),
-                update,
-            )
-            writer.add_scalar(
-                "objective/scores",
-                accelerator.gather(scores.mean()).mean().item(),
-                update,
-            )
+            writer.add_scalar("objective/scores", accelerator.gather(scores.mean()).mean().item(), update)
             writer.add_scalar("ppo/loss/policy", accelerator.gather(pg_loss).mean().item(), update)
             writer.add_scalar("ppo/loss/value", accelerator.gather(vf_loss).mean().item(), update)
             writer.add_scalar("ppo/loss/total", accelerator.gather(loss).mean().item(), update)
-            writer.add_scalar(
-                "ppo/policy/entropy",
-                accelerator.gather(entropy.mean()).mean().item(),
-                update,
-            )
-            writer.add_scalar(
-                "ppo/policy/approxkl",
-                accelerator.gather(approxkl).mean().item(),
-                update,
-            )
-            writer.add_scalar(
-                "ppo/policy/clipfrac",
-                accelerator.gather(pg_clipfrac).mean().item(),
-                update,
-            )
-            writer.add_scalar(
-                "ppo/policy/approxkl_avg",
-                accelerator.gather(approxkls_stats).mean().item(),
-                update,
-            )
-            writer.add_scalar(
-                "ppo/policy/clipfrac_avg",
-                accelerator.gather(clipfracs_stats).mean().item(),
-                update,
-            )
-            writer.add_scalar(
-                "ppo/loss/policy_avg",
-                accelerator.gather(pg_losses_stats).mean().item(),
-                update,
-            )
-            writer.add_scalar(
-                "ppo/loss/value_avg",
-                accelerator.gather(vf_losses_stats).mean().item(),
-                update,
-            )
-            writer.add_scalar(
-                "ppo/val/clipfrac_avg",
-                accelerator.gather(vf_clipfrac_stats).mean().item(),
-                update,
-            )
-            writer.add_scalar(
-                "ppo/policy/entropy_avg",
-                accelerator.gather(entropies_stats).mean().item(),
-                update,
-            )
-            writer.add_scalar(
-                "ppo/returns/mean",
-                accelerator.gather(return_mean).mean().item(),
-                update,
-            )
+            writer.add_scalar("ppo/policy/entropy", accelerator.gather(entropy.mean()).mean().item(), update)
+            writer.add_scalar("ppo/policy/approxkl", accelerator.gather(approxkl).mean().item(), update)
+            writer.add_scalar("ppo/policy/clipfrac", accelerator.gather(pg_clipfrac).mean().item(), update)
+            writer.add_scalar("ppo/policy/approxkl_avg", accelerator.gather(approxkls_stats).mean().item(), update)
+            writer.add_scalar("ppo/policy/clipfrac_avg", accelerator.gather(clipfracs_stats).mean().item(), update)
+            writer.add_scalar("ppo/loss/policy_avg", accelerator.gather(pg_losses_stats).mean().item(), update)
+            writer.add_scalar("ppo/loss/value_avg", accelerator.gather(vf_losses_stats).mean().item(), update)
+            writer.add_scalar("ppo/val/clipfrac_avg", accelerator.gather(vf_clipfrac_stats).mean().item(), update)
+            writer.add_scalar("ppo/policy/entropy_avg", accelerator.gather(entropies_stats).mean().item(), update)
+            writer.add_scalar("ppo/returns/mean", accelerator.gather(return_mean).mean().item(), update)
             writer.add_scalar("ppo/returns/var", accelerator.gather(return_var).mean().item(), update)
             writer.add_scalar("ppo/val/vpred", accelerator.gather(vpred.mean()).mean().item(), update)
-            writer.add_scalar(
-                "ppo/val/error",
-                accelerator.gather(vf_losses1.mean()).mean().item(),
-                update,
-            )
-            writer.add_scalar(
-                "ppo/val/clipfrac",
-                accelerator.gather(vf_clipfrac).mean().item(),
-                update,
-            )
+            writer.add_scalar("ppo/val/error", accelerator.gather(vf_losses1.mean()).mean().item(), update)
+            writer.add_scalar("ppo/val/clipfrac", accelerator.gather(vf_clipfrac).mean().item(), update)
             writer.add_scalar("ppo/val/mean", accelerator.gather(value_mean).mean().item(), update)
             writer.add_scalar("ppo/val/var", accelerator.gather(value_var).mean().item(), update)
             writer.add_scalar("ppo/val/ratio", accelerator.gather(ratio.mean()).mean().item(), update)
-            writer.add_scalar(
-                "ppo/val/ratio_var",
-                accelerator.gather(ratio.mean()).var().item(),
-                update,
-            )
-            writer.add_scalar(
-                "ppo/val/advantage",
-                accelerator.gather(advantages.mean()).mean().item(),
-                update,
-            )
-            writer.add_scalar(
-                "ppo/val/advantage_var",
-                accelerator.gather(advantages.mean()).var().item(),
-                update,
-            )
-            writer.add_scalar(
-                "ppo/val/num_eos_tokens",
-                (responses == tokenizer.eos_token_id).sum().item(),
-                update,
-            )
+            writer.add_scalar("ppo/val/ratio_var", accelerator.gather(ratio.mean()).var().item(), update)
+            writer.add_scalar("ppo/val/advantage", accelerator.gather(advantages.mean()).mean().item(), update)
+            writer.add_scalar("ppo/val/advantage_var", accelerator.gather(advantages.mean()).var().item(), update)
+            writer.add_scalar("ppo/val/num_eos_tokens", (responses == tokenizer.eos_token_id).sum().item(), update)
             writer.add_scalar("ppo/lr", lrnow, update)
             writer.add_scalar("ppo/episode", global_step, update)
             kl_ctl.update(mean_kl.item(), args.ppo.batch_size)
+            del kl, mean_kl, mean_entropy, mean_non_score_reward, scores
 
     # save model
     if args.save_path:

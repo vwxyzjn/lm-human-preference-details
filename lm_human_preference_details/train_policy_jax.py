@@ -1,12 +1,12 @@
+import copy
 import functools
 import os
-import copy
 import time
 from dataclasses import asdict, dataclass, field
 from types import SimpleNamespace
 from typing import List, Optional
+
 import einops
-from clu import metrics
 import flax
 import flax.linen as nn
 import jax
@@ -15,6 +15,7 @@ import numpy as np
 import optax
 import orbax
 import tyro
+from clu import metrics
 from flax import jax_utils
 from flax.training import common_utils, orbax_utils
 from flax.training.train_state import TrainState
@@ -162,9 +163,7 @@ def scale_by_adam_tf_style(
     mu_dtype = utils.canonicalize_dtype(mu_dtype)
 
     def init_fn(params):
-        mu = jax.tree_util.tree_map(
-            lambda t: jnp.zeros_like(t, dtype=mu_dtype), params
-        )  # First moment
+        mu = jax.tree_util.tree_map(lambda t: jnp.zeros_like(t, dtype=mu_dtype), params)  # First moment
         nu = jax.tree_util.tree_map(jnp.zeros_like, params)  # Second moment
         return ScaleByAdamState(count=jnp.zeros([], jnp.int32), mu=mu, nu=nu)
 
@@ -181,9 +180,7 @@ def scale_by_adam_tf_style(
         #     lambda m, v: m / (jnp.sqrt(v + eps_root) + eps), mu_hat, nu_hat)
         ### Tensorflow adam implementation
         updates = jax.tree_util.tree_map(
-            lambda m, v: (jnp.sqrt(1 - b2**count_inc) / (1 - b1**count_inc))
-            * m
-            / (jnp.sqrt(v + eps_root) + eps),
+            lambda m, v: (jnp.sqrt(1 - b2**count_inc) / (1 - b1**count_inc)) * m / (jnp.sqrt(v + eps_root) + eps),
             mu,
             nu,
         )  #
@@ -202,9 +199,7 @@ def adam_tf_style(
     mu_dtype=None,
 ):
     return combine.chain(
-        scale_by_adam_tf_style(
-            b1=b1, b2=b2, eps=eps, eps_root=eps_root, mu_dtype=mu_dtype
-        ),
+        scale_by_adam_tf_style(b1=b1, b2=b2, eps=eps, eps_root=eps_root, mu_dtype=mu_dtype),
         _scale_by_learning_rate(learning_rate),
     )
 
@@ -251,9 +246,7 @@ class RewardHead(nn.Module):
         assert x.shape[-1] == self.head_input_size
         x = nn.Dense(
             1,
-            kernel_init=nn.initializers.normal(
-                stddev=1 / np.sqrt(self.head_input_size + 1)
-            ),
+            kernel_init=nn.initializers.normal(stddev=1 / np.sqrt(self.head_input_size + 1)),
             bias_init=nn.initializers.zeros_init(),
         )(x)
         reward_gain = self.param("reward_gain", nn.initializers.ones_init(), ())
@@ -272,9 +265,7 @@ class LMBackboneWithScalarHeadParams:
 
 # a pytorch dataset
 class MyDataset(IterableDataset):
-    def __init__(
-        self, generator, tokenizer, query_length, seed, start_text=None, end_text=None
-    ):
+    def __init__(self, generator, tokenizer, query_length, seed, start_text=None, end_text=None):
         self.generator = generator
         self.tokenizer = tokenizer
         self.query_length = query_length
@@ -309,26 +300,23 @@ class MyDataset(IterableDataset):
                 return_tensors="np",
                 return_attention_mask=False,
             )
-            yield output['input_ids']
+            yield output["input_ids"]
 
 
 def numpy_collate(batch):
     if isinstance(batch[0], np.ndarray):
         return np.stack(batch)
-    elif isinstance(batch[0], (tuple,list)):
+    elif isinstance(batch[0], (tuple, list)):
         transposed = zip(*batch)
         return [numpy_collate(samples) for samples in transposed]
     else:
         return np.array(batch)
 
 
-
 def right_padding_to_left_padding(tokens, pad_id):
     def pad_row(row):
         mask = 1 - (row == pad_id)  # 1 if not pad_id, 0 if pad_id
-        return row[
-            jnp.argsort(mask)
-        ]  # uses the fact that jnp.argsort is stable by default
+        return row[jnp.argsort(mask)]  # uses the fact that jnp.argsort is stable by default
 
     return jax.vmap(pad_row)(tokens)
 
@@ -382,16 +370,10 @@ def prepare_reward_forward(args, tokenizer):
 
     if args.rewards.trained_model:
         orbax_checkpointer = orbax.checkpoint.PyTreeCheckpointer()
-        reward_state_params = orbax_checkpointer.restore(args.rewards.trained_model)[
-            "reward_model"
-        ]["params"]
+        reward_state_params = orbax_checkpointer.restore(args.rewards.trained_model)["reward_model"]["params"]
         reward_params = LMBackboneWithScalarHeadParams(
-            lm_backbone_params=flax.core.FrozenDict(
-                {"params": reward_state_params["lm_backbone_params"]["params"]}
-            ),
-            head_params=flax.core.FrozenDict(
-                {"params": reward_state_params["head_params"]["params"]}
-            ),
+            lm_backbone_params=flax.core.FrozenDict({"params": reward_state_params["lm_backbone_params"]["params"]}),
+            head_params=flax.core.FrozenDict({"params": reward_state_params["head_params"]["params"]}),
         )
         pprint(f"Loaded pretrained reward model from {args.rewards.trained_model}")
     else:
@@ -533,16 +515,12 @@ def train_step(
         logits = output.logits[:, args.task.query_length - 1 : -1, :]
         logits /= args.task.temperature
         responses = mb_query_responses[:, args.task.query_length :]
-        new_logprobs = -optax.softmax_cross_entropy_with_integer_labels(
-            logits, responses
-        )
+        new_logprobs = -optax.softmax_cross_entropy_with_integer_labels(logits, responses)
 
         logprobs_diff = new_logprobs - mb_logprobs
         ratio = jnp.exp(logprobs_diff)
         pg_losses1 = -mb_advantages * ratio
-        pg_losses2 = -mb_advantages * jnp.clip(
-            ratio, 1.0 - args.ppo.cliprange, 1.0 + args.ppo.cliprange
-        )
+        pg_losses2 = -mb_advantages * jnp.clip(ratio, 1.0 - args.ppo.cliprange, 1.0 + args.ppo.cliprange)
         pg_loss = jnp.maximum(pg_losses1, pg_losses2).mean()
         pg_clipfrac = (pg_losses2 > pg_losses1).astype(jnp.float32).mean()
 
@@ -577,11 +555,7 @@ def train_step(
 
 def linear_schedule(count, args):
     # anneal learning rate linearly
-    frac = (
-        1.0
-        - (count // (args.ppo.nminibatches * args.ppo.noptepochs))
-        / args.ppo.num_updates
-    )
+    frac = 1.0 - (count // (args.ppo.nminibatches * args.ppo.noptepochs)) / args.ppo.num_updates
     return args.ppo.lr * frac
 
 
@@ -599,16 +573,10 @@ def train(args: Args):
     args.global_learner_decices = [str(item) for item in global_learner_decices]
     args.learner_devices = [str(item) for item in learner_devices]
     args.local_rank = jax.process_index()
-    args.ppo.batch_size = int(
-        args.ppo.local_batch_size * len(args.learner_devices) * args.ppo.world_size
-    )
+    args.ppo.batch_size = int(args.ppo.local_batch_size * len(args.learner_devices) * args.ppo.world_size)
     args.ppo.minibatch_size = exact_div(args.ppo.batch_size, args.ppo.nminibatches)
-    args.ppo.local_mini_batch_size = exact_div(
-        args.ppo.local_batch_size, args.ppo.nminibatches
-    )
-    args.ppo.local_micro_batch_size = exact_div(
-        args.ppo.local_mini_batch_size, args.ppo.gradient_accumulation_steps
-    )
+    args.ppo.local_mini_batch_size = exact_div(args.ppo.local_batch_size, args.ppo.nminibatches)
+    args.ppo.local_micro_batch_size = exact_div(args.ppo.local_mini_batch_size, args.ppo.gradient_accumulation_steps)
     if args.ppo.whiten_rewards:
         assert (
             args.ppo.local_mini_batch_size >= 8
@@ -639,8 +607,7 @@ def train(args: Args):
         writer = SummaryWriter(f"runs/{run_name}")
         writer.add_text(
             "hyperparameters",
-            "|param|value|\n|-|-|\n%s"
-            % ("\n".join([f"|{key}|{value}|" for key, value in vars(args).items()])),
+            "|param|value|\n|-|-|\n%s" % ("\n".join([f"|{key}|{value}|" for key, value in vars(args).items()])),
         )
         pprint(args)
     local_seed = args.seed + args.local_rank * 100003  # Prime
@@ -670,9 +637,7 @@ def train(args: Args):
         every_k_schedule=args.ppo.gradient_accumulation_steps,
     )
 
-    policy_state = TrainState.create(
-        apply_fn=policy_forward, params=policy_params, tx=optimizer
-    )
+    policy_state = TrainState.create(apply_fn=policy_forward, params=policy_params, tx=optimizer)
     policy_state = jax_utils.replicate(policy_state)
 
     dataset = MyDataset(
@@ -683,11 +648,13 @@ def train(args: Args):
         start_text=args.task.start_text,
         end_text=args.task.end_text,
     )
-    dataloader = DataLoader(dataset, batch_size=args.ppo.batch_size, collate_fn=numpy_collate,)
-    iter_dataloader = iter(dataloader)
-    kl_ctl = AdaptiveKLController(
-        args.rewards.kl_coef, hparams=args.rewards.adaptive_kl
+    dataloader = DataLoader(
+        dataset,
+        batch_size=args.ppo.batch_size,
+        collate_fn=numpy_collate,
     )
+    iter_dataloader = iter(dataloader)
+    kl_ctl = AdaptiveKLController(args.rewards.kl_coef, hparams=args.rewards.adaptive_kl)
 
     def train_update(policy_state, input_ids, rl_stats, kl_ctl_value):
         queries = right_padding_to_left_padding(input_ids, tokenizer.pad_token_id)
@@ -707,9 +674,7 @@ def train(args: Args):
         logits /= args.task.temperature
         all_logprobs = jax.nn.log_softmax(logits, axis=-1)
         # all_logprobs: [local_batch_size, response_length, vocab_size]
-        logprobs = jnp.take_along_axis(all_logprobs, responses[..., None], -1).squeeze(
-            -1
-        )
+        logprobs = jnp.take_along_axis(all_logprobs, responses[..., None], -1).squeeze(-1)
         # logprobs: [local_batch_size, response_length]
 
         ref_output, _ = policy_forward(ref_policy_params, query_responses)
@@ -717,9 +682,7 @@ def train(args: Args):
         # ref_logits: [local_batch_size, response_length, vocab_size]
         ref_logits /= args.task.temperature
         ref_all_logprobs = jax.nn.log_softmax(ref_logits, axis=-1)
-        ref_logprobs = jnp.take_along_axis(
-            ref_all_logprobs, responses[..., None], -1
-        ).squeeze(-1)
+        ref_logprobs = jnp.take_along_axis(ref_all_logprobs, responses[..., None], -1).squeeze(-1)
         # ref_logprobs: [local_batch_size, response_length]
 
         # **Response Processing**
@@ -734,10 +697,7 @@ def train(args: Args):
             ],
             axis=1,
         )
-        truncate_mask = (
-            jnp.cumsum(truncate_after_or_token_mask, axis=1)
-            - truncate_after_or_token_mask
-        ).astype("bool")
+        truncate_mask = (jnp.cumsum(truncate_after_or_token_mask, axis=1) - truncate_after_or_token_mask).astype("bool")
         postprocessed_responses = jnp.where(
             truncate_mask,
             jnp.full_like(responses, tokenizer.pad_token_id),
@@ -745,23 +705,14 @@ def train(args: Args):
         )
 
         # 2. run reward model on the truncated responses
-        postprocessed_query_responses = jnp.concatenate(
-            (queries, postprocessed_responses), axis=1
-        )
-        postprocessed_query_responses = right_padding_to_left_padding(
-            postprocessed_query_responses, tokenizer.pad_token_id
-        )
-        scores = reward_forward(
-            query_responses_ids=postprocessed_query_responses
-        ).flatten()
+        postprocessed_query_responses = jnp.concatenate((queries, postprocessed_responses), axis=1)
+        postprocessed_query_responses = right_padding_to_left_padding(postprocessed_query_responses, tokenizer.pad_token_id)
+        scores = reward_forward(query_responses_ids=postprocessed_query_responses).flatten()
 
         # 3. filter response. Ensure that the sample contains truncate_token
         # responses not passing that filter will receive a low (fixed) score
         # only query humans on responses that pass that filter
-        matches_token = (
-            postprocessed_responses[:, args.task.truncate_after :]
-            == args.task.truncate_token
-        )
+        matches_token = postprocessed_responses[:, args.task.truncate_after :] == args.task.truncate_token
         filter_mask = jnp.any(matches_token, axis=-1)
 
         scores = jnp.where(
@@ -787,14 +738,10 @@ def train(args: Args):
             nextnonterminal = 1.0 - nextdone
 
             delta = reward + args.ppo.gamma * nextvalues * nextnonterminal - curvalues
-            advantages = (
-                delta + args.ppo.gamma * args.ppo.lam * nextnonterminal * advantages
-            )
+            advantages = delta + args.ppo.gamma * args.ppo.lam * nextnonterminal * advantages
             return advantages, advantages
 
-        extended_values = jnp.concatenate(
-            (values, jnp.zeros((args.ppo.local_batch_size, 1))), axis=1
-        )
+        extended_values = jnp.concatenate((values, jnp.zeros((args.ppo.local_batch_size, 1))), axis=1)
         dones = jnp.zeros_like(rewards)
         dones = dones.at[:, -1].set(1.0)
 
@@ -841,9 +788,7 @@ def train(args: Args):
                 "(c m) l -> c m l",
                 c=args.ppo.gradient_accumulation_steps,
             )
-            mbs_values = einops.rearrange(
-                values[perm], "(c m) l -> c m l", c=args.ppo.gradient_accumulation_steps
-            )
+            mbs_values = einops.rearrange(values[perm], "(c m) l -> c m l", c=args.ppo.gradient_accumulation_steps)
             mbs_query_responses = einops.rearrange(
                 query_responses[perm],
                 "(c m) l -> c m l",
@@ -879,9 +824,7 @@ def train(args: Args):
         rollout_stats = dict(
             mean_kl=jax.lax.pmean(kl.sum(-1).mean(), "batch"),
             mean_entropy=jax.lax.pmean((-logprobs).sum(-1).mean(), "batch"),
-            mean_non_score_reward=jax.lax.pmean(
-                non_score_reward.sum(-1).mean(), "batch"
-            ),
+            mean_non_score_reward=jax.lax.pmean(non_score_reward.sum(-1).mean(), "batch"),
             mean_scores=jax.lax.pmean(scores.mean(), "batch"),
             mean_returns=jax.lax.pmean(returns.mean(), "batch"),
             var_returns=jax.lax.pmean(returns.var(), "batch"),
@@ -936,85 +879,34 @@ def train(args: Args):
         # Rollout metrics
         rollout_stats = common_utils.get_metrics([rollout_stats])
         writer.add_scalar("objective/kl", rollout_stats["mean_kl"].item(), update)
-        writer.add_scalar(
-            "objective/entropy", rollout_stats["mean_entropy"].item(), update
-        )
-        writer.add_scalar(
-            "objective/non_score_reward",
-            rollout_stats["mean_non_score_reward"].item(),
-            update,
-        )
+        writer.add_scalar("objective/entropy", rollout_stats["mean_entropy"].item(), update)
+        writer.add_scalar("objective/non_score_reward", rollout_stats["mean_non_score_reward"].item(), update)
         writer.add_scalar(
             "objective/score_total",
-            rollout_stats["mean_non_score_reward"].item()
-            + rollout_stats["mean_scores"].item(),
+            rollout_stats["mean_non_score_reward"].item() + rollout_stats["mean_scores"].item(),
             update,
         )
-        writer.add_scalar(
-            "objective/scores", rollout_stats["mean_scores"].item(), update
-        )
-        writer.add_scalar(
-            "ppo/returns/mean", rollout_stats["mean_returns"].item(), update
-        )
+        writer.add_scalar("objective/scores", rollout_stats["mean_scores"].item(), update)
+        writer.add_scalar("ppo/returns/mean", rollout_stats["mean_returns"].item(), update)
         writer.add_scalar("ppo/returns/var", rollout_stats["var_returns"].item(), update)
-
         writer.add_scalar("ppo/val/mean", rollout_stats["mean_values"].item(), update)
         writer.add_scalar("ppo/val/var", rollout_stats["var_values"].item(), update)
-
-        writer.add_scalar(
-            "ppo/val/advantage", rollout_stats["mean_advantages"].item(), update
-        )
+        writer.add_scalar("ppo/val/advantage", rollout_stats["mean_advantages"].item(), update)
 
         # RL metrics aggregated at the batch level
         rl_stats = common_utils.get_metrics([rl_stats])
-        writer.add_scalar(
-            "ppo/policy/approxkl_avg", rl_stats["approxkl"].item(), update
-        )
-        writer.add_scalar(
-            "ppo/policy/entropy_avg",
-            rl_stats["entropy"].item(),
-            update,
-        )
-        writer.add_scalar(
-            "ppo/loss/policy_avg",
-            rl_stats["pg_loss"].item(),
-            update,
-        )
-        writer.add_scalar(
-            "ppo/policy/clipfrac_avg",
-            rl_stats["pg_clipfrac"].item(),
-            update,
-        )
-        writer.add_scalar(
-            "ppo/val/error",
-            rl_stats["vf_loss1"].item(),
-            update,
-        )
-        writer.add_scalar(
-            "ppo/loss/value_avg",
-            rl_stats["vf_loss"].item(),
-            update,
-        )
-        writer.add_scalar(
-            "ppo/val/clipfrac_avg",
-            rl_stats["vf_clipfrac"].item(),
-            update,
-        )
-        writer.add_scalar(
-            "ppo/val/ratio_avg",
-            rl_stats["ratio"].item(),
-            update,
-        )
+        writer.add_scalar("ppo/policy/approxkl_avg", rl_stats["approxkl"].item(), update)
+        writer.add_scalar("ppo/policy/entropy_avg", rl_stats["entropy"].item(), update)
+        writer.add_scalar("ppo/loss/policy_avg", rl_stats["pg_loss"].item(), update)
+        writer.add_scalar("ppo/policy/clipfrac_avg", rl_stats["pg_clipfrac"].item(), update)
+        writer.add_scalar("ppo/val/error", rl_stats["vf_loss1"].item(), update)
+        writer.add_scalar("ppo/loss/value_avg", rl_stats["vf_loss"].item(), update)
+        writer.add_scalar("ppo/val/clipfrac_avg", rl_stats["vf_clipfrac"].item(), update)
+        writer.add_scalar("ppo/val/ratio_avg", rl_stats["ratio"].item(), update)
         writer.add_scalar("ppo/loss/total", rl_stats["loss"].item(), update)
 
         # Logging learning rate and learning progress
-        writer.add_scalar(
-            "ppo/lr",
-            policy_state.opt_state.inner_opt_state.hyperparams["learning_rate"][
-                0
-            ].item(),
-            update,
-        )
+        writer.add_scalar("ppo/lr", policy_state.opt_state.inner_opt_state.hyperparams["learning_rate"][0].item(), update)
         writer.add_scalar("ppo/episode", global_step, update)
         writer.add_scalar("objective/kl_coef", np.array(kl_ctl.value), update)
         kl_ctl.update(rollout_stats["mean_kl"].item(), args.ppo.batch_size)
@@ -1026,9 +918,7 @@ def train(args: Args):
             ckpt = {"policy_model": policy_state, "args": vars(args)}
             orbax_checkpointer = orbax.checkpoint.PyTreeCheckpointer()
             save_args = orbax_utils.save_args_from_target(ckpt)
-            orbax_checkpointer.save(
-                args.save_path, ckpt, save_args=save_args, force=True
-            )
+            orbax_checkpointer.save(args.save_path, ckpt, save_args=save_args, force=True)
 
         if args.local_rank == 0 and args.track:
             wandb.finish()
