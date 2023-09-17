@@ -6,6 +6,7 @@ from types import SimpleNamespace
 from typing import Optional
 
 import numpy as np
+import pandas as pd
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -15,6 +16,7 @@ from accelerate import Accelerator
 from accelerate.state import AcceleratorState
 from rich.console import Console
 from rich.pretty import pprint
+from rich.table import Table
 from torch.utils.data import DataLoader, IterableDataset
 from torch.utils.tensorboard import SummaryWriter
 from transformers import AutoModelForCausalLM, AutoTokenizer, GenerationConfig
@@ -116,6 +118,16 @@ class Args:
     task: TaskHParams = field(default_factory=TaskHParams)
     rewards: RewardHParams = field(default_factory=RewardHParams)
     ppo: PpoHParams = field(default_factory=PpoHParams)
+
+
+def print_rich_table(title: str, df: pd.DataFrame, console: Console) -> Table:
+    table = Table(show_lines=True)
+    for column in df.columns:
+        table.add_column(column)
+    for _, row in df.iterrows():
+        table.add_row(*row.astype(str).tolist())
+    console.rule(f"[bold red]{title}")
+    console.print(table)
 
 
 from typing import List, Optional
@@ -522,11 +534,9 @@ def train(args: Args):
         import deepspeed
 
         deepspeed_states = AcceleratorState().deepspeed_plugin
-        deepspeed_states.deepspeed_config["train_micro_batch_size_per_gpu"] = args.ppo.local_micro_batch_size
-        deepspeed_states.deepspeed_config["checkpoint"] = {"use_node_local_storage": True}
         eval_ds_config = {
             "train_micro_batch_size_per_gpu": deepspeed_states.deepspeed_config["train_micro_batch_size_per_gpu"],
-            "steps_per_print": 10,
+            # "steps_per_print": 10,
             # "zero_optimization": {
             #     "stage": stage,
             #     "stage3_param_persistence_threshold": 1e4,
@@ -653,17 +663,37 @@ def train(args: Args):
             if args.ppo.whiten_rewards:
                 rewards = whiten(rewards, shift_mean=False)
             try:
-                sample_kl = kl[0].sum().item()
-                console.print(
-                    f"[green][bold]{'Query'}:[/]\n"
-                    + f"[green]{tokenizer.decode(queries[0], skip_special_tokens=True)}[/]\n\n"
-                    + f"[yellow][bold]{'Response'}:[/]\n"
-                    + f"[yellow]{tokenizer.decode(postprocessed_responses[0], skip_special_tokens=True)}[/]\n\n"
-                    + f"[red]score: {scores[0]}, kl: {sample_kl}, total reward: {scores[0] - kl_ctl.value * sample_kl} [/]"
+                all_decode_queries = tokenizer.batch_decode(queries, skip_special_tokens=True)
+                all_postprocessed_query_responses = tokenizer.batch_decode(
+                    postprocessed_query_responses, skip_special_tokens=True
                 )
+                all_postprocessed_responses = [
+                    x[len(y) :] for x, y in zip(all_postprocessed_query_responses, all_decode_queries)
+                ]
+
+                kl_sum = kl.sum(axis=1)
+                all_df = pd.DataFrame(
+                    {
+                        "query": all_decode_queries,
+                        "response": all_postprocessed_responses,
+                        "score": scores.float().cpu().numpy(),
+                        "kl": kl_sum.float().cpu().numpy(),
+                        "reward": (scores - kl_ctl.value * kl_sum).float().cpu().numpy(),
+                    }
+                )
+                if accelerator.is_main_process and args.track:
+                    wandb.log({"query_responses": wandb.Table(dataframe=all_df)}, step=global_step)
+                print_rich_table("stuff", all_df[:4], console)
             except Exception as e:
                 print(e)
-            del postprocessed_query_responses
+            del (
+                postprocessed_query_responses,
+                all_decode_queries,
+                all_postprocessed_query_responses,
+                all_postprocessed_responses,
+                kl_sum,
+                all_df,
+            )
             torch.cuda.empty_cache()
 
             # 6. compute advantages and returns
@@ -725,8 +755,8 @@ def train(args: Args):
                         accelerator.backward(loss)
                         optimizer.step()
                         optimizer.zero_grad()
-                        pd = torch.nn.functional.softmax(logits, dim=-1)
-                        entropy = torch.logsumexp(logits, dim=-1) - torch.sum(pd * logits, dim=-1)
+                        prob_dist = torch.nn.functional.softmax(logits, dim=-1)
+                        entropy = torch.logsumexp(logits, dim=-1) - torch.sum(prob_dist * logits, dim=-1)
                         approxkl = 0.5 * (logprobs_diff**2).mean()
                         with torch.no_grad():
                             approxkls_stats[ppo_epoch_idx, minibatch_idx, gradient_accumulation_idx] = approxkl
