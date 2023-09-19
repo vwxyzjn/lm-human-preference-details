@@ -110,6 +110,10 @@ class Args:
     """Whether to use cuda if available."""
     run_name: tyro.conf.Suppress[str] = None
     """TO BE FILLED: a unique name of this run"""
+    upload_model: bool = False
+    "whether to upload the saved model to huggingface"
+    hf_entity: str = ""
+    "the user or org name of the model repository from the Hugging Face Hub"
 
     base_model: str = "gpt2"
     """the name of the pretrained model to use"""
@@ -826,9 +830,15 @@ def train(args: Args):
             del kl, mean_kl, mean_entropy, mean_non_score_reward, scores
 
     # save model
-    if args.save_path:
+    if accelerator.is_main_process and args.save_path:
         os.makedirs(os.path.dirname(args.save_path), exist_ok=True)
-        torch.save(reward_model.state_dict(), args.save_path)
+        torch.save(policy.state_dict(), args.save_path)
+
+        if args.upload_model:
+            repo_name = f"{args.exp_name}__{args.rewards.label_dataset}__seed{args.seed}__{int(time.time())}"
+            repo_id = f"{args.hf_entity}/{repo_name}" if args.hf_entity else repo_name
+            policy.lm_backbone.save_pretrained(repo_id, safe_serialization=True, push_to_hub=True)
+            tokenizer.save_pretrained(repo_id, push_to_hub=True)
 
 
 if __name__ == "__main__":
