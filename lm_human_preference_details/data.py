@@ -60,7 +60,7 @@ def tldr_generator(mode, seed=0, shuffle=False):
         dataset = dataset.shuffle(seed)
 
     for _, data in enumerate(dataset):
-        text = data["body"]
+        text = data["content"]
         yield text
 
 
