@@ -415,7 +415,6 @@ def normalize(
 
 
 def train(args: Args):
-    args = tyro.cli(Args)
     accelerator = Accelerator(
         kwargs_handlers=[
             DistributedDataParallelKwargs(
