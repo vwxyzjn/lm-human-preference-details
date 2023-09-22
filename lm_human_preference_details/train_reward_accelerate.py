@@ -1,3 +1,4 @@
+import functools
 import os
 import random
 import time
@@ -26,11 +27,9 @@ from torch.optim.optimizer import (
     _get_value,
     _use_grad_for_differentiable,
 )
-from torch.utils.data import DataLoader, IterableDataset
+from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from transformers import AutoModelForCausalLM, AutoTokenizer, GenerationConfig
-
-from lm_human_preference_details.data import DATASET
 
 
 @dataclass
@@ -46,10 +45,6 @@ class TaskHParams:
     # Query params
     query_length: int = 64
     query_dataset: str = "books"
-    query_prefix: str = ""
-    query_suffix: str = ""
-    start_text: Optional[str] = None
-    end_text: Optional[str] = None
 
     # Response params
     response_length: int = 24
@@ -310,48 +305,6 @@ class AutoModelForCausalLMWithRewardHead(nn.Module):
         return output, reward
 
 
-# Dataset for reward-model normalization
-class NormalizationDataset(IterableDataset):
-    """A dataset for reward model normalization."""
-
-    def __init__(self, generator, tokenizer, query_length, seed, start_text=None, end_text=None):
-        self.generator = generator
-        self.tokenizer = tokenizer
-        self.query_length = query_length
-        self.start_text = start_text
-        self.end_text = end_text
-        self.seed = seed
-        token_to_index = tokenizer.get_vocab()
-        self.start_token = token_to_index[start_text] if self.start_text else None
-        self.end_token = token_to_index[end_text] if self.end_text else None
-
-    def __iter__(self):
-        for text in self.generator("train", self.seed, shuffle=True):
-            tokens = self.tokenizer.encode(text)
-            if self.start_token is not None:
-                try:
-                    first_index = tokens.index(self.start_token) + 1
-                    if first_index < len(tokens):
-                        tokens = tokens[first_index:]
-                except:
-                    continue
-            tokens = tokens[: self.query_length]
-            if self.end_token is not None:
-                try:
-                    last_index = len(tokens) - tokens[::-1].index(self.end_token)
-                    tokens = tokens[:last_index]
-                except:
-                    continue
-            output = self.tokenizer.pad(
-                {"input_ids": tokens},
-                padding="max_length",
-                max_length=self.query_length,
-                return_tensors="pt",
-                return_attention_mask=True,
-            )
-            yield output
-
-
 def right_padding_to_left_padding(tokens, pad_id):
     """Convert from right padding to left padding."""
     assert tokens.ndim == 2
@@ -421,8 +374,8 @@ def normalize(
         sample_queries_responses = []
         for _ in range(n_batches):
             data = next(iter_dataloader)
-            queries = data["input_ids"].to(device)
-            queries = right_padding_to_left_padding(data["input_ids"], args.pad_token_id).to(device)
+            queries = data["query_token"].to(device)
+            queries = right_padding_to_left_padding(data["query_token"], args.pad_token_id).to(device)
             query_responses = generate(lm_backbone, queries, args, generation_config)
             sample_queries_responses.append(query_responses)
 
@@ -448,8 +401,8 @@ def normalize(
         sample_queries_responses = []
         for _ in range(n_batches):
             data = next(iter_dataloader)
-            queries = data["input_ids"].to(device)
-            queries = right_padding_to_left_padding(data["input_ids"], args.pad_token_id).to(device)
+            queries = data["query_token"].to(device)
+            queries = right_padding_to_left_padding(data["query_token"], args.pad_token_id).to(device)
             query_responses = generate(lm_backbone, queries, args, generation_config)
             sample_queries_responses.append(query_responses)
         rewards = []
@@ -473,7 +426,6 @@ def train(args: Args):
     args.world_size = accelerator.num_processes
     args.batch_size = int(args.local_batch_size * args.world_size)
     args.rollout_batch_size = int(args.local_rollout_batch_size * args.world_size)
-
     args.local_micro_batch_size = exact_div(args.local_batch_size, args.gradient_accumulation_steps)
 
     console = Console(force_terminal=True)
@@ -535,16 +487,23 @@ def train(args: Args):
         optimizer = AdamTensorFlowStyle(reward_model.parameters(), lr=args.lr, eps=args.eps)
     else:
         optimizer = optim.Adam(reward_model.parameters(), lr=args.lr, eps=args.eps)
-    normalization_dataset = NormalizationDataset(
-        DATASET[args.task.query_dataset],
-        tokenizer,
-        args.task.query_length,
-        seed=local_seed,
-        start_text=args.task.start_text,
-        end_text=args.task.end_text,
+    dataset = load_dataset("bookcorpus", split="train")
+    dataset = dataset.shuffle(seed=local_seed)
+
+    def process_query_data(x, base_model: str, response_length: int):  # added args so it's hashable
+        tokenizer = AutoTokenizer.from_pretrained(base_model)
+        tokenizer.add_special_tokens({"pad_token": "[PAD]"})
+        return {
+            "query_token": tokenizer(
+                x["text"], padding="max_length", max_length=response_length, truncation=True, return_tensors="pt"
+            )["input_ids"],
+        }
+
+    dataset.set_transform(
+        functools.partial(process_query_data, base_model=args.base_model, response_length=args.task.response_length)
     )
-    normalization_dataloader = DataLoader(normalization_dataset, batch_size=args.local_rollout_batch_size)
-    reward_model, optimizer, normalization_dataloader = accelerator.prepare(reward_model, optimizer, normalization_dataloader)
+    dataloader = DataLoader(dataset, batch_size=args.local_rollout_batch_size)
+    reward_model, optimizer, dataloader = accelerator.prepare(reward_model, optimizer, dataloader)
     if args.deepspeed:
         import deepspeed
 
@@ -570,8 +529,11 @@ def train(args: Args):
     else:
         untrained_model = untrained_model.to(device)
 
-    iter_normalization_dataloader = iter(normalization_dataloader)
+    def repeat_generator():  # TODO: ideally we shuffle the dataloader as well
+        while True:
+            yield from dataloader
 
+    iter_dataloader = iter(repeat_generator())
     generation_config = GenerationConfig(
         max_new_tokens=args.task.response_length,
         min_new_tokens=args.task.response_length,
@@ -595,7 +557,7 @@ def train(args: Args):
             device,
             untrained_model.lm_backbone,
             reward_model,
-            iter_normalization_dataloader,
+            iter_dataloader,
             generation_config,
         )
         print(
@@ -708,10 +670,10 @@ def train(args: Args):
                     print("test/accuracy", test_accuracy, global_step)
 
                 # the part below is testing out some generations and KLs, not presented in the original code
-                data = next(iter_normalization_dataloader)
-                queries = data["input_ids"].to(device)
+                data = next(iter_dataloader)
+                queries = data["query_token"].to(device)
                 context_length = queries.shape[1]
-                queries = right_padding_to_left_padding(data["input_ids"], args.pad_token_id).to(device)
+                queries = right_padding_to_left_padding(data["query_token"], args.pad_token_id).to(device)
                 query_responses = generate(
                     accelerator.unwrap_model(reward_model).lm_backbone,
                     queries,
@@ -776,7 +738,7 @@ def train(args: Args):
             device,
             untrained_model.lm_backbone,
             reward_model,
-            iter_normalization_dataloader,
+            iter_dataloader,
             generation_config,
         )
         print(
