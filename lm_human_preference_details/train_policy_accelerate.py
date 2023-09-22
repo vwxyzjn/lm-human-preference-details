@@ -486,7 +486,7 @@ def train(args: Args):
         return {
             "query_token": tokenizer(
                 x["text"], padding="max_length", max_length=response_length, truncation=True, return_tensors="pt"
-            )["query_token"],
+            )["input_ids"],
         }
 
     dataset.set_transform(
