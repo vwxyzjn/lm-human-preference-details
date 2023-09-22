@@ -27,7 +27,7 @@ from torch.optim.optimizer import (
     _get_value,
     _use_grad_for_differentiable,
 )
-from torch.utils.data import DataLoader, IterableDataset
+from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from transformers import AutoModelForCausalLM, AutoTokenizer, GenerationConfig
 
@@ -490,16 +490,16 @@ def train(args: Args):
         optimizer = optim.Adam(reward_model.parameters(), lr=args.lr, eps=args.eps)
     dataset = load_dataset("bookcorpus", split="train")
     dataset = dataset.shuffle(seed=local_seed)
-    def process_query_data(x, base_model: str, response_length: int): # added args so it's hashable
+
+    def process_query_data(x, base_model: str, response_length: int):  # added args so it's hashable
         tokenizer = AutoTokenizer.from_pretrained(base_model)
         tokenizer.add_special_tokens({"pad_token": "[PAD]"})
         return {
-            "query_token": tokenizer(x["text"],
-            padding="max_length",
-            max_length=response_length,
-            truncation=True,
-            return_tensors="pt")["input_ids"],
+            "query_token": tokenizer(
+                x["text"], padding="max_length", max_length=response_length, truncation=True, return_tensors="pt"
+            )["input_ids"],
         }
+
     dataset.set_transform(
         functools.partial(process_query_data, base_model=args.base_model, response_length=args.task.response_length)
     )
@@ -530,10 +530,10 @@ def train(args: Args):
     else:
         untrained_model = untrained_model.to(device)
 
-    def repeat_generator(): # TODO: ideally we shuffle the dataloader as well
+    def repeat_generator():  # TODO: ideally we shuffle the dataloader as well
         while True:
-            for item in dataloader:
-                yield item
+            yield from dataloader
+
     iter_dataloader = iter(repeat_generator())
     generation_config = GenerationConfig(
         max_new_tokens=args.task.response_length,
