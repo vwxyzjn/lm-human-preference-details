@@ -1,3 +1,4 @@
+import functools
 import os
 import random
 import time
@@ -14,6 +15,7 @@ import torch.optim as optim
 import tyro
 from accelerate import Accelerator
 from accelerate.state import AcceleratorState
+from datasets import load_dataset
 from rich.console import Console
 from rich.pretty import pprint
 from rich.table import Table
@@ -76,10 +78,6 @@ class TaskHParams:
     # Query params
     query_length: int = 64
     query_dataset: str = "books"
-    query_prefix: str = ""
-    query_suffix: str = ""
-    start_text: Optional[str] = None
-    end_text: Optional[str] = None
 
     # Response params
     response_length: int = 24
@@ -338,51 +336,12 @@ class AutoModelForCausalLMWithRewardHead(nn.Module):
         self.reward_bias = torch.nn.Parameter(torch.tensor(0.0), requires_grad=True)
 
 
-# a pytorch dataset
-class MyDataset(IterableDataset):
-    def __init__(self, generator, tokenizer, query_length, seed, start_text=None, end_text=None):
-        self.generator = generator
-        self.tokenizer = tokenizer
-        self.query_length = query_length
-        self.start_text = start_text
-        self.end_text = end_text
-        self.seed = seed
-        token_to_index = tokenizer.get_vocab()
-        self.start_token = token_to_index[start_text] if self.start_text else None
-        self.end_token = token_to_index[end_text] if self.end_text else None
-
-    def __iter__(self):
-        for text in self.generator("train", self.seed, shuffle=True):
-            tokens = self.tokenizer.encode(text)
-            if self.start_token is not None:
-                try:
-                    first_index = tokens.index(self.start_token) + 1
-                    if first_index < len(tokens):
-                        tokens = tokens[first_index:]
-                except:
-                    continue
-            tokens = tokens[: self.query_length]
-            if self.end_token is not None:
-                try:
-                    last_index = len(tokens) - tokens[::-1].index(self.end_token)
-                    tokens = tokens[:last_index]
-                except:
-                    continue
-            output = self.tokenizer.pad(
-                {"input_ids": tokens},
-                padding="max_length",
-                max_length=self.query_length,
-                return_tensors="pt",
-                return_attention_mask=True,
-            )
-            yield output
-
-
-def right_padding_to_left_padding(query, pad_id):
-    # Convert from right padding to left padding.
+def right_padding_to_left_padding(tokens, pad_id):
+    """Convert from right padding to left padding."""
+    assert tokens.ndim == 2
     return torch.tensor(
-        [[pad_id] * (row == pad_id).sum() + [x for x in row if x != pad_id] for row in query],
-        device=query.device,
+        [[pad_id] * (row == pad_id).sum() + [x for x in row if x != pad_id] for row in tokens],
+        device=tokens.device,
     )
 
 
@@ -520,13 +479,20 @@ def train(args: Args):
         optimizer = AdamTensorFlowStyle(policy.parameters(), lr=args.ppo.lr, eps=args.ppo.eps)
     else:
         optimizer = optim.Adam(policy.parameters(), lr=args.ppo.lr, eps=args.ppo.eps)
-    dataset = MyDataset(
-        DATASET[args.task.query_dataset],
-        tokenizer,
-        args.task.query_length,
-        seed=local_seed,
-        start_text=args.task.start_text,
-        end_text=args.task.end_text,
+    dataset = load_dataset("bookcorpus", split="train")
+    dataset = dataset.shuffle(seed=local_seed)
+    def process_query_data(x, base_model: str, response_length: int): # added args so it's hashable
+        tokenizer = AutoTokenizer.from_pretrained(base_model)
+        tokenizer.add_special_tokens({"pad_token": "[PAD]"})
+        return {
+            "query_token": tokenizer(x["text"],
+            padding="max_length",
+            max_length=response_length,
+            truncation=True,
+            return_tensors="pt")["query_token"],
+        }
+    dataset.set_transform(
+        functools.partial(process_query_data, base_model=args.base_model, response_length=args.task.response_length)
     )
     dataloader = DataLoader(dataset, batch_size=args.ppo.local_batch_size)
     policy, optimizer, dataloader = accelerator.prepare(policy, optimizer, dataloader)
@@ -557,7 +523,11 @@ def train(args: Args):
     else:
         ref_policy = ref_policy.to(device)
         reward_model = reward_model.to(device)
-    iter_dataloader = iter(dataloader)
+    def repeat_generator(): # TODO: ideally we shuffle the dataloader as well
+        while True:
+            for item in dataloader:
+                yield item
+    iter_dataloader = iter(repeat_generator())
     kl_ctl = AdaptiveKLController(args.rewards.kl_coef, hparams=args.rewards.adaptive_kl)
     # WARNING: even with `max_new_tokens` and `min_new_tokens` set to the same value, the number of tokens generated
     # may not be the same. TODO: investigate further, we just want to generate a fixed number of tokens
@@ -586,8 +556,8 @@ def train(args: Args):
         optimizer.param_groups[0]["lr"] = lrnow
         data = next(iter_dataloader)
         with torch.no_grad():
-            queries = data["input_ids"].to(device)
-            queries = right_padding_to_left_padding(data["input_ids"], tokenizer.pad_token_id).to(device)
+            queries = data["query_token"].to(device)
+            queries = right_padding_to_left_padding(data["query_token"], tokenizer.pad_token_id).to(device)
             query_responses = generate(
                 accelerator.unwrap_model(policy).lm_backbone,
                 queries,
