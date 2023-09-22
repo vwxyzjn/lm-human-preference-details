@@ -503,7 +503,7 @@ def train(args: Args):
     dataset.set_transform(
         functools.partial(process_query_data, base_model=args.base_model, response_length=args.task.response_length)
     )
-    dataloader = DataLoader(normalization_dataset, batch_size=args.local_rollout_batch_size)
+    dataloader = DataLoader(dataset, batch_size=args.local_rollout_batch_size)
     reward_model, optimizer, dataloader = accelerator.prepare(reward_model, optimizer, normalization_dataloader)
     if args.deepspeed:
         import deepspeed
