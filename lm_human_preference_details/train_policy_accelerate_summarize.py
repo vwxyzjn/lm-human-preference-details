@@ -440,10 +440,7 @@ def forward(policy, query_responses, tokenizer):
     )
 
 
-# def train(args: Args):
-if __name__ == "__main__":
-    args = tyro.cli(Args)
-
+def train(args: Args):
     accelerator = Accelerator(gradient_accumulation_steps=args.ppo.gradient_accumulation_steps)
     args.ppo.world_size = accelerator.num_processes
     args.ppo.batch_size = int(args.ppo.local_batch_size * args.ppo.world_size)
@@ -516,7 +513,7 @@ if __name__ == "__main__":
         optimizer = AdamTensorFlowStyle(policy.parameters(), lr=args.ppo.lr, eps=args.ppo.eps)
     else:
         optimizer = optim.Adam(policy.parameters(), lr=args.ppo.lr, eps=args.ppo.eps)
-    dataset = load_dataset("bookcorpus", split="train")
+    dataset = load_dataset(args.task.query_dataset, split="train")
     dataset = dataset.shuffle(seed=local_seed)
 
     def process_query_data(x, base_model: str, response_length: int):  # added args so it's hashable

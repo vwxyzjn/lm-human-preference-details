@@ -94,7 +94,7 @@ class Args:
     """the name of the pretrained model to use"""
     deepspeed: bool = False
     """Whether to use deepspeed to train the model"""
-    label_dataset: str = "sentiment/offline_5k.json"
+    label_dataset: str = "openai/summarize_from_feedback"
     """the name of the dataset to use for labels in `https://huggingface.co/datasets/vwxyzjn/lm-human-preferences`"""
     local_batch_size: int = 4
     """per rank batch size"""
@@ -124,7 +124,7 @@ class Args:
     """Whether, before training, to normalize the rewards on the policy to the scales on the training buffer. (For comparisons, just use mean 0, var 1.)"""
     normalize_after: bool = True
     """Whether, after training, to normalize the rewards on the ref policy to mean 0, var 1 (so the KL coefficient always has the same meaning)."""
-    print_sample_output_freq: int = 10
+    print_sample_output_freq: int = 20
     """How often to print sample output"""
     save_path: str = "models/reward.pt"
     """Where to save the model"""
@@ -445,9 +445,7 @@ def normalize(
         print(f"after mean: {mean}, after std: {std}")
 
 
-# def train(args: Args):
-if __name__ == "__main__":
-    args = tyro.cli(Args)
+def train(args: Args):
     accelerator = Accelerator(
         kwargs_handlers=[
             DistributedDataParallelKwargs(
@@ -604,8 +602,8 @@ if __name__ == "__main__":
         )
 
     # `label` has keys `['sample0', 'query', 'best', 'sample3', 'sample1', 'sample2']`
-    label = load_dataset("openai/summarize_from_feedback", "comparisons", split="train")
-    test_label = load_dataset("openai/summarize_from_feedback", "comparisons", split="validation")
+    label = load_dataset(args.label_dataset, "comparisons", split="train")
+    test_label = load_dataset(args.label_dataset, "comparisons", split="validation")
     print("Num labels found in source:", len(label))
     print("training on", args.labels.num_train, "in batches of", args.local_batch_size)
 
