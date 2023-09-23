@@ -29,6 +29,7 @@ from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from transformers import AutoModelForCausalLM, AutoTokenizer, GenerationConfig
 
+from lm_human_preference_details.data import process_query
 
 @dataclass
 class AdaptiveKLParams:
@@ -75,7 +76,7 @@ class PpoHParams:
 class TaskHParams:
     # Query params
     query_length: int = 512
-    query_dataset: str = "tldr_3_filtered"
+    query_dataset: str = "vwxyzjn/summarize_from_feedback_tldr_3_filtered"
 
     query_format_str: Optional[str] = "SUBREDDIT: r/{subreddit}\n\nTITLE: {title}\n\nPOST: {post}\n\nTL;DR:"
     query_truncate_field: Optional[str] = "post"
@@ -447,6 +448,15 @@ def train(args: Args):
     args.ppo.minibatch_size = exact_div(args.ppo.batch_size, args.ppo.nminibatches)
     args.ppo.local_mini_batch_size = exact_div(args.ppo.local_batch_size, args.ppo.nminibatches)
     args.ppo.local_micro_batch_size = exact_div(args.ppo.local_mini_batch_size, args.ppo.gradient_accumulation_steps)
+    patch_h = TaskQueryHParams(
+        length=args.task.query_length,
+        dataset=args.task.query_dataset,
+        format_str=args.task.query_format_str,
+        truncate_field=args.task.query_truncate_field,
+        truncate_text=args.task.query_truncate_text,
+        padding=args.task.query_padding,
+        pad_side=args.task.query_pad_side,
+    )
     if args.ppo.whiten_rewards:
         assert (
             args.ppo.local_mini_batch_size >= 8
@@ -514,20 +524,15 @@ def train(args: Args):
     else:
         optimizer = optim.Adam(policy.parameters(), lr=args.ppo.lr, eps=args.ppo.eps)
     dataset = load_dataset(args.task.query_dataset, split="train")
-    dataset = dataset.shuffle(seed=local_seed)
 
-    def process_query_data(x, base_model: str, response_length: int):  # added args so it's hashable
-        tokenizer = AutoTokenizer.from_pretrained(base_model)
-        tokenizer.add_special_tokens({"pad_token": "[PAD]"})
+    def process_query_data(x):
         return {
-            "query_token": tokenizer(
-                x["text"], padding="max_length", max_length=response_length, truncation=True, return_tensors="pt"
-            )["input_ids"],
+            **process_query(x, encoder=tokenizer, hparams=patch_h),
         }
 
-    dataset.set_transform(
-        functools.partial(process_query_data, base_model=args.base_model, response_length=args.task.response_length)
-    )
+    dataset = dataset.map(process_query_data)
+    dataset = dataset.with_format("torch", columns=["query_token"])
+    dataset = dataset.shuffle(seed=local_seed)
     dataloader = DataLoader(dataset, batch_size=args.ppo.local_batch_size)
     policy, optimizer, dataloader = accelerator.prepare(policy, optimizer, dataloader)
     if args.deepspeed:
@@ -653,17 +658,17 @@ def train(args: Args):
             )
             scores = scores[:, :, 0].gather(1, last_response_indices.unsqueeze(1)).view(-1)
 
-            # # 3. filter response. Ensure that the sample contains truncate_token
-            # # responses not passing that filter will receive a low (fixed) score
-            # # only query humans on responses that pass that filter
-            # matches_token = postprocessed_responses[:, args.task.truncate_after :] == args.task.truncate_token
-            # filter_mask = torch.any(matches_token, dim=-1)
-            # scores = torch.where(
-            #     filter_mask,
-            #     scores,
-            #     torch.full_like(scores, args.task.penalty_reward_value),
-            # )
-            # del matches_token, filter_mask
+            # 3. filter response. Ensure that the sample contains truncate_token
+            # responses not passing that filter will receive a low (fixed) score
+            # only query humans on responses that pass that filter
+            matches_token = postprocessed_responses[:, args.task.truncate_after :] == args.task.truncate_token
+            filter_mask = torch.any(matches_token, dim=-1)
+            scores = torch.where(
+                filter_mask,
+                scores,
+                torch.full_like(scores, args.task.penalty_reward_value),
+            )
+            del matches_token, filter_mask
             torch.cuda.empty_cache()
 
             # 4. compute rewards

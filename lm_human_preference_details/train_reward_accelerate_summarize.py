@@ -124,7 +124,7 @@ class Args:
     """Whether, before training, to normalize the rewards on the policy to the scales on the training buffer. (For comparisons, just use mean 0, var 1.)"""
     normalize_after: bool = True
     """Whether, after training, to normalize the rewards on the ref policy to mean 0, var 1 (so the KL coefficient always has the same meaning)."""
-    print_sample_output_freq: int = 20
+    print_sample_output_freq: int = 60
     """How often to print sample output"""
     save_path: str = "models/reward.pt"
     """Where to save the model"""
@@ -685,7 +685,8 @@ def train(args: Args):
             with torch.no_grad():
                 # eval on test_label, some duplicate code (I don't want to make the training loop into a function...)
                 test_accuracies = []
-                len_labels = (len(test_label) // args.batch_size) * args.batch_size  # in case the last batch is not full
+                eval_len = 200 # len(test_label)
+                len_labels = (eval_len // args.batch_size) * args.batch_size  # in case the last batch is not full
                 new_all_inds = np.arange(len_labels)
                 for start in range(0, len_labels, args.batch_size):
                     end = start + args.batch_size
@@ -766,7 +767,11 @@ def train(args: Args):
                 )
                 if accelerator.is_main_process and args.track:
                     wandb.log({"query_responses": wandb.Table(dataframe=all_df)}, step=global_step)
-                print_rich_table(f"Sample Output at Step {global_step}", all_df[:4], console)
+                try:
+                    print_rich_table(f"Sample Output at Step {global_step}", all_df[:4], console)
+                except Exception as e:
+                    print(e)
+                    pass
                 del (
                     query_responses,
                     all_decode_queries,
