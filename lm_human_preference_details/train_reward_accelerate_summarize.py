@@ -45,7 +45,7 @@ class LabelHParams:
 class TaskHParams:
     # Query params
     query_length: int = 512
-    query_dataset: str = "tldr_3_filtered"
+    query_dataset: str = "vwxyzjn/summarize_from_feedback_tldr_3_filtered"
 
     query_format_str: Optional[str] = "SUBREDDIT: r/{subreddit}\n\nTITLE: {title}\n\nPOST: {post}\n\nTL;DR:"
     query_truncate_field: Optional[str] = "post"
@@ -527,7 +527,7 @@ def train(args: Args):
         optimizer = AdamTensorFlowStyle(reward_model.parameters(), lr=args.lr, eps=args.eps)
     else:
         optimizer = optim.Adam(reward_model.parameters(), lr=args.lr, eps=args.eps)
-    dataset = load_dataset("vwxyzjn/summarize_from_feedback_tldr_3_filtered", split="train")
+    dataset = load_dataset(args.task.query_dataset, split="train")
 
     def process_query_data(x):
         return {
@@ -685,7 +685,7 @@ def train(args: Args):
             with torch.no_grad():
                 # eval on test_label, some duplicate code (I don't want to make the training loop into a function...)
                 test_accuracies = []
-                eval_len = 200 # len(test_label)
+                eval_len = 200  # len(test_label)
                 len_labels = (eval_len // args.batch_size) * args.batch_size  # in case the last batch is not full
                 new_all_inds = np.arange(len_labels)
                 for start in range(0, len_labels, args.batch_size):
@@ -771,7 +771,6 @@ def train(args: Args):
                     print_rich_table(f"Sample Output at Step {global_step}", all_df[:4], console)
                 except Exception as e:
                     print(e)
-                    pass
                 del (
                     query_responses,
                     all_decode_queries,

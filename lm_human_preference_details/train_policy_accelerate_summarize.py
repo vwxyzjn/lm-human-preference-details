@@ -1,4 +1,3 @@
-import functools
 import os
 import random
 import time
@@ -30,6 +29,7 @@ from torch.utils.tensorboard import SummaryWriter
 from transformers import AutoModelForCausalLM, AutoTokenizer, GenerationConfig
 
 from lm_human_preference_details.data import process_query
+
 
 @dataclass
 class AdaptiveKLParams:
