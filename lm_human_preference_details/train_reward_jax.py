@@ -88,7 +88,7 @@ class Args:
     lr: float = 0.00005
     """the learning rate"""
     eps: float = 1e-5
-    """the epsilon for AdamW"""
+    """the epsilon for Adam"""
     local_rollout_batch_size: int = 512
     """per rank rollout batch size"""
     rollout_batch_size: tyro.conf.Suppress[int] = None
@@ -358,6 +358,7 @@ def create_initial_reward_state_and_models(init_key, args):
     optimizer = optax.MultiSteps(
         optax.inject_hyperparams(adam)(
             learning_rate=functools.partial(single_epoch_linear_schedule, args=args),
+            eps=args.eps,
         ),
         every_k_schedule=args.gradient_accumulation_steps,
     )
