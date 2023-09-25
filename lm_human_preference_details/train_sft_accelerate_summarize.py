@@ -8,12 +8,9 @@ from typing import List, Optional
 import numpy as np
 import pandas as pd
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
 import torch.optim as optim
 import tyro
 from accelerate import Accelerator
-from accelerate.state import AcceleratorState
 from datasets import load_dataset
 from rich.console import Console
 from rich.pretty import pprint
@@ -303,8 +300,6 @@ class AdamTensorFlowStyle(optim.Adam):
         return loss
 
 
-
-
 def right_padding_to_left_padding(tokens, pad_id):
     """Convert from right padding to left padding."""
     assert tokens.ndim == 2
@@ -340,7 +335,6 @@ def generate(lm_backbone, queries, tokenizer, generation_config):
     )
     # restore padding tokens
     return torch.cat((queries, output.sequences[:, context_length:]), dim=1)
-
 
 
 def forward(policy, query_responses, tokenizer):
@@ -420,9 +414,7 @@ if __name__ == "__main__":
     # we use the padding token manually but do not resize the token embedding of the model
     tokenizer.add_special_tokens({"pad_token": "[PAD]"})
     policy = AutoModelForCausalLM.from_pretrained(args.base_model, trust_remote_code=True)
-    policy.generation_config.eos_token_id = (
-        None  # disable `pad_token_id` and `eos_token_id` because we just want to
-    )
+    policy.generation_config.eos_token_id = None  # disable `pad_token_id` and `eos_token_id` because we just want to
     policy.generation_config.pad_token_id = None  # generate tokens without truncation / padding
     # IMPORTANT: Layer norm produces weird gradients, which affects Adam optimizer to impact all the parameters systematically
     # see https://github.com/pytorch/pytorch/issues/104857 for more details
@@ -488,7 +480,7 @@ if __name__ == "__main__":
             accelerator.backward(loss)
             optimizer.step()
             optimizer.zero_grad()
-        if (update - 1) %  args.ppo.gradient_accumulation_steps:
+        if (update - 1) % args.ppo.gradient_accumulation_steps:
             writer.add_scalar("loss", loss.item(), update)
         if (update - 1) % args.print_sample_output_freq * args.ppo.gradient_accumulation_steps == 0:
             with torch.no_grad():
@@ -500,7 +492,9 @@ if __name__ == "__main__":
                 try:
                     all_decode_test_queries = tokenizer.batch_decode(test_queries, skip_special_tokens=True)
                     all_decode_test_query_responses = tokenizer.batch_decode(generated_responses, skip_special_tokens=True)
-                    all_decode_test_reference_responses = tokenizer.batch_decode(test_reference_responses, skip_special_tokens=True)
+                    all_decode_test_reference_responses = tokenizer.batch_decode(
+                        test_reference_responses, skip_special_tokens=True
+                    )
                     all_decode_test_responses = [
                         x[len(y) :] for x, y in zip(all_decode_test_query_responses, all_decode_test_queries)
                     ]
@@ -517,8 +511,6 @@ if __name__ == "__main__":
                     print_rich_table("stuff", all_df[:4], console)
                 except Exception as e:
                     print(e)
-
-            
 
     # save model
     if accelerator.is_main_process and args.save_path:
