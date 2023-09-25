@@ -29,44 +29,19 @@ from lm_human_preference_details.data import process_query
 
 
 @dataclass
-class AdaptiveKLParams:
-    target: float = 6.0
-    horizon: int = 10000  # in episodes
-
-
-@dataclass
-class RewardHParams:
-    kl_coef: float = 0.15
-    adaptive_kl: Optional[AdaptiveKLParams] = field(default_factory=AdaptiveKLParams)
-    trained_model: Optional[str] = "models/reward.pt"
-    label_dataset: tyro.conf.Suppress[Optional[str]] = None
-
-
-@dataclass
-class PpoHParams:
-    total_episodes: int = 1000000
-    local_batch_size: int = 8
-    local_mini_batch_size: tyro.conf.Suppress[int] = None
-    batch_size: tyro.conf.Suppress[int] = None
-    mini_batch_size: tyro.conf.Suppress[int] = None
+class SFTHParams:
     gradient_accumulation_steps: int = 32
-    """gradient accumulation steps"""
-    local_micro_batch_size: tyro.conf.Suppress[int] = None
-    """per rank micro batch size"""
-    world_size: tyro.conf.Suppress[int] = None
-    batch_size: tyro.conf.Suppress[int] = None
-    minibatch_size: tyro.conf.Suppress[int] = None
-    num_updates: tyro.conf.Suppress[int] = None
-    nminibatches: int = 1
-    noptepochs: int = 4
+    local_micro_batch_size: int = 8
+    noptepochs: int = 1
     lr: float = 0.00001
     eps: float = 1e-5
-    vf_coef: float = 0.1
-    cliprange: float = 0.2
-    cliprange_value: float = 0.2
-    gamma: float = 1
-    lam: float = 0.95
-    whiten_rewards: bool = True
+    total_episodes: tyro.conf.Suppress[int] = None
+    local_batch_size:tyro.conf.Suppress[int] = None
+    batch_size: tyro.conf.Suppress[int] = None
+    mini_batch_size: tyro.conf.Suppress[int] = None
+    world_size: tyro.conf.Suppress[int] = None
+    batch_size: tyro.conf.Suppress[int] = None
+    num_updates: tyro.conf.Suppress[int] = None
 
 
 @dataclass
@@ -138,8 +113,7 @@ class Args:
     use_tensorflow_adam: bool = True
     """Whether to use tensorflow-style Adam optimizer instead of PyTorch's"""
     task: TaskHParams = field(default_factory=TaskHParams)
-    rewards: RewardHParams = field(default_factory=RewardHParams)
-    ppo: PpoHParams = field(default_factory=PpoHParams)
+    sft: SFTHParams = field(default_factory=SFTHParams)
 
 
 def print_rich_table(title: str, df: pd.DataFrame, console: Console) -> Table:
@@ -350,15 +324,11 @@ def forward(policy, query_responses, tokenizer):
     )
 
 
-# def train(args: Args):
-if __name__ == "__main__":
-    args = tyro.cli(Args)
-    accelerator = Accelerator(gradient_accumulation_steps=args.ppo.gradient_accumulation_steps)
-    args.ppo.world_size = accelerator.num_processes
-    args.ppo.batch_size = int(args.ppo.local_batch_size * args.ppo.world_size)
-    # args.ppo.minibatch_size = exact_div(args.ppo.batch_size, args.ppo.nminibatches)
-    # args.ppo.local_mini_batch_size = exact_div(args.ppo.local_batch_size, args.ppo.nminibatches)
-    # args.ppo.local_micro_batch_size = exact_div(args.ppo.local_mini_batch_size, args.ppo.gradient_accumulation_steps)
+def train(args: Args):
+    accelerator = Accelerator(gradient_accumulation_steps=args.sft.gradient_accumulation_steps)
+    args.sft.world_size = accelerator.num_processes
+    args.sft.local_batch_size = args.sft.local_micro_batch_size * args.sft.gradient_accumulation_steps
+    args.sft.batch_size = int(args.sft.local_batch_size * args.sft.world_size)
     patch_h = TaskQueryHParams(
         length=args.task.query_length,
         dataset=args.task.query_dataset,
@@ -368,13 +338,10 @@ if __name__ == "__main__":
         padding=args.task.query_padding,
         pad_side=args.task.query_pad_side,
     )
-    # if args.ppo.whiten_rewards:
-    #     assert (
-    #         args.ppo.local_mini_batch_size >= 8
-    #     ), f"Per-rank minibatch size {args.ppo.local_mini_batch_size} is insufficient for whitening"
-    # `per_rank_rollout_batch_size` is our `args.ppo.local_batch_size`
-    # `per_rank_minibatch_size` is our `args.ppo.local_mini_batch_size`
-    args.ppo.num_updates = args.ppo.total_episodes // args.ppo.batch_size
+    dataset = load_dataset(args.task.query_dataset, split="train")
+    test_dataset = load_dataset(args.task.query_dataset, split="test")
+    args.sft.total_episodes = len(dataset)
+    args.sft.num_updates = args.sft.total_episodes // args.sft.batch_size
 
     console = Console(force_terminal=True)
     run_name = f"{args.exp_name}__{args.seed}__{int(time.time())}"
@@ -419,11 +386,9 @@ if __name__ == "__main__":
     # IMPORTANT: Layer norm produces weird gradients, which affects Adam optimizer to impact all the parameters systematically
     # see https://github.com/pytorch/pytorch/issues/104857 for more details
     if args.use_tensorflow_adam:
-        optimizer = AdamTensorFlowStyle(policy.parameters(), lr=args.ppo.lr, eps=args.ppo.eps)
+        optimizer = AdamTensorFlowStyle(policy.parameters(), lr=args.sft.lr, eps=args.sft.eps)
     else:
-        optimizer = optim.Adam(policy.parameters(), lr=args.ppo.lr, eps=args.ppo.eps)
-    dataset = load_dataset(args.task.query_dataset, split="train")
-    test_dataset = load_dataset(args.task.query_dataset, split="test")
+        optimizer = optim.Adam(policy.parameters(), lr=args.sft.lr, eps=args.sft.eps)
 
     def process_query_data1(x):
         return {
@@ -439,7 +404,7 @@ if __name__ == "__main__":
     test_dataset = test_dataset.map(process_query_data1)
     test_dataset = test_dataset.with_format("torch", columns=["query_token", "reference_response"])
     test_dataset = test_dataset.shuffle(seed=local_seed)
-    dataloader = DataLoader(dataset, batch_size=args.ppo.local_batch_size)
+    dataloader = DataLoader(dataset, batch_size=args.sft.local_batch_size)
     policy, optimizer, dataloader = accelerator.prepare(policy, optimizer, dataloader)
     iter_dataloader = iter(dataloader)
     # WARNING: even with `max_new_tokens` and `min_new_tokens` set to the same value, the number of tokens generated
@@ -455,19 +420,15 @@ if __name__ == "__main__":
 
     print("===training policy===")
     global_step = 0
-    stats_shape = (args.ppo.noptepochs, args.ppo.nminibatches, args.ppo.gradient_accumulation_steps)
-    approxkls_stats = torch.zeros(stats_shape, device=device)
-    clipfracs_stats = torch.zeros(stats_shape, device=device)
-    pg_losses_stats = torch.zeros(stats_shape, device=device)
-    vf_losses_stats = torch.zeros(stats_shape, device=device)
-    vf_clipfrac_stats = torch.zeros(stats_shape, device=device)
-    entropies_stats = torch.zeros(stats_shape, device=device)
+    loss_stats = torch.zeros(args.sft.gradient_accumulation_steps, device=device)
     test_data = test_dataset[0:10]
     test_data = {k: v.to(device) for k, v in test_data.items()}
-    for update in range(1, args.ppo.num_updates + 1):
-        global_step += 1 * args.ppo.batch_size
-        frac = 1.0 - (update - 1.0) / args.ppo.num_updates
-        lrnow = frac * args.ppo.lr
+    gradient_accumulation_idx = 0
+    for update in range(1, args.sft.num_updates + 1):
+        print(update, global_step)
+        global_step += 1 * args.sft.batch_size
+        frac = 1.0 - (update - 1.0) / args.sft.num_updates
+        lrnow = frac * args.sft.lr
         optimizer.param_groups[0]["lr"] = lrnow
         data = next(iter_dataloader)
         queries = data["query_token"].to(device)
@@ -480,9 +441,12 @@ if __name__ == "__main__":
             accelerator.backward(loss)
             optimizer.step()
             optimizer.zero_grad()
-        if (update - 1) % args.ppo.gradient_accumulation_steps:
-            writer.add_scalar("loss", loss.item(), update)
-        if (update - 1) % args.print_sample_output_freq * args.ppo.gradient_accumulation_steps == 0:
+        loss_stats[gradient_accumulation_idx] = loss
+        gradient_accumulation_idx = (gradient_accumulation_idx + 1) % args.sft.gradient_accumulation_steps
+        if (update - 1) % args.sft.gradient_accumulation_steps:
+            writer.add_scalar("loss", accelerator.gather(loss_stats).mean().item(), update)
+            writer.add_scalar("lr", lrnow, update)
+        if (update - 1) % args.print_sample_output_freq * args.sft.gradient_accumulation_steps == 0:
             with torch.no_grad():
                 test_queries = test_data["query_token"]
                 test_reference_responses = test_data["reference_response"]
@@ -508,7 +472,7 @@ if __name__ == "__main__":
                     )
                     if accelerator.is_main_process and args.track:
                         wandb.log({"query_responses": wandb.Table(dataframe=all_df)}, step=update)
-                    print_rich_table("stuff", all_df[:4], console)
+                    print_rich_table(f"Sample Output at Step {update}", all_df[:4], console)
                 except Exception as e:
                     print(e)
 
@@ -520,9 +484,8 @@ if __name__ == "__main__":
         if args.upload_model:
             repo_name = f"{args.exp_name}__{args.rewards.label_dataset}__seed{args.seed}__{int(time.time())}"
             repo_id = f"{args.hf_entity}/{repo_name}" if args.hf_entity else repo_name
-            policy.lm_backbone.save_pretrained(repo_id, safe_serialization=True, push_to_hub=True)
+            policy.save_pretrained(repo_id, safe_serialization=True, push_to_hub=True)
             tokenizer.save_pretrained(repo_id, push_to_hub=True)
-
 
 if __name__ == "__main__":
     args = tyro.cli(Args)
