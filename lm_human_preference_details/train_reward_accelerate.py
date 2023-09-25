@@ -86,7 +86,7 @@ class Args:
     lr: float = 0.00005
     """the learning rate"""
     eps: float = 1e-5
-    """the epsilon for AdamW"""
+    """the epsilon for Adam"""
     local_rollout_batch_size: int = 512
     """per rank rollout batch size"""
     rollout_batch_size: tyro.conf.Suppress[int] = None
