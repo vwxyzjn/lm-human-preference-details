@@ -633,6 +633,7 @@ def train(args: Args):
     optimizer = optax.MultiSteps(
         optax.inject_hyperparams(adam)(
             learning_rate=functools.partial(linear_schedule, args=args),
+            eps=args.ppo.eps,
         ),
         every_k_schedule=args.ppo.gradient_accumulation_steps,
     )
