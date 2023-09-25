@@ -406,8 +406,9 @@ def normalize(
         for _ in range(n_batches):
             data = next(iter_dataloader)
             queries = data["query_token"].to(device)
-            queries = right_padding_to_left_padding(data["query_token"], args.pad_token_id).to(device)
-            query_responses = generate(lm_backbone, queries, args, generation_config)
+            reference_response = data["reference_response"].to(device)
+            query_responses = torch.cat((queries, reference_response), dim=1)
+            query_responses = right_padding_to_left_padding(query_responses, args.pad_token_id).to(device)
             sample_queries_responses.append(query_responses)
 
         # compute reward statistics
@@ -433,8 +434,9 @@ def normalize(
         for _ in range(n_batches):
             data = next(iter_dataloader)
             queries = data["query_token"].to(device)
-            queries = right_padding_to_left_padding(data["query_token"], args.pad_token_id).to(device)
-            query_responses = generate(lm_backbone, queries, args, generation_config)
+            reference_response = data["reference_response"].to(device)
+            query_responses = torch.cat((queries, reference_response), dim=1)
+            query_responses = right_padding_to_left_padding(query_responses, args.pad_token_id).to(device)
             sample_queries_responses.append(query_responses)
         rewards = []
         for query_responses in sample_queries_responses:
@@ -532,10 +534,13 @@ def train(args: Args):
     def process_query_data(x):
         return {
             **process_query(x, encoder=tokenizer, hparams=patch_h),
+            "reference_response": tokenizer.encode(
+                x["summary"], padding="max_length", max_length=args.task.response_length, truncation=True
+            ),
         }
 
     dataset = dataset.map(process_query_data)
-    dataset = dataset.with_format("torch", columns=["query_token"])
+    dataset = dataset.with_format("torch", columns=["query_token", "reference_response"])
     dataset = dataset.shuffle(seed=local_seed)
     dataloader = DataLoader(dataset, batch_size=args.local_rollout_batch_size)
     reward_model, optimizer, dataloader = accelerator.prepare(reward_model, optimizer, dataloader)

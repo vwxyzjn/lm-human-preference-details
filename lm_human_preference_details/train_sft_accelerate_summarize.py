@@ -30,10 +30,10 @@ from lm_human_preference_details.data import process_query
 
 @dataclass
 class SFTHParams:
-    gradient_accumulation_steps: int = 32
+    gradient_accumulation_steps: int = 2
     local_micro_batch_size: int = 8
     noptepochs: int = 1
-    lr: float = 0.00001
+    lr: float = 6.35e-5
     eps: float = 1e-5
     total_episodes: tyro.conf.Suppress[int] = None
     local_batch_size:tyro.conf.Suppress[int] = None
@@ -106,7 +106,7 @@ class Args:
     """the name of the pretrained model to use"""
     deepspeed: bool = False
     """Whether to use deepspeed to train the model"""
-    print_sample_output_freq: int = 40
+    print_sample_output_freq: int = 80
     """How often to print sample output"""
     save_path: str = "models/policy.pt"
     """Where to save the model"""
