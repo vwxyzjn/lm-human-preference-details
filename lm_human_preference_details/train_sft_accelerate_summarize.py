@@ -390,7 +390,7 @@ def train(args: Args):
     else:
         optimizer = optim.Adam(policy.parameters(), lr=args.sft.lr, eps=args.sft.eps)
 
-    def process_query_data1(x):
+    def process_query_data(x):
         return {
             **process_query(x, encoder=tokenizer, hparams=patch_h),
             "reference_response": tokenizer.encode(
@@ -398,10 +398,10 @@ def train(args: Args):
             ),
         }
 
-    dataset = dataset.map(process_query_data1)
+    dataset = dataset.map(process_query_data)
     dataset = dataset.with_format("torch", columns=["query_token", "reference_response"])
     dataset = dataset.shuffle(seed=local_seed)
-    test_dataset = test_dataset.map(process_query_data1)
+    test_dataset = test_dataset.map(process_query_data)
     test_dataset = test_dataset.with_format("torch", columns=["query_token", "reference_response"])
     test_dataset = test_dataset.shuffle(seed=local_seed)
     dataloader = DataLoader(dataset, batch_size=args.sft.local_batch_size)
