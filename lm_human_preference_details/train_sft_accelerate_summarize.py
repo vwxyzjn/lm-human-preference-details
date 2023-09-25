@@ -48,11 +48,11 @@ class RewardHParams:
 @dataclass
 class PpoHParams:
     total_episodes: int = 1000000
-    local_batch_size: int = 64
+    local_batch_size: int = 8
     local_mini_batch_size: tyro.conf.Suppress[int] = None
     batch_size: tyro.conf.Suppress[int] = None
     mini_batch_size: tyro.conf.Suppress[int] = None
-    gradient_accumulation_steps: int = 1
+    gradient_accumulation_steps: int = 32
     """gradient accumulation steps"""
     local_micro_batch_size: tyro.conf.Suppress[int] = None
     """per rank micro batch size"""
@@ -134,7 +134,7 @@ class Args:
     """the name of the pretrained model to use"""
     deepspeed: bool = False
     """Whether to use deepspeed to train the model"""
-    print_sample_output_freq: int = 10
+    print_sample_output_freq: int = 40
     """How often to print sample output"""
     save_path: str = "models/policy.pt"
     """Where to save the model"""
@@ -362,9 +362,9 @@ if __name__ == "__main__":
     accelerator = Accelerator(gradient_accumulation_steps=args.ppo.gradient_accumulation_steps)
     args.ppo.world_size = accelerator.num_processes
     args.ppo.batch_size = int(args.ppo.local_batch_size * args.ppo.world_size)
-    args.ppo.minibatch_size = exact_div(args.ppo.batch_size, args.ppo.nminibatches)
-    args.ppo.local_mini_batch_size = exact_div(args.ppo.local_batch_size, args.ppo.nminibatches)
-    args.ppo.local_micro_batch_size = exact_div(args.ppo.local_mini_batch_size, args.ppo.gradient_accumulation_steps)
+    # args.ppo.minibatch_size = exact_div(args.ppo.batch_size, args.ppo.nminibatches)
+    # args.ppo.local_mini_batch_size = exact_div(args.ppo.local_batch_size, args.ppo.nminibatches)
+    # args.ppo.local_micro_batch_size = exact_div(args.ppo.local_mini_batch_size, args.ppo.gradient_accumulation_steps)
     patch_h = TaskQueryHParams(
         length=args.task.query_length,
         dataset=args.task.query_dataset,
@@ -374,10 +374,10 @@ if __name__ == "__main__":
         padding=args.task.query_padding,
         pad_side=args.task.query_pad_side,
     )
-    if args.ppo.whiten_rewards:
-        assert (
-            args.ppo.local_mini_batch_size >= 8
-        ), f"Per-rank minibatch size {args.ppo.local_mini_batch_size} is insufficient for whitening"
+    # if args.ppo.whiten_rewards:
+    #     assert (
+    #         args.ppo.local_mini_batch_size >= 8
+    #     ), f"Per-rank minibatch size {args.ppo.local_mini_batch_size} is insufficient for whitening"
     # `per_rank_rollout_batch_size` is our `args.ppo.local_batch_size`
     # `per_rank_minibatch_size` is our `args.ppo.local_mini_batch_size`
     args.ppo.num_updates = args.ppo.total_episodes // args.ppo.batch_size
@@ -444,6 +444,9 @@ if __name__ == "__main__":
     dataset = dataset.map(process_query_data1)
     dataset = dataset.with_format("torch", columns=["query_token", "reference_response"])
     dataset = dataset.shuffle(seed=local_seed)
+    test_dataset = test_dataset.map(process_query_data1)
+    test_dataset = test_dataset.with_format("torch", columns=["query_token", "reference_response"])
+    test_dataset = test_dataset.shuffle(seed=local_seed)
     dataloader = DataLoader(dataset, batch_size=args.ppo.local_batch_size)
     policy, optimizer, dataloader = accelerator.prepare(policy, optimizer, dataloader)
     iter_dataloader = iter(dataloader)
@@ -467,24 +470,55 @@ if __name__ == "__main__":
     vf_losses_stats = torch.zeros(stats_shape, device=device)
     vf_clipfrac_stats = torch.zeros(stats_shape, device=device)
     entropies_stats = torch.zeros(stats_shape, device=device)
+    test_data = test_dataset[0:10]
+    test_data = {k: v.to(device) for k, v in test_data.items()}
     for update in range(1, args.ppo.num_updates + 1):
         global_step += 1 * args.ppo.batch_size
         frac = 1.0 - (update - 1.0) / args.ppo.num_updates
         lrnow = frac * args.ppo.lr
         optimizer.param_groups[0]["lr"] = lrnow
         data = next(iter_dataloader)
-        with torch.no_grad():
-            queries = data["query_token"].to(device)
-            reference_responses = data["reference_response"].to(device)
-            query_responses = torch.cat((queries, reference_responses), dim=1)
-            query_responses = right_padding_to_left_padding(query_responses, tokenizer.pad_token_id).to(device)
-            with accelerator.accumulate(policy):
-                output = forward(policy, query_responses, tokenizer)
-                loss = output.loss
-                accelerator.backward(loss)
-                optimizer.step()
-                optimizer.zero_grad()
+        queries = data["query_token"].to(device)
+        reference_responses = data["reference_response"].to(device)
+        query_responses = torch.cat((queries, reference_responses), dim=1)
+        query_responses = right_padding_to_left_padding(query_responses, tokenizer.pad_token_id).to(device)
+        with accelerator.accumulate(policy):
+            output = forward(policy, query_responses, tokenizer)
+            loss = output.loss
+            accelerator.backward(loss)
+            optimizer.step()
+            optimizer.zero_grad()
+        if (update - 1) %  args.ppo.gradient_accumulation_steps:
             writer.add_scalar("loss", loss.item(), update)
+        if (update - 1) % args.print_sample_output_freq * args.ppo.gradient_accumulation_steps == 0:
+            with torch.no_grad():
+                test_queries = test_data["query_token"]
+                test_reference_responses = test_data["reference_response"]
+                test_queries = right_padding_to_left_padding(test_queries, tokenizer.pad_token_id)
+                generated_responses = generate(policy, test_queries, tokenizer, generation_config)
+
+                try:
+                    all_decode_test_queries = tokenizer.batch_decode(test_queries, skip_special_tokens=True)
+                    all_decode_test_query_responses = tokenizer.batch_decode(generated_responses, skip_special_tokens=True)
+                    all_decode_test_reference_responses = tokenizer.batch_decode(test_reference_responses, skip_special_tokens=True)
+                    all_decode_test_responses = [
+                        x[len(y) :] for x, y in zip(all_decode_test_query_responses, all_decode_test_queries)
+                    ]
+
+                    all_df = pd.DataFrame(
+                        {
+                            "query": all_decode_test_queries,
+                            "response": all_decode_test_responses,
+                            "reference": all_decode_test_reference_responses,
+                        }
+                    )
+                    if accelerator.is_main_process and args.track:
+                        wandb.log({"query_responses": wandb.Table(dataframe=all_df)}, step=update)
+                    print_rich_table("stuff", all_df[:4], console)
+                except Exception as e:
+                    print(e)
+
+            
 
     # save model
     if accelerator.is_main_process and args.save_path:
