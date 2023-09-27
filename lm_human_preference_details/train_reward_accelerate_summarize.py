@@ -124,7 +124,7 @@ class Args:
     """Whether, before training, to normalize the rewards on the policy to the scales on the training buffer. (For comparisons, just use mean 0, var 1.)"""
     normalize_after: bool = True
     """Whether, after training, to normalize the rewards on the ref policy to mean 0, var 1 (so the KL coefficient always has the same meaning)."""
-    print_sample_output_freq: int = 60
+    print_sample_output_freq: int = 120
     """How often to print sample output"""
     save_path: str = "models/reward.pt"
     """Where to save the model"""
@@ -393,23 +393,24 @@ def normalize(
     device,
     lm_backbone,
     reward_model,
-    iter_dataloader,
-    generation_config,
+    dataloader,
+    validation_dataloader,
 ):
+    idx = 0
     with torch.no_grad():
         # reset reward scales
         accelerator.unwrap_model(reward_model).reward_gain.data.fill_(1.0)
         accelerator.unwrap_model(reward_model).reward_bias.data.fill_(0.0)
         # number of minibatches for computing the normalization statistics
-        n_batches = ceil_div(args.local_normalize_samples, args.local_rollout_batch_size)
         sample_queries_responses = []
-        for _ in range(n_batches):
-            data = next(iter_dataloader)
+        for data in dataloader:
+            idx += len(data["query_token"])
             queries = data["query_token"].to(device)
             reference_response = data["reference_response"].to(device)
             query_responses = torch.cat((queries, reference_response), dim=1)
             query_responses = right_padding_to_left_padding(query_responses, args.pad_token_id).to(device)
             sample_queries_responses.append(query_responses)
+        accelerator.print(f"====number of samples per device: {idx}")
 
         # compute reward statistics
         rewards = []
@@ -429,10 +430,8 @@ def normalize(
         accelerator.unwrap_model(reward_model).reward_bias.data = bias
 
         # validate normalization
-        n_batches = ceil_div(args.local_normalize_samples, args.local_rollout_batch_size)
         sample_queries_responses = []
-        for _ in range(n_batches):
-            data = next(iter_dataloader)
+        for data in validation_dataloader:
             queries = data["query_token"].to(device)
             reference_response = data["reference_response"].to(device)
             query_responses = torch.cat((queries, reference_response), dim=1)
@@ -530,6 +529,7 @@ def train(args: Args):
     else:
         optimizer = optim.Adam(reward_model.parameters(), lr=args.lr, eps=args.eps)
     dataset = load_dataset(args.task.query_dataset, split="train")
+    validation_dataset = load_dataset(args.task.query_dataset, split="validation")
 
     def process_query_data(x):
         return {
@@ -543,6 +543,10 @@ def train(args: Args):
     dataset = dataset.with_format("torch", columns=["query_token", "reference_response"])
     dataset = dataset.shuffle(seed=local_seed)
     dataloader = DataLoader(dataset, batch_size=args.local_rollout_batch_size)
+    validation_dataset = validation_dataset.map(process_query_data)
+    validation_dataset = validation_dataset.with_format("torch", columns=["query_token", "reference_response"])
+    validation_dataset = validation_dataset.shuffle(seed=local_seed)
+    validation_dataloader = DataLoader(validation_dataset, batch_size=args.local_rollout_batch_size)
     reward_model, optimizer, dataloader = accelerator.prepare(reward_model, optimizer, dataloader)
     if args.deepspeed:
         import deepspeed
@@ -569,11 +573,7 @@ def train(args: Args):
     else:
         untrained_model = untrained_model.to(device)
 
-    def repeat_generator():  # TODO: ideally we shuffle the dataloader as well
-        while True:
-            yield from dataloader
-
-    iter_dataloader = iter(repeat_generator())
+    iter_dataloader = iter(dataloader)
     generation_config = GenerationConfig(
         max_new_tokens=args.task.response_length,
         min_new_tokens=args.task.response_length,
@@ -597,8 +597,8 @@ def train(args: Args):
             device,
             untrained_model.lm_backbone,
             reward_model,
-            iter_dataloader,
-            generation_config,
+            dataloader,
+            validation_dataloader,
         )
         print(
             "after normalization. "
@@ -608,9 +608,9 @@ def train(args: Args):
 
     # `label` has keys `['sample0', 'query', 'best', 'sample3', 'sample1', 'sample2']`
     label = load_dataset(args.label_dataset, "comparisons", split="train")
-    test_label = load_dataset(args.label_dataset, "comparisons", split="validation")
-    print("Num labels found in source:", len(label))
-    print("training on", args.labels.num_train, "in batches of", args.local_batch_size)
+    validation_label = load_dataset(args.label_dataset, "comparisons", split="validation")
+    accelerator.print("Num labels found in source:", len(label))
+    accelerator.print("training on", args.labels.num_train, "in batches of", args.local_batch_size)
 
     def process_response_data(x):
         return {
@@ -624,10 +624,10 @@ def train(args: Args):
         }
 
     label = label.map(process_response_data)
-    test_label = test_label.map(process_response_data)
+    validation_label = validation_label.map(process_response_data)
     #  tokenizer.encode(label[0]["summaries"][0]["text"])
 
-    print("===training reward model===")
+    accelerator.print("===training reward model===")
     all_inds = np.random.permutation(args.labels.num_train)
     # ensure that all processes have the same shuffled indices
     all_inds = broadcast(torch.tensor(all_inds, device=device), 0)
@@ -684,13 +684,13 @@ def train(args: Args):
         writer.add_scalar("train/loss", accelerator.gather(losses).mean().item(), global_step)
         writer.add_scalar("train/accuracy", train_accuracy, global_step)
         writer.add_scalar("train/lr", lr, global_step)
-        print("train/accuracy", train_accuracy)
+        accelerator.print("train/accuracy", train_accuracy)
 
         if args.print_sample_output_freq > 0 and global_step % args.print_sample_output_freq == 0:
             with torch.no_grad():
-                # eval on test_label, some duplicate code (I don't want to make the training loop into a function...)
+                # eval on validation_label, some duplicate code (I don't want to make the training loop into a function...)
                 test_accuracies = []
-                eval_len = 200  # len(test_label)
+                eval_len = len(validation_label)
                 len_labels = (eval_len // args.batch_size) * args.batch_size  # in case the last batch is not full
                 new_all_inds = np.arange(len_labels)
                 for start in range(0, len_labels, args.batch_size):
@@ -700,7 +700,7 @@ def train(args: Args):
                     for micro_batch_start in range(0, args.local_batch_size, args.local_micro_batch_size):
                         micro_batch_end = micro_batch_start + args.local_micro_batch_size
                         micro_batch_inds = b_inds[micro_batch_start:micro_batch_end]
-                        mb_data = label[micro_batch_inds]
+                        mb_data = validation_label[micro_batch_inds]
                         mb_query = torch.from_numpy(np.stack(mb_data["query_token"])).to(device)
                         mb_best = torch.from_numpy(np.stack(mb_data["choice"])).to(device)
                         mb_responses = [
@@ -726,8 +726,7 @@ def train(args: Args):
                         test_accuracies.append(accuracy)
                 test_accuracy = accelerator.gather(torch.stack(test_accuracies).mean()).mean().item()
                 writer.add_scalar("test/accuracy", test_accuracy, global_step)
-                if accelerator.is_main_process:
-                    print("test/accuracy", test_accuracy, global_step)
+                accelerator.print("test/accuracy", test_accuracy, global_step)
 
                 # the part below is testing out some generations and KLs, not presented in the original code
                 data = next(iter_dataloader)
@@ -801,8 +800,8 @@ def train(args: Args):
             device,
             untrained_model.lm_backbone,
             reward_model,
-            iter_dataloader,
-            generation_config,
+            dataloader,
+            validation_dataloader,
         )
         print(
             "after normalization. "

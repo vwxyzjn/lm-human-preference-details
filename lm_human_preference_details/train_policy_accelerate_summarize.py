@@ -40,6 +40,7 @@ class AdaptiveKLParams:
 @dataclass
 class RewardHParams:
     kl_coef: float = 0.15
+    use_adaptive_kl: bool = True
     adaptive_kl: Optional[AdaptiveKLParams] = field(default_factory=AdaptiveKLParams)
     trained_model: Optional[str] = "models/reward.pt"
     label_dataset: tyro.conf.Suppress[Optional[str]] = None
@@ -136,6 +137,8 @@ class Args:
     """Whether to use deepspeed to train the model"""
     print_sample_output_freq: int = 10
     """How often to print sample output"""
+    sft_model_path: str = "models/sft_policy.pt"
+    """Where to load the SFT model"""
     save_path: str = "models/policy.pt"
     """Where to save the model"""
     use_tensorflow_adam: bool = True
@@ -513,6 +516,10 @@ def train(args: Args):
         AutoModelForCausalLM.from_pretrained(args.base_model, trust_remote_code=True)
     )
     policy = AutoModelForCausalLMWithScalarHead(AutoModelForCausalLM.from_pretrained(args.base_model, trust_remote_code=True))
+    if args.sft_model_path:
+        policy.lm_backbone.load_state_dict(torch.load(args.sft_model_path, map_location=device))
+        ref_policy.lm_backbone.load_state_dict(torch.load(args.sft_model_path, map_location=device))
+        print(f"loaded pretrained policy from {args.sft_model_path}")
     policy.lm_backbone.generation_config.eos_token_id = (
         None  # disable `pad_token_id` and `eos_token_id` because we just want to
     )
@@ -574,7 +581,7 @@ def train(args: Args):
     generation_config = GenerationConfig(
         max_new_tokens=args.task.response_length,
         min_new_tokens=args.task.response_length,
-        temperature=args.task.temperature,
+        temperature=(args.task.temperature + 1e-7),
         top_k=0.0,
         top_p=1.0,
         do_sample=True,
@@ -610,7 +617,7 @@ def train(args: Args):
             output, full_values = forward(policy, query_responses, tokenizer)
             values = full_values[:, context_length - 1 : -1].squeeze(-1)
             logits = output.logits[:, context_length - 1 : -1]
-            logits /= args.task.temperature
+            logits /= (args.task.temperature + 1e-7)
             all_logprobs = F.log_softmax(logits, dim=-1)
             logprobs = torch.gather(all_logprobs, 2, responses.unsqueeze(-1)).squeeze(-1)
             del output, logits, all_logprobs
@@ -618,7 +625,7 @@ def train(args: Args):
 
             ref_output, _ = forward(ref_policy, query_responses, tokenizer)
             ref_logits = ref_output.logits[:, context_length - 1 : -1]
-            ref_logits /= args.task.temperature
+            ref_logits /= (args.task.temperature + 1e-7)
             ref_all_logprobs = F.log_softmax(ref_logits, dim=-1)
             ref_logprobs = torch.gather(ref_all_logprobs, 2, responses.unsqueeze(-1)).squeeze(-1)
             del ref_output, ref_logits, ref_all_logprobs
@@ -752,7 +759,7 @@ def train(args: Args):
 
                         output, vpred_temp = forward(policy, mb_query_responses, tokenizer)
                         logits = output.logits[:, context_length - 1 : -1]
-                        logits /= args.task.temperature
+                        logits /= (args.task.temperature + 1e-7)
                         new_all_logprobs = F.log_softmax(logits, dim=-1)
                         new_logprobs = torch.gather(new_all_logprobs, 2, mb_responses.unsqueeze(-1)).squeeze(-1)
                         vpred = vpred_temp[:, context_length - 1 : -1].squeeze(-1)
@@ -842,7 +849,8 @@ def train(args: Args):
             writer.add_scalar("ppo/val/num_eos_tokens", (responses == tokenizer.eos_token_id).sum().item(), update)
             writer.add_scalar("ppo/lr", lrnow, update)
             writer.add_scalar("ppo/episode", global_step, update)
-            kl_ctl.update(mean_kl.item(), args.ppo.batch_size)
+            if args.rewards.use_adaptive_kl:
+                kl_ctl.update(mean_kl.item(), args.ppo.batch_size)
             del kl, mean_kl, mean_entropy, mean_non_score_reward, scores
 
     # save model

@@ -30,8 +30,8 @@ from lm_human_preference_details.data import process_query
 
 @dataclass
 class SFTHParams:
-    gradient_accumulation_steps: int = 2
-    local_micro_batch_size: int = 8
+    gradient_accumulation_steps: int = 16
+    local_micro_batch_size: int = 1
     noptepochs: int = 1
     lr: float = 6.35e-5
     eps: float = 1e-5
@@ -108,7 +108,7 @@ class Args:
     """Whether to use deepspeed to train the model"""
     print_sample_output_freq: int = 80
     """How often to print sample output"""
-    save_path: str = "models/policy.pt"
+    save_path: str = "models/sft_policy.pt"
     """Where to save the model"""
     use_tensorflow_adam: bool = True
     """Whether to use tensorflow-style Adam optimizer instead of PyTorch's"""
@@ -394,7 +394,8 @@ def train(args: Args):
         return {
             **process_query(x, encoder=tokenizer, hparams=patch_h),
             "reference_response": tokenizer.encode(
-                x["summary"], padding="max_length", max_length=args.task.response_length, truncation=True
+                f" {x['summary']}", padding="max_length", max_length=args.task.response_length, truncation=True,
+                # with an extra leading space to account for the space between the query and response
             ),
         }
 
@@ -404,7 +405,7 @@ def train(args: Args):
     test_dataset = test_dataset.map(process_query_data)
     test_dataset = test_dataset.with_format("torch", columns=["query_token", "reference_response"])
     test_dataset = test_dataset.shuffle(seed=local_seed)
-    dataloader = DataLoader(dataset, batch_size=args.sft.local_batch_size)
+    dataloader = DataLoader(dataset, batch_size=args.sft.local_micro_batch_size)
     policy, optimizer, dataloader = accelerator.prepare(policy, optimizer, dataloader)
     iter_dataloader = iter(dataloader)
     # WARNING: even with `max_new_tokens` and `min_new_tokens` set to the same value, the number of tokens generated
@@ -420,13 +421,13 @@ def train(args: Args):
 
     print("===training policy===")
     global_step = 0
-    loss_stats = torch.zeros(args.sft.gradient_accumulation_steps, device=device)
     test_data = test_dataset[0:10]
     test_data = {k: v.to(device) for k, v in test_data.items()}
+    loss_stats = torch.zeros(args.sft.gradient_accumulation_steps, device=device)
     gradient_accumulation_idx = 0
     for update in range(1, args.sft.num_updates + 1):
-        print(update, global_step)
         global_step += 1 * args.sft.batch_size
+        accelerator.print(f"update {update}, global_step {global_step}")
         frac = 1.0 - (update - 1.0) / args.sft.num_updates
         lrnow = frac * args.sft.lr
         optimizer.param_groups[0]["lr"] = lrnow
@@ -443,7 +444,7 @@ def train(args: Args):
             optimizer.zero_grad()
         loss_stats[gradient_accumulation_idx] = loss
         gradient_accumulation_idx = (gradient_accumulation_idx + 1) % args.sft.gradient_accumulation_steps
-        if (update - 1) % args.sft.gradient_accumulation_steps:
+        if update > 1 and (update - 1) % args.sft.gradient_accumulation_steps == 0:
             writer.add_scalar("loss", accelerator.gather(loss_stats).mean().item(), update)
             writer.add_scalar("lr", lrnow, update)
         if (update - 1) % args.print_sample_output_freq * args.sft.gradient_accumulation_steps == 0:
@@ -451,7 +452,7 @@ def train(args: Args):
                 test_queries = test_data["query_token"]
                 test_reference_responses = test_data["reference_response"]
                 test_queries = right_padding_to_left_padding(test_queries, tokenizer.pad_token_id)
-                generated_responses = generate(policy, test_queries, tokenizer, generation_config)
+                generated_responses = generate(accelerator.unwrap_model(policy), test_queries, tokenizer, generation_config)
 
                 try:
                     all_decode_test_queries = tokenizer.batch_decode(test_queries, skip_special_tokens=True)
@@ -479,7 +480,7 @@ def train(args: Args):
     # save model
     if accelerator.is_main_process and args.save_path:
         os.makedirs(os.path.dirname(args.save_path), exist_ok=True)
-        torch.save(policy.state_dict(), args.save_path)
+        torch.save(accelerator.unwrap_model(policy).state_dict(), args.save_path)
 
         if args.upload_model:
             repo_name = f"{args.exp_name}__{args.rewards.label_dataset}__seed{args.seed}__{int(time.time())}"
