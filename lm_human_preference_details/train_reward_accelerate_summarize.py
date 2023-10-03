@@ -124,7 +124,7 @@ class Args:
     """Whether, before training, to normalize the rewards on the policy to the scales on the training buffer. (For comparisons, just use mean 0, var 1.)"""
     normalize_after: bool = True
     """Whether, after training, to normalize the rewards on the ref policy to mean 0, var 1 (so the KL coefficient always has the same meaning)."""
-    print_sample_output_freq: int = 120
+    print_sample_output_freq: int = 506
     """How often to print sample output"""
     save_path: str = "models/reward.pt"
     """Where to save the model"""
@@ -132,9 +132,6 @@ class Args:
     """Whether to use tensorflow-style Adam optimizer instead of PyTorch's"""
     task: TaskHParams = field(default_factory=TaskHParams)
     labels: LabelHParams = field(default_factory=LabelHParams)
-
-
-OPENAI_PAD_TOKEN_ID = 50259
 
 
 def first_true_indices(bools, dtype=torch.long):
@@ -356,10 +353,10 @@ def exact_div(a, b):
     return q
 
 
-def generate(lm_backbone, queries, args, generation_config):
+def generate(lm_backbone, queries, tokenizer, generation_config):
     """generate in a way that does not affect padding tokens"""
     context_length = queries.shape[1]
-    attention_mask = queries != args.pad_token_id
+    attention_mask = queries != tokenizer.pad_token_id
     input_ids = queries.clone()
     input_ids[~attention_mask] = 0  # set padding tokens to 0
     output = lm_backbone.generate(
@@ -387,8 +384,18 @@ def get_reward(reward_model, query_responses, args):
     )
 
 
+def get_reward_complete(reward_model, query_responses, args):
+    reward = get_reward(reward_model, query_responses, args)[1]
+    last_response_indices = first_true_indices(query_responses == args.pad_token_id) - 1
+    last_response_indices = torch.max(
+        last_response_indices,
+        torch.zeros([1], dtype=last_response_indices.dtype, device=query_responses.device),
+    )
+    return reward[:, :, 0].gather(1, last_response_indices.unsqueeze(1)).view(-1)
+
+
 def normalize(
-    args,
+    tokenizer,
     accelerator,
     device,
     lm_backbone,
@@ -402,20 +409,16 @@ def normalize(
         accelerator.unwrap_model(reward_model).reward_gain.data.fill_(1.0)
         accelerator.unwrap_model(reward_model).reward_bias.data.fill_(0.0)
         # number of minibatches for computing the normalization statistics
-        sample_queries_responses = []
+        rewards = []
         for data in dataloader:
             idx += len(data["query_token"])
             queries = data["query_token"].to(device)
+            queries = right_padding_to_left_padding(queries, tokenizer.pad_token_id).to(device)
             reference_response = data["reference_response"].to(device)
             query_responses = torch.cat((queries, reference_response), dim=1)
-            query_responses = right_padding_to_left_padding(query_responses, args.pad_token_id).to(device)
-            sample_queries_responses.append(query_responses)
+            score = get_reward_complete(reward_model, query_responses, tokenizer)
+            rewards.append(score)
         accelerator.print(f"====number of samples per device: {idx}")
-
-        # compute reward statistics
-        rewards = []
-        for query_responses in sample_queries_responses:
-            rewards.append(get_reward(reward_model, query_responses, args)[1])
         rewards = torch.cat(rewards)
         rewards = accelerator.gather(rewards)
         mean, std = rewards.mean(), rewards.std()
@@ -430,16 +433,14 @@ def normalize(
         accelerator.unwrap_model(reward_model).reward_bias.data = bias
 
         # validate normalization
-        sample_queries_responses = []
+        rewards = []
         for data in validation_dataloader:
             queries = data["query_token"].to(device)
+            queries = right_padding_to_left_padding(queries, tokenizer.pad_token_id).to(device)
             reference_response = data["reference_response"].to(device)
             query_responses = torch.cat((queries, reference_response), dim=1)
-            query_responses = right_padding_to_left_padding(query_responses, args.pad_token_id).to(device)
-            sample_queries_responses.append(query_responses)
-        rewards = []
-        for query_responses in sample_queries_responses:
-            rewards.append(get_reward(reward_model, query_responses, args)[1])
+            score = get_reward_complete(reward_model, query_responses, tokenizer)
+            rewards.append(score)
         rewards = torch.cat(rewards)
         rewards = accelerator.gather(rewards)
         mean, std = rewards.mean(), rewards.std()
@@ -535,7 +536,8 @@ def train(args: Args):
         return {
             **process_query(x, encoder=tokenizer, hparams=patch_h),
             "reference_response": tokenizer.encode(
-                x["summary"], padding="max_length", max_length=args.task.response_length, truncation=True
+                f" {x['summary']}", padding="max_length", max_length=args.task.response_length, truncation=True,
+                # with an extra leading space to account for the space between the query and response
             ),
         }
 
@@ -592,7 +594,7 @@ def train(args: Args):
         )
 
         normalize(
-            args,
+            tokenizer,
             accelerator,
             device,
             untrained_model.lm_backbone,
@@ -658,13 +660,8 @@ def train(args: Args):
                 predicted_rewards = []
                 for i in range(args.labels.num_labels):
                     query_responses = torch.cat([mb_query, mb_responses[i]], dim=1)
-                    reward = get_reward(reward_model, query_responses, args)[1]
-                    last_response_indices = first_true_indices(query_responses == args.pad_token_id) - 1
-                    last_response_indices = torch.max(
-                        last_response_indices,
-                        torch.zeros([1], dtype=last_response_indices.dtype, device=query_responses.device),
-                    )
-                    predicted_rewards.append(reward[:, :, 0].gather(1, last_response_indices.unsqueeze(1)).view(-1))
+                    score = get_reward_complete(reward_model, query_responses, args)
+                    predicted_rewards.append(score)
                 predicted_rewards = torch.stack(
                     predicted_rewards, dim=1
                 )  # shape (batch_size, num_labels), basically a reward prediction for each label
@@ -702,6 +699,7 @@ def train(args: Args):
                         micro_batch_inds = b_inds[micro_batch_start:micro_batch_end]
                         mb_data = validation_label[micro_batch_inds]
                         mb_query = torch.from_numpy(np.stack(mb_data["query_token"])).to(device)
+                        mb_query = right_padding_to_left_padding(mb_query, args.pad_token_id).to(device)
                         mb_best = torch.from_numpy(np.stack(mb_data["choice"])).to(device)
                         mb_responses = [
                             torch.from_numpy(np.stack(mb_data[f"response{i}_token"])).to(device)
@@ -710,13 +708,8 @@ def train(args: Args):
                         predicted_rewards = []
                         for i in range(args.labels.num_labels):
                             query_responses = torch.cat([mb_query, mb_responses[i]], dim=1)
-                            reward = get_reward(reward_model, query_responses, args)[1]
-                            last_response_indices = first_true_indices(query_responses == args.pad_token_id) - 1
-                            last_response_indices = torch.max(
-                                last_response_indices,
-                                torch.zeros([1], dtype=last_response_indices.dtype, device=query_responses.device),
-                            )
-                            predicted_rewards.append(reward[:, :, 0].gather(1, last_response_indices.unsqueeze(1)).view(-1))
+                            score = get_reward_complete(reward_model, query_responses, args)
+                            predicted_rewards.append(score)
                         predicted_rewards = torch.stack(
                             predicted_rewards, dim=1
                         )  # shape (batch_size, num_labels), basically a reward prediction for each label
@@ -736,12 +729,12 @@ def train(args: Args):
                 query_responses = generate(
                     accelerator.unwrap_model(reward_model).lm_backbone,
                     queries,
-                    args,
+                    tokenizer,
                     generation_config,
                 )
                 responses = query_responses[:, context_length:]
 
-                output, reward = get_reward(reward_model, query_responses, args)
+                output, _ = get_reward(reward_model, query_responses, args)
                 logits = output.logits[:, context_length - 1 : -1]
                 logits /= args.task.temperature
                 all_logprobs = F.log_softmax(logits, dim=-1)
@@ -795,7 +788,7 @@ def train(args: Args):
         )
 
         normalize(
-            args,
+            tokenizer,
             accelerator,
             device,
             untrained_model.lm_backbone,
@@ -812,7 +805,8 @@ def train(args: Args):
     # save model
     if args.save_path:
         os.makedirs(os.path.dirname(args.save_path), exist_ok=True)
-        torch.save(accelerator.unwrap_model(reward_model).state_dict(), args.save_path)
+        # torch.save(accelerator.unwrap_model(reward_model).state_dict(), args.save_path)
+        accelerator.save_model(reward_model, args.save_path)
 
     if accelerator.is_main_process and args.track:
         wandb.finish()

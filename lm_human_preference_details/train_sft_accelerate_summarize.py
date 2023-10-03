@@ -1,3 +1,4 @@
+import collections
 import os
 import random
 import time
@@ -10,6 +11,7 @@ import pandas as pd
 import torch
 import torch.optim as optim
 import tyro
+import evaluate
 from accelerate import Accelerator
 from datasets import load_dataset
 from rich.console import Console
@@ -65,7 +67,7 @@ class TaskHParams:
     penalty_reward_value: int = -1
 
     # LM params
-    temperature: float = 0.7
+    temperature: float = 0.01
 
 
 # a patch
@@ -106,7 +108,7 @@ class Args:
     """the name of the pretrained model to use"""
     deepspeed: bool = False
     """Whether to use deepspeed to train the model"""
-    print_sample_output_freq: int = 80
+    print_sample_output_freq: int = 220
     """How often to print sample output"""
     save_path: str = "models/sft_policy.pt"
     """Where to save the model"""
@@ -340,6 +342,8 @@ def train(args: Args):
     )
     dataset = load_dataset(args.task.query_dataset, split="train")
     test_dataset = load_dataset(args.task.query_dataset, split="test")
+    accelerator.print("The number of samples in dataset", len(dataset))
+    accelerator.print("The number of samples in test_dataset", len(test_dataset))
     args.sft.total_episodes = len(dataset)
     args.sft.num_updates = args.sft.total_episodes // args.sft.batch_size
 
@@ -406,7 +410,8 @@ def train(args: Args):
     test_dataset = test_dataset.with_format("torch", columns=["query_token", "reference_response"])
     test_dataset = test_dataset.shuffle(seed=local_seed)
     dataloader = DataLoader(dataset, batch_size=args.sft.local_micro_batch_size)
-    policy, optimizer, dataloader = accelerator.prepare(policy, optimizer, dataloader)
+    test_dataloader = DataLoader(test_dataset, batch_size=args.sft.local_micro_batch_size)
+    policy, optimizer, dataloader, test_dataloader = accelerator.prepare(policy, optimizer, dataloader, test_dataloader)
     iter_dataloader = iter(dataloader)
     # WARNING: even with `max_new_tokens` and `min_new_tokens` set to the same value, the number of tokens generated
     # may not be the same. TODO: investigate further, we just want to generate a fixed number of tokens
@@ -418,6 +423,7 @@ def train(args: Args):
         top_p=1.0,
         do_sample=True,
     )
+    rouge = evaluate.load("rouge")
 
     print("===training policy===")
     global_step = 0
@@ -425,11 +431,18 @@ def train(args: Args):
     test_data = {k: v.to(device) for k, v in test_data.items()}
     loss_stats = torch.zeros(args.sft.gradient_accumulation_steps, device=device)
     gradient_accumulation_idx = 0
+
+    # Given parameters
+    eta_min = 0
+    eta_max = 6.35e-5
+    T_max = args.sft.num_updates
+
     for update in range(1, args.sft.num_updates + 1):
         global_step += 1 * args.sft.batch_size
         accelerator.print(f"update {update}, global_step {global_step}")
-        frac = 1.0 - (update - 1.0) / args.sft.num_updates
-        lrnow = frac * args.sft.lr
+        # frac = 1.0 - (update - 1.0) / args.sft.num_updates
+        # lrnow = frac * args.sft.lr
+        lrnow = eta_min + 0.5 * (eta_max - eta_min) * (1 + np.cos(np.pi * (update - 1) / T_max))
         optimizer.param_groups[0]["lr"] = lrnow
         data = next(iter_dataloader)
         queries = data["query_token"].to(device)
@@ -448,13 +461,15 @@ def train(args: Args):
             writer.add_scalar("loss", accelerator.gather(loss_stats).mean().item(), update)
             writer.add_scalar("lr", lrnow, update)
         if (update - 1) % args.print_sample_output_freq * args.sft.gradient_accumulation_steps == 0:
-            with torch.no_grad():
-                test_queries = test_data["query_token"]
-                test_reference_responses = test_data["reference_response"]
-                test_queries = right_padding_to_left_padding(test_queries, tokenizer.pad_token_id)
-                generated_responses = generate(accelerator.unwrap_model(policy), test_queries, tokenizer, generation_config)
-
-                try:
+            rouge_scores = collections.defaultdict(list)
+            for test_idx, test_data in enumerate(test_dataloader):
+                with torch.no_grad():
+                    test_queries = test_data["query_token"].to(device)
+                    test_reference_responses = test_data["reference_response"].to(device)
+                    test_queries = right_padding_to_left_padding(test_queries, tokenizer.pad_token_id)
+                    generated_responses = generate(accelerator.unwrap_model(policy), test_queries, tokenizer, generation_config)
+                    accelerator.print(update, test_idx)
+                    
                     all_decode_test_queries = tokenizer.batch_decode(test_queries, skip_special_tokens=True)
                     all_decode_test_query_responses = tokenizer.batch_decode(generated_responses, skip_special_tokens=True)
                     all_decode_test_reference_responses = tokenizer.batch_decode(
@@ -463,24 +478,36 @@ def train(args: Args):
                     all_decode_test_responses = [
                         x[len(y) :] for x, y in zip(all_decode_test_query_responses, all_decode_test_queries)
                     ]
+                    rouge_score = rouge.compute(predictions=all_decode_test_responses, references=all_decode_test_reference_responses)
+                    rouge_scores["rouge1"].append(rouge_score["rouge1"])
+                    rouge_scores["rouge2"].append(rouge_score["rouge2"])
+                    rouge_scores["rougeL"].append(rouge_score["rougeL"])
 
-                    all_df = pd.DataFrame(
-                        {
-                            "query": all_decode_test_queries,
-                            "response": all_decode_test_responses,
-                            "reference": all_decode_test_reference_responses,
-                        }
-                    )
-                    if accelerator.is_main_process and args.track:
-                        wandb.log({"query_responses": wandb.Table(dataframe=all_df)}, step=update)
-                    print_rich_table(f"Sample Output at Step {update}", all_df[:4], console)
-                except Exception as e:
-                    print(e)
+                    if test_idx == 0:
+                        try:
+                            all_df = pd.DataFrame(
+                                {
+                                    "query": all_decode_test_queries,
+                                    "response": all_decode_test_responses,
+                                    "reference": all_decode_test_reference_responses,
+                                }
+                            )
+                            if accelerator.is_main_process and args.track:
+                                wandb.log({"samples/query_responses": wandb.Table(dataframe=all_df)}, step=update)
+                            print_rich_table(f"Sample Output at Step {update}", all_df[:4], console)
+                        except Exception as e:
+                            print(e)
+            
+            for k, v in rouge_scores.items():
+                rouge_metric = torch.tensor(v, device=device)
+                rouge_metric = accelerator.gather(rouge_metric)
+                writer.add_scalar(f"rouge/{k}", rouge_metric.mean().item(), update)
+                accelerator.print(f"rouge/{k}: {rouge_metric.mean().item()} {rouge_metric.shape} {rouge_metric}")
 
     # save model
     if accelerator.is_main_process and args.save_path:
         os.makedirs(os.path.dirname(args.save_path), exist_ok=True)
-        torch.save(accelerator.unwrap_model(policy).state_dict(), args.save_path)
+        accelerator.save_model(policy, args.save_path)
 
         if args.upload_model:
             repo_name = f"{args.exp_name}__{args.rewards.label_dataset}__seed{args.seed}__{int(time.time())}"
