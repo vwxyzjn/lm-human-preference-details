@@ -617,9 +617,9 @@ if __name__ == "__main__":
     dataloader = DataLoader(dataset, batch_size=args.ppo.local_batch_size)
     validation_dataset = validation_dataset.map(process_query_data)
     validation_dataset = validation_dataset.with_format("torch", columns=["query_token", "reference_response"])
-    validation_dataset = validation_dataset.shuffle(seed=local_seed)
     validation_dataloader = DataLoader(validation_dataset, batch_size=args.ppo.local_batch_size)
     model, optimizer, dataloader = accelerator.prepare(model, optimizer, dataloader)
+    validation_dataloader = accelerator.prepare(validation_dataloader)
     if args.deepspeed:
         import deepspeed
 
@@ -651,6 +651,19 @@ if __name__ == "__main__":
     def repeat_generator():  # TODO: ideally we shuffle the dataloader as well
         while True:
             yield from dataloader
+
+    sample_validation_inds = np.arange(args.ppo.batch_size)
+    local_sample_validation_inds = sample_validation_inds[accelerator.process_index :: accelerator.num_processes]
+    sample_validation = validation_dataset[local_sample_validation_inds]
+    sample_validation = {k: v.to(device) for k, v in sample_validation.items()}
+    sample_validation_queries = sample_validation["query_token"]
+    with torch.no_grad():
+        print(sample_validation_queries.shape)
+        sample_validation_queries = right_padding_to_left_padding(sample_validation_queries, tokenizer.pad_token_id)
+        sample_validation_reference_response = sample_validation["reference_response"]
+        sample_validation_query_reference_responses = torch.cat((sample_validation_queries, sample_validation_reference_response), dim=1)
+        sample_validation_reference_scores = get_reward_complete(reward_model, sample_validation_query_reference_responses, tokenizer)
+
 
     iter_dataloader = iter(repeat_generator())
     kl_ctl = AdaptiveKLController(args.rewards.kl_coef, hparams=args.rewards.adaptive_kl)
@@ -723,13 +736,6 @@ if __name__ == "__main__":
             reference_responses = data["reference_response"].to(device)
             queries = right_padding_to_left_padding(data["query_token"], tokenizer.pad_token_id).to(device)
             query_reference_responses = torch.cat((queries, reference_responses), dim=1)
-
-
-
-            reference_scores = get_reward_complete(reward_model, query_reference_responses, tokenizer)
-            accelerator.print(accelerator.gather(reference_scores).mean())
-
-
             query_responses = generate(
                 accelerator.unwrap_model(model).policy,
                 queries,
@@ -738,6 +744,15 @@ if __name__ == "__main__":
             )
             context_length = queries.shape[1]
             responses = query_responses[:, context_length:]
+
+            # validation
+            sample_validation_query_responses = generate(
+                accelerator.unwrap_model(model).policy,
+                sample_validation_queries,
+                tokenizer,
+                generation_config,
+            )
+
 
             output = forward(accelerator.unwrap_model(model).policy, query_responses, tokenizer)
             full_values = get_reward(accelerator.unwrap_model(model).critic, query_responses, tokenizer)[1]
@@ -787,6 +802,9 @@ if __name__ == "__main__":
 
             scores = get_reward_complete(reward_model, postprocessed_query_responses, tokenizer)
             reference_scores = get_reward_complete(reward_model, query_reference_responses, tokenizer)
+            # note that we do not truncate the validation responses
+            validation_score = get_reward_complete(reward_model, sample_validation_query_responses, tokenizer)
+            accelerator.print(accelerator.gather(reference_scores).mean())
 
             # 3. filter response. Ensure that the sample contains truncate_token
             # responses not passing that filter will receive a low (fixed) score
@@ -813,39 +831,62 @@ if __name__ == "__main__":
 
             if args.print_sample_output_freq > 0 and (update - 1) % args.print_sample_output_freq == 0:
                 try:
-                    all_decode_queries = tokenizer.batch_decode(queries, skip_special_tokens=True)
-                    all_postprocessed_query_responses = tokenizer.batch_decode(
-                        postprocessed_query_responses, skip_special_tokens=True
-                    )
-                    all_postprocessed_responses = [
-                        x[len(y) :] for x, y in zip(all_postprocessed_query_responses, all_decode_queries)
-                    ]
-                    all_reference_responses = tokenizer.batch_decode(reference_responses, skip_special_tokens=True)
+                    # all_decode_queries = tokenizer.batch_decode(queries, skip_special_tokens=True)
+                    # all_postprocessed_query_responses = tokenizer.batch_decode(
+                    #     postprocessed_query_responses, skip_special_tokens=True
+                    # )
+                    # all_postprocessed_responses = [
+                    #     x[len(y) :] for x, y in zip(all_postprocessed_query_responses, all_decode_queries)
+                    # ]
+                    # all_reference_responses = tokenizer.batch_decode(reference_responses, skip_special_tokens=True)
 
-                    kl_sum = kl.sum(axis=1)
-                    all_df = pd.DataFrame(
+                    # kl_sum = kl.sum(axis=1)
+                    # all_df = pd.DataFrame(
+                    #     {
+                    #         "query": all_decode_queries,
+                    #         "response": all_postprocessed_responses,
+                    #         "reference_responses": all_reference_responses,
+                    #         "score": scores.float().cpu().numpy(),
+                    #         "reference_scores": reference_scores.float().cpu().numpy(),
+                    #         "kl": kl_sum.float().cpu().numpy(),
+                    #         "reward": (scores - kl_ctl.value * kl_sum).float().cpu().numpy(),
+                    #     }
+                    # )
+                    # if accelerator.is_main_process and args.track:
+                    #     wandb.log({"query_responses": wandb.Table(dataframe=all_df)}, step=update)
+                    # print_rich_table("stuff", all_df[:4], console)
+                    all_decode_validation_queries = tokenizer.batch_decode(sample_validation_queries, skip_special_tokens=True)
+                    all_sample_validation_query_responses = tokenizer.batch_decode(
+                        sample_validation_query_responses, skip_special_tokens=True
+                    )
+                    all_sample_validation_responses = [
+                        x[len(y) :] for x, y in zip(all_sample_validation_query_responses, all_decode_validation_queries)
+                    ]
+                    all_sample_validation_reference_responses = tokenizer.batch_decode(
+                        sample_validation_reference_response, skip_special_tokens=True
+                    )
+                    all_sample_validation_df = pd.DataFrame(
                         {
-                            "query": all_decode_queries,
-                            "response": all_postprocessed_responses,
-                            "reference_responses": all_reference_responses,
-                            "score": scores.float().cpu().numpy(),
-                            "reference_scores": reference_scores.float().cpu().numpy(),
-                            "kl": kl_sum.float().cpu().numpy(),
-                            "reward": (scores - kl_ctl.value * kl_sum).float().cpu().numpy(),
+                            "query": all_decode_validation_queries,
+                            "response": all_sample_validation_responses,
+                            "reference_responses": all_sample_validation_reference_responses,
+                            "scores": validation_score.float().cpu().numpy(),
+                            "reference_scores": sample_validation_reference_scores.float().cpu().numpy(),
                         }
                     )
                     if accelerator.is_main_process and args.track:
-                        wandb.log({"query_responses": wandb.Table(dataframe=all_df)}, step=update)
-                    print_rich_table("stuff", all_df[:4], console)
+                        wandb.log({"samples/query_responses": wandb.Table(dataframe=all_sample_validation_df)}, step=update)
+                    print_rich_table("stuff", all_sample_validation_df[:4], console)
+                    
                 except Exception as e:
                     print(e)
-                del (
-                    all_decode_queries,
-                    all_postprocessed_query_responses,
-                    all_postprocessed_responses,
-                    kl_sum,
-                    all_df,
-                )
+                # del (
+                #     all_decode_queries,
+                #     all_postprocessed_query_responses,
+                #     all_postprocessed_responses,
+                #     kl_sum,
+                #     all_df,
+                # )
             del postprocessed_query_responses
             torch.cuda.empty_cache()
 
@@ -954,6 +995,7 @@ if __name__ == "__main__":
             )
             writer.add_scalar("objective/scores", accelerator.gather(scores.mean()).mean().item(), update)
             writer.add_scalar("objective/reference_scores", accelerator.gather(reference_scores.mean()).mean().item(), update)
+            writer.add_scalar("objective/validation_score", accelerator.gather(validation_score.mean()).mean().item(), update)
             writer.add_scalar("ppo/loss/policy", accelerator.gather(pg_loss).mean().item(), update)
             writer.add_scalar("ppo/loss/value", accelerator.gather(vf_loss).mean().item(), update)
             writer.add_scalar("ppo/loss/total", accelerator.gather(loss).mean().item(), update)

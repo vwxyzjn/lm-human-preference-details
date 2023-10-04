@@ -505,7 +505,7 @@ def train(args: Args):
                 accelerator.print(f"rouge/{k}: {rouge_metric.mean().item()} {rouge_metric.shape} {rouge_metric}")
 
     # save model
-    if accelerator.is_main_process and args.save_path:
+    if args.save_path:
         os.makedirs(os.path.dirname(args.save_path), exist_ok=True)
         accelerator.save_model(policy, args.save_path)
 

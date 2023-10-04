@@ -1,0 +1,18 @@
+#!/bin/bash
+#SBATCH --job-name=lm_human_preference_details
+#SBATCH --partition=production-cluster
+#SBATCH --gpus-per-task={{gpus_per_task}}
+#SBATCH --cpus-per-gpu={{cpus_per_gpu}}
+#SBATCH --ntasks={{ntasks}}
+#SBATCH --output=slurm/logs/%x_%j.out
+#SBATCH --array={{array}}
+#SBATCH --exclude=ip-26-0-149-199
+#SBATCH --exclusive
+
+{{nodes}}
+
+seeds={{seeds}}
+seed=${seeds[$SLURM_ARRAY_TASK_ID % {{len_seeds}}]}
+
+echo "Running task $SLURM_ARRAY_TASK_ID with seed: $seed"
+SEED=$seed srun {{command}}
