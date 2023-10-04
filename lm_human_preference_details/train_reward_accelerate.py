@@ -689,7 +689,7 @@ def train(args: Args):
                 del output, logits, all_logprobs
                 torch.cuda.empty_cache()
 
-                output, _ = get_reward(untrained_model, query_responses, args)
+                output, _ = get_reward(untrained_model, query_responses, tokenizer)
                 logits = output.logits[:, context_length - 1 : -1]
                 logits /= args.task.temperature
                 all_logprobs = F.log_softmax(logits, dim=-1)
