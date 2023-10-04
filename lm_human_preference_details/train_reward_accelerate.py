@@ -676,7 +676,7 @@ def train(args: Args):
                 query_responses = generate(
                     accelerator.unwrap_model(reward_model).lm_backbone,
                     queries,
-                    args,
+                    tokenizer,
                     generation_config,
                 )
                 responses = query_responses[:, context_length:]
