@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "lm-human-preference-details"
-version = "0.1.0"
+version = "1.0.0b1"
 description = ""
 authors = ["Costa Huang <costa.huang@outlook.com>"]
 readme = "README.md"

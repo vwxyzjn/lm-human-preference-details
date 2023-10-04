@@ -46,8 +46,9 @@ accelerate launch \
 
 > ⚠️ **NOTE**: You can install the latest torch or jax with the following command:
 ```
-poetry run pip install --upgrade torch
-poetry run pip install --upgrade "jax[cuda11_cudnn82]==0.4.8" -f https://storage.googleapis.com/jax-releases/jax_cuda_releases.html
+poetry run pip install torch==2.0.1
+poetry run pip install "jax[cuda11_cudnn82]==0.4.8" -f https://storage.googleapis.com/jax-releases/jax_cuda_releases.html
+poetry run pip install git+https://github.com/huggingface/huggingface_hub@main
 ```
 
 ## Current status
