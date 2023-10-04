@@ -290,7 +290,6 @@ def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
     return layer
 
 
-
 class AdaptiveKLController:
     def __init__(self, init_kl_coef: float, hparams: AdaptiveKLParams):
         self.value = init_kl_coef
@@ -806,12 +805,15 @@ def train(args: Args):
         accelerator.save_model(policy, args.save_path)
 
         if accelerator.is_main_process and args.upload_model:
-            from huggingface_hub import create_collection, add_collection_item, whoami
+            from huggingface_hub import add_collection_item, create_collection, whoami
+
             repo_name = f"{args.exp_name}__{args.rewards.label_dataset.replace('/', '_')}__seed{args.seed}"
             if not args.hf_entity:
                 args.hf_entity = whoami()["name"]
             repo_id = f"{args.hf_entity}/{repo_name}"
-            accelerator.unwrap_model(policy).lm_backbone.save_pretrained(repo_id, repo_id=repo_id, safe_serialization=True, push_to_hub=True)
+            accelerator.unwrap_model(policy).lm_backbone.save_pretrained(
+                repo_id, repo_id=repo_id, safe_serialization=True, push_to_hub=True
+            )
             tokenizer.save_pretrained(repo_id, repo_id=repo_id, push_to_hub=True)
             collection = create_collection(title=f"lm-human-preference-details", namespace=args.hf_entity, exists_ok=True)
             add_collection_item(collection.slug, repo_id, item_type="model")
