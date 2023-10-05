@@ -533,11 +533,10 @@ def train(args: Args):
     validation_dataset = load_dataset(args.task.query_dataset, split="validation")
 
     def process_query_data(x):
-        pad_summary_w_leading_space = " " + x['summary']
         return {
             **process_query(x, encoder=tokenizer, hparams=patch_h),
             "reference_response": tokenizer.encode(
-                pad_summary_w_leading_space, padding="max_length", max_length=args.task.response_length, truncation=True,
+                f" {x['summary']}<|endoftext|>", padding="max_length", max_length=args.task.response_length, truncation=True,
                 # with an extra leading space to account for the space between the query and response
             ),
         }
@@ -619,10 +618,10 @@ def train(args: Args):
         return {
             **process_query(x["info"], encoder=tokenizer, hparams=patch_h),
             "response0_token": tokenizer.encode(
-                x["summaries"][0]["text"], padding="max_length", max_length=args.task.response_length, truncation=True
+                f" {x['summaries'][0]['text']}<|endoftext|>", padding="max_length", max_length=args.task.response_length, truncation=True
             ),
             "response1_token": tokenizer.encode(
-                x["summaries"][1]["text"], padding="max_length", max_length=args.task.response_length, truncation=True
+                f" {x['summaries'][1]['text']}<|endoftext|>", padding="max_length", max_length=args.task.response_length, truncation=True
             ),
         }
 

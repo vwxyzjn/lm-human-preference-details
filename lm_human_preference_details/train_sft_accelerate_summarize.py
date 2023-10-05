@@ -395,11 +395,10 @@ def train(args: Args):
         optimizer = optim.Adam(policy.parameters(), lr=args.sft.lr, eps=args.sft.eps)
 
     def process_query_data(x):
-        pad_summary_w_leading_space = " " + x['summary']
         return {
             **process_query(x, encoder=tokenizer, hparams=patch_h),
             "reference_response": tokenizer.encode(
-                pad_summary_w_leading_space, padding="max_length", max_length=args.task.response_length, truncation=True,
+                f" {x['summary']}<|endoftext|>", padding="max_length", max_length=args.task.response_length, truncation=True,
                 # with an extra leading space to account for the space between the query and response
             ),
         }
