@@ -43,7 +43,7 @@ class RewardHParams:
     kl_coef: float = 0.15
     use_adaptive_kl: bool = True
     adaptive_kl: Optional[AdaptiveKLParams] = field(default_factory=AdaptiveKLParams)
-    trained_model: Optional[str] = "models/reward.pt"
+    trained_model: Optional[str] = "models/reward"
     label_dataset: tyro.conf.Suppress[Optional[str]] = None
 
 
@@ -127,6 +127,8 @@ class Args:
     """Whether to use cuda if available."""
     run_name: tyro.conf.Suppress[str] = None
     """TO BE FILLED: a unique name of this run"""
+    load_from_cache_file: bool = False
+    """Whether to load data from the local cache file in `dataset.map`"""
     upload_model: bool = False
     "whether to upload the saved model to huggingface"
     hf_entity: str = ""
@@ -136,9 +138,9 @@ class Args:
     """the name of the pretrained model to use"""
     deepspeed: bool = False
     """Whether to use deepspeed to train the model"""
-    print_sample_output_freq: int = 10
+    print_sample_output_freq: int = 1
     """How often to print sample output"""
-    sft_model_path: str = "models/sft_policy.pt"
+    sft_model_path: str = "models/sft_policy"
     """Where to load the SFT model"""
     save_path: str = "models/policy.pt"
     """Where to save the model"""
@@ -354,18 +356,18 @@ class AutoModelForCausalLMWithRewardHead(nn.Module):
             nn.Linear(lm_backbone.config.hidden_size, 1),
             std=1 / np.sqrt(lm_backbone.config.hidden_size + 1),
         )
-        self.reward_gain = torch.nn.Parameter(torch.tensor(1.0), requires_grad=True)
-        self.reward_bias = torch.nn.Parameter(torch.tensor(0.0), requires_grad=True)
+        # self.reward_gain = torch.nn.Parameter(torch.tensor(1.0), requires_grad=True)
+        # self.reward_bias = torch.nn.Parameter(torch.tensor(0.0), requires_grad=True)
 
     def forward(self, **kwargs):
         output = self.lm_backbone(**kwargs)
-        reward_latents = output.hidden_states[-1]
+        last_reward_latents = output.hidden_states[-1]
         # shape: [batch_size, length, hidden_size]
-        last_reward_latents = reward_latents
+        # last_reward_latents = reward_latents
         # shape: [batch_size, hidden_size]
         reward = self.scalar_head(last_reward_latents)
-        # shape: [batch_size, 1]
-        reward = self.reward_gain * reward + self.reward_bias
+        # # shape: [batch_size, 1]
+        # reward = self.reward_gain * reward + self.reward_bias
         return output, reward
 
 
@@ -418,11 +420,10 @@ def generate(lm_backbone, queries, tokenizer, generation_config):
     return torch.cat((queries, output.sequences[:, context_length:]), dim=1)
 
 
-def get_reward(reward_model, query_responses, args):
-    attention_mask = query_responses != args.pad_token_id
+def get_reward(reward_model, query_responses, tokenizer):
+    attention_mask = query_responses != tokenizer.pad_token_id
     position_ids = attention_mask.cumsum(1) - attention_mask.long()  # exclusive cumsum
-    input_ids = query_responses.clone()
-    input_ids[~attention_mask] = 0
+    input_ids = torch.masked_fill(query_responses, ~attention_mask, 0)
     return reward_model(
         input_ids=input_ids,
         attention_mask=attention_mask,
@@ -432,68 +433,14 @@ def get_reward(reward_model, query_responses, args):
     )
 
 
-def get_reward_complete(reward_model, query_responses, args):
-    reward = get_reward(reward_model, query_responses, args)[1]
-    last_response_indices = first_true_indices(query_responses == args.pad_token_id) - 1
+def get_reward_complete(reward_model, query_responses, tokenizer):
+    reward = get_reward(reward_model, query_responses, tokenizer)[1]
+    last_response_indices = first_true_indices(query_responses == tokenizer.pad_token_id) - 1
     last_response_indices = torch.max(
         last_response_indices,
         torch.zeros([1], dtype=last_response_indices.dtype, device=query_responses.device),
     )
     return reward[:, :, 0].gather(1, last_response_indices.unsqueeze(1)).view(-1)
-
-
-def normalize(
-    tokenizer,
-    accelerator,
-    device,
-    lm_backbone,
-    reward_model,
-    dataloader,
-    validation_dataloader,
-):
-    idx = 0
-    with torch.no_grad():
-        # reset reward scales
-        # accelerator.unwrap_model(reward_model).reward_gain.data.fill_(1.0)
-        # accelerator.unwrap_model(reward_model).reward_bias.data.fill_(0.0)
-        # number of minibatches for computing the normalization statistics
-        rewards = []
-        for data in dataloader:
-            idx += len(data["query_token"])
-            queries = data["query_token"].to(device)
-            queries = right_padding_to_left_padding(queries, tokenizer.pad_token_id).to(device)
-            reference_response = data["reference_response"].to(device)
-            query_responses = torch.cat((queries, reference_response), dim=1)
-            score = get_reward_complete(reward_model, query_responses, tokenizer)
-            accelerator.print(score.shape, accelerator.gather(score).mean())
-            rewards.append(score)
-        accelerator.print(f"====number of samples per device: {idx}")
-        rewards = torch.cat(rewards)
-        rewards = accelerator.gather(rewards)
-        mean, std = rewards.mean(), rewards.std()
-        print(f"mean: {mean}, std: {std}")
-
-        # reward normalization
-        target_mean, target_std = torch.tensor(0.0, device=device), torch.tensor(1.0, device=device)
-        gain = target_std / std
-        bias = target_mean - gain * mean
-        print(f"gain: {gain}, bias: {bias}")
-        accelerator.unwrap_model(reward_model).reward_gain.data = gain
-        accelerator.unwrap_model(reward_model).reward_bias.data = bias
-
-        # validate normalization
-        rewards = []
-        for data in validation_dataloader:
-            queries = data["query_token"].to(device)
-            queries = right_padding_to_left_padding(queries, tokenizer.pad_token_id).to(device)
-            reference_response = data["reference_response"].to(device)
-            query_responses = torch.cat((queries, reference_response), dim=1)
-            score = get_reward_complete(reward_model, query_responses, tokenizer)
-            rewards.append(score)
-        rewards = torch.cat(rewards)
-        rewards = accelerator.gather(rewards)
-        mean, std = rewards.mean(), rewards.std()
-        print(f"after mean: {mean}, after std: {std}")
 
 
 def forward(policy, query_responses, tokenizer):
@@ -611,11 +558,11 @@ if __name__ == "__main__":
             ),
         }
 
-    dataset = dataset.map(process_query_data)
+    dataset = dataset.map(process_query_data, load_from_cache_file=args.load_from_cache_file)
     dataset = dataset.with_format("torch", columns=["query_token", "reference_response"])
     dataset = dataset.shuffle(seed=local_seed)
     dataloader = DataLoader(dataset, batch_size=args.ppo.local_batch_size)
-    validation_dataset = validation_dataset.map(process_query_data)
+    validation_dataset = validation_dataset.map(process_query_data, load_from_cache_file=args.load_from_cache_file)
     validation_dataset = validation_dataset.with_format("torch", columns=["query_token", "reference_response"])
     validation_dataloader = DataLoader(validation_dataset, batch_size=args.ppo.local_batch_size)
     model, optimizer, dataloader = accelerator.prepare(model, optimizer, dataloader)
@@ -663,7 +610,7 @@ if __name__ == "__main__":
         sample_validation_reference_response = sample_validation["reference_response"]
         sample_validation_query_reference_responses = torch.cat((sample_validation_queries, sample_validation_reference_response), dim=1)
         sample_validation_reference_scores = get_reward_complete(reward_model, sample_validation_query_reference_responses, tokenizer)
-
+    # breakpoint()
 
     iter_dataloader = iter(repeat_generator())
     kl_ctl = AdaptiveKLController(args.rewards.kl_coef, hparams=args.rewards.adaptive_kl)
@@ -752,6 +699,25 @@ if __name__ == "__main__":
                 tokenizer,
                 generation_config,
             )
+            sample_validation_responses = sample_validation_query_responses[:, context_length:]
+            truncate_token_mask = sample_validation_responses == args.task.truncate_token
+            truncate_after_or_token_mask = torch.cat(
+                [
+                    torch.zeros_like(truncate_token_mask)[:, : args.task.truncate_after],
+                    truncate_token_mask[:, args.task.truncate_after :],
+                ],
+                dim=1,
+            )
+            truncate_mask = (torch.cumsum(truncate_after_or_token_mask, dim=1) - truncate_after_or_token_mask.long()).bool()
+            postprocessed_sample_validation_responses = torch.where(
+                truncate_mask,
+                torch.full_like(sample_validation_responses, tokenizer.pad_token_id),
+                sample_validation_responses,
+            )
+            postprocessed_sample_validation_query_responses = torch.cat((sample_validation_queries, postprocessed_sample_validation_responses), 1)
+            del truncate_token_mask, truncate_after_or_token_mask, truncate_mask
+            torch.cuda.empty_cache()
+
 
 
             output = forward(accelerator.unwrap_model(model).policy, query_responses, tokenizer)
@@ -776,47 +742,67 @@ if __name__ == "__main__":
             # 1. truncate at the first occurrence of `truncate_token` that appears at or after
             # position truncate_after in the responses
             # https://github.com/openai/lm-human-preferences/blob/cbfd210bb8b08f6bc5c26878c10984b90f516c66/lm_human_preferences/train_policy.py#L378
-            truncate_token_mask = responses == args.task.truncate_token
-            truncate_after_or_token_mask = torch.cat(
-                [
-                    torch.zeros_like(truncate_token_mask)[:, : args.task.truncate_after],
-                    truncate_token_mask[:, args.task.truncate_after :],
-                ],
-                dim=1,
-            )
-            truncate_mask = (torch.cumsum(truncate_after_or_token_mask, dim=1) - truncate_after_or_token_mask.long()).bool()
-            postprocessed_responses = torch.where(
-                truncate_mask,
-                torch.full_like(responses, tokenizer.pad_token_id),
-                responses,
-            )
-            del truncate_token_mask, truncate_after_or_token_mask, truncate_mask
+            # truncate_token_mask = responses == args.task.truncate_token
+            # truncate_after_or_token_mask = torch.cat(
+            #     [
+            #         torch.zeros_like(truncate_token_mask)[:, : args.task.truncate_after],
+            #         truncate_token_mask[:, args.task.truncate_after :],
+            #     ],
+            #     dim=1,
+            # )
+            # truncate_mask = (torch.cumsum(truncate_after_or_token_mask, dim=1) - truncate_after_or_token_mask.long()).bool()
+            # postprocessed_responses = torch.where(
+            #     truncate_mask,
+            #     torch.full_like(responses, tokenizer.pad_token_id),
+            #     responses,
+            # )
+            # del truncate_token_mask, truncate_after_or_token_mask, truncate_mask
+
+            trunc_idxs = first_true_indices(responses == args.task.truncate_token).unsqueeze(-1)
+            new_size = [1] * (len(responses.size()) - 1) + [args.task.response_length]
+            idxs = torch.arange(args.task.response_length, device=responses.device).view(*new_size)
+            postprocessed_responses = torch.masked_fill(responses, idxs > trunc_idxs, tokenizer.pad_token_id)
             torch.cuda.empty_cache()
 
             # 2. run reward model on the truncated responses
             postprocessed_query_responses = torch.cat((queries, postprocessed_responses), 1)
-            padding_mask = (postprocessed_query_responses == tokenizer.pad_token_id)[:, context_length - 1 : -1]
+            padding_mask = postprocessed_responses == tokenizer.pad_token_id
             logprobs = torch.masked_fill(logprobs, padding_mask, INVALID_LOGPROB)
             ref_logprobs = torch.masked_fill(ref_logprobs, padding_mask, INVALID_LOGPROB)
             values = torch.masked_fill(values, padding_mask, 0)
 
             scores = get_reward_complete(reward_model, postprocessed_query_responses, tokenizer)
+            rew = get_reward(reward_model, postprocessed_query_responses, tokenizer)[1]
+
+            qr = postprocessed_query_responses
+            attention_mask = qr != tokenizer.pad_token_id
+            position_ids = attention_mask.cumsum(1) - attention_mask.long()  # exclusive cumsum
+            input_ids = torch.masked_fill(qr, ~attention_mask, 0)
+            output = reward_model.lm_backbone(input_ids=input_ids, attention_mask=attention_mask, position_ids=position_ids, return_dict=True, output_hidden_states=True)
+            last_reward_latents = output.hidden_states[-1] # TODO: investigate whether it should be output.hidden_states[0] or output.hidden_states[-1]
+            reward = reward_model.scalar_head(last_reward_latents)
+
+            print(postprocessed_query_responses[0:5,537:])
+            print(rew.squeeze(-1)[0:5,537:])
+            print(scores)
+            breakpoint()
+
+
             reference_scores = get_reward_complete(reward_model, query_reference_responses, tokenizer)
             # note that we do not truncate the validation responses
-            validation_score = get_reward_complete(reward_model, sample_validation_query_responses, tokenizer)
-            accelerator.print(accelerator.gather(reference_scores).mean())
+            validation_score = get_reward_complete(reward_model, postprocessed_sample_validation_query_responses, tokenizer)
+            
+            # carperAI-style score normaliation
+            accelerator.print("before score", scores, scores.mean())
+            accelerator.print("reference_scores", reference_scores, reference_scores.mean())
+            scores = scores - reference_scores
+            accelerator.print("after score", scores, scores.mean())
 
             # 3. filter response. Ensure that the sample contains truncate_token
             # responses not passing that filter will receive a low (fixed) score
             # only query humans on responses that pass that filter
-            matches_token = postprocessed_responses[:, args.task.truncate_after :] == args.task.truncate_token
-            filter_mask = torch.any(matches_token, dim=-1)
-            scores = torch.where(
-                filter_mask,
-                scores,
-                torch.full_like(scores, args.task.penalty_reward_value),
-            )
-            del matches_token, filter_mask
+            contain_pad_token = torch.any(postprocessed_responses == tokenizer.pad_token_id, dim=-1)
+            scores = torch.where(contain_pad_token, scores, torch.full_like(scores, args.task.penalty_reward_value))
             torch.cuda.empty_cache()
 
             # 4. compute rewards
@@ -831,44 +817,27 @@ if __name__ == "__main__":
 
             if args.print_sample_output_freq > 0 and (update - 1) % args.print_sample_output_freq == 0:
                 try:
-                    # all_decode_queries = tokenizer.batch_decode(queries, skip_special_tokens=True)
-                    # all_postprocessed_query_responses = tokenizer.batch_decode(
-                    #     postprocessed_query_responses, skip_special_tokens=True
-                    # )
-                    # all_postprocessed_responses = [
-                    #     x[len(y) :] for x, y in zip(all_postprocessed_query_responses, all_decode_queries)
-                    # ]
-                    # all_reference_responses = tokenizer.batch_decode(reference_responses, skip_special_tokens=True)
-
-                    # kl_sum = kl.sum(axis=1)
-                    # all_df = pd.DataFrame(
-                    #     {
-                    #         "query": all_decode_queries,
-                    #         "response": all_postprocessed_responses,
-                    #         "reference_responses": all_reference_responses,
-                    #         "score": scores.float().cpu().numpy(),
-                    #         "reference_scores": reference_scores.float().cpu().numpy(),
-                    #         "kl": kl_sum.float().cpu().numpy(),
-                    #         "reward": (scores - kl_ctl.value * kl_sum).float().cpu().numpy(),
-                    #     }
-                    # )
-                    # if accelerator.is_main_process and args.track:
-                    #     wandb.log({"query_responses": wandb.Table(dataframe=all_df)}, step=update)
-                    # print_rich_table("stuff", all_df[:4], console)
-                    all_decode_validation_queries = tokenizer.batch_decode(sample_validation_queries, skip_special_tokens=True)
+                    all_decode_validation_queries = tokenizer.batch_decode(sample_validation_queries)
                     all_sample_validation_query_responses = tokenizer.batch_decode(
-                        sample_validation_query_responses, skip_special_tokens=True
+                        sample_validation_query_responses
+                    )
+                    all_sample_validation_query_responses_postprocessed = tokenizer.batch_decode(
+                        postprocessed_sample_validation_query_responses
                     )
                     all_sample_validation_responses = [
                         x[len(y) :] for x, y in zip(all_sample_validation_query_responses, all_decode_validation_queries)
                     ]
+                    all_sample_validation_postprocessed_responses = [
+                        x[len(y) :] for x, y in zip(all_sample_validation_query_responses_postprocessed, all_decode_validation_queries)
+                    ]
                     all_sample_validation_reference_responses = tokenizer.batch_decode(
-                        sample_validation_reference_response, skip_special_tokens=True
+                        sample_validation_reference_response
                     )
                     all_sample_validation_df = pd.DataFrame(
                         {
                             "query": all_decode_validation_queries,
                             "response": all_sample_validation_responses,
+                            "postprocessed_response": all_sample_validation_postprocessed_responses,
                             "reference_responses": all_sample_validation_reference_responses,
                             "scores": validation_score.float().cpu().numpy(),
                             "reference_scores": sample_validation_reference_scores.float().cpu().numpy(),
@@ -880,13 +849,13 @@ if __name__ == "__main__":
                     
                 except Exception as e:
                     print(e)
-                # del (
-                #     all_decode_queries,
-                #     all_postprocessed_query_responses,
-                #     all_postprocessed_responses,
-                #     kl_sum,
-                #     all_df,
-                # )
+                del (
+                    all_decode_validation_queries,
+                    all_sample_validation_query_responses,
+                    all_sample_validation_responses,
+                    all_sample_validation_reference_responses,
+                    all_sample_validation_df,
+                )
             del postprocessed_query_responses
             torch.cuda.empty_cache()
 
@@ -926,6 +895,15 @@ if __name__ == "__main__":
 
                         # output, vpred_temp = forward(policy, mb_query_responses, tokenizer)
                         output, (_, vpred_temp) = forward(model, mb_query_responses, tokenizer)
+                        # TODO: value also use the EOS token index!!!!!!!!!!!!!!!!!!!
+                        # TODO: value also use the EOS token index!!!!!!!!!!!!!!!!!!!
+                        # TODO: value also use the EOS token index!!!!!!!!!!!!!!!!!!!
+                        # TODO: value also use the EOS token index!!!!!!!!!!!!!!!!!!!
+                        # TODO: value also use the EOS token index!!!!!!!!!!!!!!!!!!!
+                        # TODO: value also use the EOS token index!!!!!!!!!!!!!!!!!!!
+                        # TODO: value also use the EOS token index!!!!!!!!!!!!!!!!!!!
+                        # TODO: value also use the EOS token index!!!!!!!!!!!!!!!!!!!
+                        # TODO: value also use the EOS token index!!!!!!!!!!!!!!!!!!!
                         
                         logits = output.logits[:, context_length - 1 : -1]
                         logits /= (args.task.temperature + 1e-7)
@@ -951,6 +929,7 @@ if __name__ == "__main__":
                         pg_clipfrac = (pg_losses2 > pg_losses).float().mean()
                         loss = pg_loss + args.ppo.vf_coef * vf_loss
                         accelerator.backward(loss)
+                        breakpoint()
                         optimizer.step()
                         optimizer.zero_grad()
                         prob_dist = torch.nn.functional.softmax(logits, dim=-1)

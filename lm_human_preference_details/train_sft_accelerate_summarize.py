@@ -4,12 +4,13 @@ import random
 import time
 from dataclasses import asdict, dataclass, field
 from types import SimpleNamespace
-from typing import List, Optional
+from typing import List, Literal, Optional
 
 import numpy as np
 import pandas as pd
 import torch
 import torch.optim as optim
+from torch.nn import functional as F
 import tyro
 import evaluate
 from accelerate import Accelerator
@@ -25,7 +26,7 @@ from torch.optim.optimizer import (
 )
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
-from transformers import AutoModelForCausalLM, AutoTokenizer, GenerationConfig
+from transformers import AutoModelForCausalLM, AutoTokenizer, GenerationConfig, get_scheduler
 
 from lm_human_preference_details.data import process_query
 
@@ -37,6 +38,7 @@ class SFTHParams:
     noptepochs: int = 1
     lr: float = 6.35e-5
     eps: float = 1e-5
+    lm_loss_on_response_only: bool = False
     total_episodes: tyro.conf.Suppress[int] = None
     local_batch_size:tyro.conf.Suppress[int] = None
     batch_size: tyro.conf.Suppress[int] = None
@@ -99,6 +101,8 @@ class Args:
     """Whether to use cuda if available."""
     run_name: tyro.conf.Suppress[str] = None
     """TO BE FILLED: a unique name of this run"""
+    load_from_cache_file: bool = False
+    """Whether to load data from the local cache file in `dataset.map`"""
     upload_model: bool = False
     "whether to upload the saved model to huggingface"
     hf_entity: str = ""
@@ -110,10 +114,14 @@ class Args:
     """Whether to use deepspeed to train the model"""
     print_sample_output_freq: int = 220
     """How often to print sample output"""
-    save_path: str = "models/sft_policy.pt"
+    save_path: str = "models/sft_policy"
     """Where to save the model"""
-    use_tensorflow_adam: bool = True
-    """Whether to use tensorflow-style Adam optimizer instead of PyTorch's"""
+    optimizer: Literal["tf_adam", "adam", "adamw"] = "adamw"
+    """Which optimizer to use"""
+    scheduler: str = "cosine"
+    """Which scheduler to use"""
+    warm_up_steps: int = 0
+    """Number of warm up steps for the scheduler"""
     task: TaskHParams = field(default_factory=TaskHParams)
     sft: SFTHParams = field(default_factory=SFTHParams)
 
@@ -318,7 +326,6 @@ def forward(policy, query_responses, tokenizer):
     position_ids = attention_mask.cumsum(1) - attention_mask.long()  # exclusive cumsum
     input_ids = torch.masked_fill(query_responses, ~attention_mask, 0)
     return policy(
-        labels=input_ids,
         input_ids=input_ids,
         attention_mask=attention_mask,
         position_ids=position_ids,
@@ -326,7 +333,9 @@ def forward(policy, query_responses, tokenizer):
     )
 
 
-def train(args: Args):
+# def train(args: Args):
+if __name__ == "__main__":
+    args = tyro.cli(Args)
     accelerator = Accelerator(gradient_accumulation_steps=args.sft.gradient_accumulation_steps)
     args.sft.world_size = accelerator.num_processes
     args.sft.local_batch_size = args.sft.local_micro_batch_size * args.sft.gradient_accumulation_steps
@@ -351,7 +360,6 @@ def train(args: Args):
     run_name = f"{args.exp_name}__{args.seed}__{int(time.time())}"
     writer = SimpleNamespace()  # dummy writer
     writer.add_scalar = lambda x, y, z: None
-    writer.add_histogram = lambda x, y, z: None
     if accelerator.is_main_process:
         if args.track:
             import wandb
@@ -389,10 +397,19 @@ def train(args: Args):
     policy.generation_config.pad_token_id = None  # generate tokens without truncation / padding
     # IMPORTANT: Layer norm produces weird gradients, which affects Adam optimizer to impact all the parameters systematically
     # see https://github.com/pytorch/pytorch/issues/104857 for more details
-    if args.use_tensorflow_adam:
+    if args.optimizer == "tf_adam":
         optimizer = AdamTensorFlowStyle(policy.parameters(), lr=args.sft.lr, eps=args.sft.eps)
-    else:
+    elif args.optimizer == "adam":
         optimizer = optim.Adam(policy.parameters(), lr=args.sft.lr, eps=args.sft.eps)
+    elif args.optimizer == "adamw":
+        optimizer = optim.AdamW(policy.parameters(), lr=args.sft.lr, eps=args.sft.eps)
+    # TODO: use AdamW
+    scheduler = get_scheduler(
+        args.scheduler,
+        optimizer=optimizer,
+        num_warmup_steps=args.warm_up_steps,
+        num_training_steps=args.sft.num_updates // args.sft.gradient_accumulation_steps,
+    )
 
     def process_query_data(x):
         return {
@@ -403,15 +420,15 @@ def train(args: Args):
             ),
         }
 
-    dataset = dataset.map(process_query_data)
+    dataset = dataset.map(process_query_data, load_from_cache_file=args.load_from_cache_file)
     dataset = dataset.with_format("torch", columns=["query_token", "reference_response"])
     dataset = dataset.shuffle(seed=local_seed)
-    test_dataset = test_dataset.map(process_query_data)
+    test_dataset = test_dataset.map(process_query_data, load_from_cache_file=args.load_from_cache_file)
     test_dataset = test_dataset.with_format("torch", columns=["query_token", "reference_response"])
     test_dataset = test_dataset.shuffle(seed=local_seed)
     dataloader = DataLoader(dataset, batch_size=args.sft.local_micro_batch_size)
     test_dataloader = DataLoader(test_dataset, batch_size=args.sft.local_micro_batch_size)
-    policy, optimizer, dataloader, test_dataloader = accelerator.prepare(policy, optimizer, dataloader, test_dataloader)
+    policy, optimizer, dataloader, test_dataloader, scheduler = accelerator.prepare(policy, optimizer, dataloader, test_dataloader, scheduler)
     iter_dataloader = iter(dataloader)
     # WARNING: even with `max_new_tokens` and `min_new_tokens` set to the same value, the number of tokens generated
     # may not be the same. TODO: investigate further, we just want to generate a fixed number of tokens
@@ -427,94 +444,123 @@ def train(args: Args):
 
     print("===training policy===")
     global_step = 0
-    test_data = test_dataset[0:10]
-    test_data = {k: v.to(device) for k, v in test_data.items()}
     loss_stats = torch.zeros(args.sft.gradient_accumulation_steps, device=device)
     gradient_accumulation_idx = 0
-
-    # Given parameters
-    eta_min = 0
-    eta_max = 6.35e-5
-    T_max = args.sft.num_updates
-
+    policy.train()
     for update in range(1, args.sft.num_updates + 1):
-        global_step += 1 * args.sft.batch_size
+        global_step += args.sft.batch_size
         accelerator.print(f"update {update}, global_step {global_step}")
-        # frac = 1.0 - (update - 1.0) / args.sft.num_updates
-        # lrnow = frac * args.sft.lr
-        lrnow = eta_min + 0.5 * (eta_max - eta_min) * (1 + np.cos(np.pi * (update - 1) / T_max))
-        optimizer.param_groups[0]["lr"] = lrnow
         data = next(iter_dataloader)
-        queries = data["query_token"].to(device)
-        reference_responses = data["reference_response"].to(device)
+        reference_responses = data["reference_response"].to(device, non_blocking=True)
+        queries = data["query_token"].to(device, non_blocking=True)
+        queries = right_padding_to_left_padding(queries, tokenizer.pad_token_id).to(device)
         query_responses = torch.cat((queries, reference_responses), dim=1)
-        query_responses = right_padding_to_left_padding(query_responses, tokenizer.pad_token_id).to(device)
         with accelerator.accumulate(policy):
             output = forward(policy, query_responses, tokenizer)
-            loss = output.loss
+            # mask out gradient effects on response padding tokens
+            labels = query_responses.masked_fill(query_responses == tokenizer.pad_token_id, -1)
+            if args.sft.lm_loss_on_response_only:
+                # mask out gradient effects on query tokens
+                labels[:, :queries.shape[1]] = -1
+            lm_logits = output.logits
+            # hand-rolled transformer loss: Shift so that tokens < n predict n
+            # but unlike `transformers` we mask the padding tokens via `ignore_index=-1`
+            shift_logits = lm_logits[..., :-1, :].contiguous()
+            shift_labels = labels[..., 1:].contiguous()
+            loss = F.cross_entropy(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1), ignore_index=-1)
             accelerator.backward(loss)
             optimizer.step()
             optimizer.zero_grad()
+            scheduler.step()
         loss_stats[gradient_accumulation_idx] = loss
         gradient_accumulation_idx = (gradient_accumulation_idx + 1) % args.sft.gradient_accumulation_steps
         if update > 1 and (update - 1) % args.sft.gradient_accumulation_steps == 0:
             writer.add_scalar("loss", accelerator.gather(loss_stats).mean().item(), update)
-            writer.add_scalar("lr", lrnow, update)
-        if (update - 1) % args.print_sample_output_freq * args.sft.gradient_accumulation_steps == 0:
+            writer.add_scalar("lr", optimizer.param_groups[0]["lr"], update)
+        if update == 1 or update == args.sft.num_updates - 1:
+            policy.eval()
             rouge_scores = collections.defaultdict(list)
+            all_decode_test_queries = []
+            all_decode_test_query_responses = []
+            all_decode_test_responses = []
+            all_decode_test_reference_responses = []
+            all_test_losses = []
             for test_idx, test_data in enumerate(test_dataloader):
                 with torch.no_grad():
-                    test_queries = test_data["query_token"].to(device)
-                    test_reference_responses = test_data["reference_response"].to(device)
+                    test_reference_responses = test_data["reference_response"].to(device, non_blocking=True)
+                    test_queries = test_data["query_token"].to(device, non_blocking=True)
                     test_queries = right_padding_to_left_padding(test_queries, tokenizer.pad_token_id)
+                    test_query_reference_responses = torch.cat((test_queries, test_reference_responses), dim=1)
+
+                    test_output = forward(policy, test_query_reference_responses, tokenizer)
+                    test_labels = test_query_reference_responses.masked_fill(test_query_reference_responses == tokenizer.pad_token_id, -1)
+                    if args.sft.lm_loss_on_response_only:
+                        test_labels[:, :queries.shape[1]] = -1
+                    test_lm_logits = test_output.logits
+                    # hand-rolled transformer loss: Shift so that tokens < n predict n
+                    # but unlike `transformers` we mask the padding tokens via `ignore_index=-1`
+                    test_shift_logits = test_lm_logits[..., :-1, :].contiguous()
+                    test_shift_labels = test_labels[..., 1:].contiguous()
+                    test_loss = F.cross_entropy(test_shift_logits.view(-1, test_shift_logits.size(-1)), test_shift_labels.view(-1), ignore_index=-1)
+                    test_loss = accelerator.gather(test_loss)
+                    all_test_losses.append(test_loss)
+
                     generated_responses = generate(accelerator.unwrap_model(policy), test_queries, tokenizer, generation_config)
-                    accelerator.print(update, test_idx)
-                    
-                    all_decode_test_queries = tokenizer.batch_decode(test_queries, skip_special_tokens=True)
-                    all_decode_test_query_responses = tokenizer.batch_decode(generated_responses, skip_special_tokens=True)
-                    all_decode_test_reference_responses = tokenizer.batch_decode(
-                        test_reference_responses, skip_special_tokens=True
+                    decode_test_queries = tokenizer.batch_decode(accelerator.gather(test_queries))
+                    decode_test_query_responses = tokenizer.batch_decode(accelerator.gather(generated_responses))
+                    decode_test_reference_responses = tokenizer.batch_decode(
+                        accelerator.gather(test_reference_responses)
                     )
-                    all_decode_test_responses = [
-                        x[len(y) :] for x, y in zip(all_decode_test_query_responses, all_decode_test_queries)
+                    decode_test_responses = [
+                        x[len(y) :] for x, y in zip(decode_test_query_responses, decode_test_queries)
                     ]
-                    rouge_score = rouge.compute(predictions=all_decode_test_responses, references=all_decode_test_reference_responses)
+                    rouge_score = rouge.compute(predictions=decode_test_responses, references=decode_test_reference_responses)
                     rouge_scores["rouge1"].append(rouge_score["rouge1"])
                     rouge_scores["rouge2"].append(rouge_score["rouge2"])
                     rouge_scores["rougeL"].append(rouge_score["rougeL"])
 
-                    if test_idx == 0:
-                        try:
-                            all_df = pd.DataFrame(
-                                {
-                                    "query": all_decode_test_queries,
-                                    "response": all_decode_test_responses,
-                                    "reference": all_decode_test_reference_responses,
-                                }
-                            )
-                            if accelerator.is_main_process and args.track:
-                                wandb.log({"samples/query_responses": wandb.Table(dataframe=all_df)}, step=update)
-                            print_rich_table(f"Sample Output at Step {update}", all_df[:4], console)
-                        except Exception as e:
-                            print(e)
+                    all_decode_test_queries.extend(decode_test_queries)
+                    accelerator.print("len(all_decode_test_queries)", len(all_decode_test_queries), decode_test_responses)
+                    all_decode_test_query_responses.extend(decode_test_query_responses)
+                    all_decode_test_responses.extend(decode_test_responses)
+                    all_decode_test_reference_responses.extend(decode_test_reference_responses)
+                if test_idx == 10:
+                    break
+
+            try:
+                all_df = pd.DataFrame(
+                    {
+                        "query": all_decode_test_queries,
+                        "response": all_decode_test_responses,
+                        "reference": all_decode_test_reference_responses,
+                    }
+                )
+                accelerator.print(all_df)
+                if accelerator.is_main_process and args.track:
+                    wandb.log({"samples/query_responses": wandb.Table(dataframe=all_df)}, step=update)
+                    print_rich_table(f"Sample Output at Step {update}", all_df[:4], console)
+            except Exception as e:
+                print(e)
             
             for k, v in rouge_scores.items():
                 rouge_metric = torch.tensor(v, device=device)
                 rouge_metric = accelerator.gather(rouge_metric)
                 writer.add_scalar(f"rouge/{k}", rouge_metric.mean().item(), update)
                 accelerator.print(f"rouge/{k}: {rouge_metric.mean().item()} {rouge_metric.shape} {rouge_metric}")
+            writer.add_scalar("test_loss", torch.stack(all_test_losses).mean().item(), update)
+            policy.train()
 
     # save model
     if args.save_path:
         os.makedirs(os.path.dirname(args.save_path), exist_ok=True)
-        accelerator.save_model(policy, args.save_path)
+        accelerator.save_model(policy, args.save_path, max_shard_size="1000GB")
 
-        if args.upload_model:
-            repo_name = f"{args.exp_name}__{args.rewards.label_dataset}__seed{args.seed}__{int(time.time())}"
+        if args.upload_model and accelerator.is_main_process:
+            repo_name = f"{args.exp_name}__tldr__seed{args.seed}__{int(time.time())}"
             repo_id = f"{args.hf_entity}/{repo_name}" if args.hf_entity else repo_name
             policy.save_pretrained(repo_id, safe_serialization=True, push_to_hub=True)
             tokenizer.save_pretrained(repo_id, push_to_hub=True)
 
-if __name__ == "__main__":
-    args = tyro.cli(Args)
-    train(args)
+# if __name__ == "__main__":
+#     args = tyro.cli(Args)
+#     train(args)
