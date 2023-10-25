@@ -3,10 +3,9 @@ import random
 import time
 from dataclasses import asdict, dataclass, field
 from types import SimpleNamespace
-from typing import List, Literal, Optional
+from typing import Optional
 
 import numpy as np
-import pandas as pd
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -14,22 +13,14 @@ import torch.optim as optim
 import tyro
 from accelerate import Accelerator
 from accelerate.state import AcceleratorState
-from datasets import load_dataset
 from rich.console import Console
 from rich.pretty import pprint
-from rich.table import Table
-from torch import Tensor, optim
-from torch.optim.optimizer import (
-    _dispatch_sqrt,
-    _get_value,
-    _use_grad_for_differentiable,
-)
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, IterableDataset
 from torch.utils.tensorboard import SummaryWriter
 from transformers import AutoModelForCausalLM, AutoTokenizer, GenerationConfig
 
+from lm_human_preference_details.data import DATASET
 
-INVALID_LOGPROB = 1.0
 
 @dataclass
 class AdaptiveKLParams:
@@ -40,9 +31,8 @@ class AdaptiveKLParams:
 @dataclass
 class RewardHParams:
     kl_coef: float = 0.15
-    use_adaptive_kl: bool = True
     adaptive_kl: Optional[AdaptiveKLParams] = field(default_factory=AdaptiveKLParams)
-    trained_model: Optional[str] = "models/gpt2medium_last_index_reward/pytorch_model.bin"
+    trained_model: Optional[str] = "models/reward.pt"
     label_dataset: tyro.conf.Suppress[Optional[str]] = None
 
 
@@ -76,37 +66,23 @@ class PpoHParams:
 @dataclass
 class TaskHParams:
     # Query params
-    query_length: int = 512
-    query_dataset: str = "vwxyzjn/summarize_from_feedback_tldr_3_filtered_oai_preprocessing"
-
-    query_format_str: Optional[str] = "SUBREDDIT: r/{subreddit}\n\nTITLE: {title}\n\nPOST: {post}\n\nTL;DR:"
-    query_truncate_field: Optional[str] = "post"
-    query_truncate_text: Optional[str] = "\n"
-    query_padding: Optional[str] = None  # defaults to repeated spaces
-    query_pad_side: Optional[str] = "left"
+    query_length: int = 64
+    query_dataset: str = "books"
+    query_prefix: str = ""
+    query_suffix: str = ""
+    start_text: Optional[str] = None
+    end_text: Optional[str] = None
 
     # Response params
-    response_length: int = 48
+    response_length: int = 24
 
     # Truncate response after the first occurrence of this token at or after index after when sampling.
-    truncate_token: int = 50256  # EOS token
+    truncate_token: int = 13
     truncate_after: int = 16
     penalty_reward_value: int = -1
 
     # LM params
     temperature: float = 0.7
-
-
-# a patch
-@dataclass
-class TaskQueryHParams:
-    length: int = None
-    dataset: str = None
-    format_str: Optional[str] = None  # if underlying dataset yields dicts, can format arbitrarily
-    truncate_field: Optional[str] = None
-    truncate_text: Optional[str] = None
-    padding: Optional[str] = None  # defaults to repeated spaces
-    pad_side: Optional[str] = None
 
 
 @dataclass
@@ -126,50 +102,30 @@ class Args:
     """Whether to use cuda if available."""
     run_name: tyro.conf.Suppress[str] = None
     """TO BE FILLED: a unique name of this run"""
-    load_from_cache_file: bool = False
-    """Whether to load data from the local cache file in `dataset.map`"""
-    upload_model: bool = False
-    "whether to upload the saved model to huggingface"
-    hf_entity: str = ""
-    "the user or org name of the model repository from the Hugging Face Hub"
 
     base_model: str = "gpt2"
     """the name of the pretrained model to use"""
     deepspeed: bool = False
     """Whether to use deepspeed to train the model"""
-    print_sample_output_freq: int = 1
+    print_sample_output_freq: int = 0
     """How often to print sample output"""
-    sft_model_path: str = ""
-    """Where to load the SFT model"""
     save_path: str = "models/policy.pt"
     """Where to save the model"""
-    optimizer: Literal["tf_adam", "adam", "adamw"] = "adamw"
-    """Which optimizer to use"""
+    use_tensorflow_adam: bool = True
+    """Whether to use tensorflow-style Adam optimizer instead of PyTorch's"""
     task: TaskHParams = field(default_factory=TaskHParams)
     rewards: RewardHParams = field(default_factory=RewardHParams)
     ppo: PpoHParams = field(default_factory=PpoHParams)
 
 
-def first_true_indices(bools, dtype=torch.long):
-    """
-    Takes an N-dimensional bool tensor and returns an (N-1)-dimensional tensor of integers giving
-    the position of the first True in each "row".
+from typing import List, Optional
 
-    Returns the length of the rows (bools.size(-1)) if no element is True in a given row.
-    """
-    row_len = bools.size(-1)
-    zero_or_index = row_len * (~bools).type(dtype) + torch.arange(row_len, dtype=dtype, device=bools.device)
-    return torch.min(zero_or_index, dim=-1).values
-
-
-def print_rich_table(title: str, df: pd.DataFrame, console: Console) -> Table:
-    table = Table(show_lines=True)
-    for column in df.columns:
-        table.add_column(column)
-    for _, row in df.iterrows():
-        table.add_row(*row.astype(str).tolist())
-    console.rule(f"[bold red]{title}")
-    console.print(table)
+from torch import Tensor, optim
+from torch.optim.optimizer import (
+    _dispatch_sqrt,
+    _get_value,
+    _use_grad_for_differentiable,
+)
 
 
 def _single_tensor_adam(
@@ -347,6 +303,17 @@ def whiten(values, shift_mean=True):
     return whitened
 
 
+class AutoModelForCausalLMWithScalarHead(nn.Module):
+    def __init__(self, lm_backbone):
+        super().__init__()
+        self.lm_backbone = lm_backbone
+        self.scalar_head = layer_init(nn.Linear(lm_backbone.config.hidden_size, 1), std=0)
+
+    def forward(self, **kwargs):
+        output = self.lm_backbone(**kwargs)
+        return output, self.scalar_head(output.hidden_states[-1])
+
+
 class AutoModelForCausalLMWithRewardHead(nn.Module):
     def __init__(self, lm_backbone):
         super().__init__()
@@ -355,35 +322,55 @@ class AutoModelForCausalLMWithRewardHead(nn.Module):
             nn.Linear(lm_backbone.config.hidden_size, 1),
             std=1 / np.sqrt(lm_backbone.config.hidden_size + 1),
         )
-        # self.reward_gain = torch.nn.Parameter(torch.tensor(1.0), requires_grad=True)
-        # self.reward_bias = torch.nn.Parameter(torch.tensor(0.0), requires_grad=True)
-
-    def forward(self, **kwargs):
-        output = self.lm_backbone(**kwargs)
-        latents = output.hidden_states[-1] # shape: [batch_size, length, hidden_size]
-        scalars = self.scalar_head(latents).squeeze(-1) # shape: [batch_size, length]
-        last_scalar = scalars[:, -1] # shape: [batch_size, 1]
-        return scalars, last_scalar
+        self.reward_gain = torch.nn.Parameter(torch.tensor(1.0), requires_grad=True)
+        self.reward_bias = torch.nn.Parameter(torch.tensor(0.0), requires_grad=True)
 
 
-# taken from https://github.com/OpenLMLab/MOSS-RLHF/blob/40b91eb2f2b71b16919addede0341d2bef70825d/ppo/ppo_trainer.py#L29
-# we did this we can do a single `model = accelerator.prepare(model)`
-class PolicyAndValueWrapper(nn.Module):
-    def __init__(self, policy, critic) -> None:
-        super().__init__()
-        self.policy = policy
-        self.critic = critic
-    
-    def forward(self, **kwargs):
-        return self.policy(**kwargs), self.critic(**kwargs)
-    
+# a pytorch dataset
+class MyDataset(IterableDataset):
+    def __init__(self, generator, tokenizer, query_length, seed, start_text=None, end_text=None):
+        self.generator = generator
+        self.tokenizer = tokenizer
+        self.query_length = query_length
+        self.start_text = start_text
+        self.end_text = end_text
+        self.seed = seed
+        token_to_index = tokenizer.get_vocab()
+        self.start_token = token_to_index[start_text] if self.start_text else None
+        self.end_token = token_to_index[end_text] if self.end_text else None
 
-def right_padding_to_left_padding(tokens, pad_id):
-    """Convert from right padding to left padding."""
-    assert tokens.ndim == 2
+    def __iter__(self):
+        for text in self.generator("train", self.seed, shuffle=True):
+            tokens = self.tokenizer.encode(text)
+            if self.start_token is not None:
+                try:
+                    first_index = tokens.index(self.start_token) + 1
+                    if first_index < len(tokens):
+                        tokens = tokens[first_index:]
+                except:
+                    continue
+            tokens = tokens[: self.query_length]
+            if self.end_token is not None:
+                try:
+                    last_index = len(tokens) - tokens[::-1].index(self.end_token)
+                    tokens = tokens[:last_index]
+                except:
+                    continue
+            output = self.tokenizer.pad(
+                {"input_ids": tokens},
+                padding="max_length",
+                max_length=self.query_length,
+                return_tensors="pt",
+                return_attention_mask=True,
+            )
+            yield output
+
+
+def right_padding_to_left_padding(query, pad_id):
+    # Convert from right padding to left padding.
     return torch.tensor(
-        [[pad_id] * (row == pad_id).sum() + [x for x in row if x != pad_id] for row in tokens],
-        device=tokens.device,
+        [[pad_id] * (row == pad_id).sum() + [x for x in row if x != pad_id] for row in query],
+        device=query.device,
     )
 
 
@@ -402,7 +389,8 @@ def generate(lm_backbone, queries, tokenizer, generation_config):
     """generate in a way that does not affect padding tokens"""
     context_length = queries.shape[1]
     attention_mask = queries != tokenizer.pad_token_id
-    input_ids = torch.masked_fill(queries, ~attention_mask, 0)
+    input_ids = queries.clone()
+    input_ids[~attention_mask] = 0  # set padding tokens to 0
     output = lm_backbone.generate(
         input_ids=input_ids,
         attention_mask=attention_mask,
@@ -410,26 +398,34 @@ def generate(lm_backbone, queries, tokenizer, generation_config):
         generation_config=generation_config,
         return_dict_in_generate=True,
     )
+    # restore padding tokens
     return torch.cat((queries, output.sequences[:, context_length:]), dim=1)
 
 
 def get_reward(reward_model, query_responses, tokenizer):
     attention_mask = query_responses != tokenizer.pad_token_id
     position_ids = attention_mask.cumsum(1) - attention_mask.long()  # exclusive cumsum
-    input_ids = torch.masked_fill(query_responses, ~attention_mask, 0)
-    return reward_model(
+    input_ids = query_responses.clone()
+    input_ids[~attention_mask] = 0
+    output = reward_model.lm_backbone(
         input_ids=input_ids,
         attention_mask=attention_mask,
         position_ids=position_ids,
         return_dict=True,
         output_hidden_states=True,
     )
+    reward = reward_model.scalar_head(output.hidden_states[-1])
+    reward = reward_model.reward_gain * reward + reward_model.reward_bias
+    # but we only care about the reward of the last token
+    reward = reward[:, -1]
+    return reward
 
 
 def forward(policy, query_responses, tokenizer):
     attention_mask = query_responses != tokenizer.pad_token_id
     position_ids = attention_mask.cumsum(1) - attention_mask.long()  # exclusive cumsum
-    input_ids = torch.masked_fill(query_responses, ~attention_mask, 0)
+    input_ids = query_responses.clone()
+    input_ids[~attention_mask] = 0
     return policy(
         input_ids=input_ids,
         attention_mask=attention_mask,
@@ -439,17 +435,7 @@ def forward(policy, query_responses, tokenizer):
     )
 
 
-def truncate_response(args, tokenizer, responses):
-    trunc_idxs = first_true_indices(responses == args.task.truncate_token).unsqueeze(-1)
-    new_size = [1] * (len(responses.size()) - 1) + [args.task.response_length]
-    idxs = torch.arange(args.task.response_length, device=responses.device).view(*new_size)
-    postprocessed_responses = torch.masked_fill(responses, idxs > trunc_idxs, tokenizer.pad_token_id)
-    postprocessed_responses = right_padding_to_left_padding(postprocessed_responses, tokenizer.pad_token_id)
-    return postprocessed_responses
-
-# def train(args: Args):
-if __name__ == "__main__":
-    args = tyro.cli(Args)
+def train(args: Args):
     accelerator = Accelerator(gradient_accumulation_steps=args.ppo.gradient_accumulation_steps)
     args.ppo.world_size = accelerator.num_processes
     args.ppo.batch_size = int(args.ppo.local_batch_size * args.ppo.world_size)
@@ -501,53 +487,44 @@ if __name__ == "__main__":
     )
     # we use the padding token manually but do not resize the token embedding of the model
     tokenizer.add_special_tokens({"pad_token": "[PAD]"})
-    reward_model = AutoModelForCausalLMWithRewardHead(
-        AutoModelForCausalLM.from_pretrained(args.base_model, trust_remote_code=True)
-    )
-    critic = AutoModelForCausalLMWithRewardHead(
-        AutoModelForCausalLM.from_pretrained(args.base_model, trust_remote_code=True)
-    )
+    reward_model = AutoModelForCausalLMWithRewardHead(AutoModelForCausalLM.from_pretrained(args.base_model, trust_remote_code=True))
     if args.rewards.trained_model:
         reward_model.load_state_dict(torch.load(args.rewards.trained_model, map_location=device))
-        critic.load_state_dict(torch.load(args.rewards.trained_model, map_location=device))
         print(f"loaded pretrained reward model from {args.rewards.trained_model}")
     # each class should have a separate pretrained model that do not share weights
-    ref_policy = AutoModelForCausalLM.from_pretrained(args.base_model, trust_remote_code=True)
-    policy = AutoModelForCausalLM.from_pretrained(args.base_model, trust_remote_code=True)
-    if args.sft_model_path:
-        policy.load_state_dict(torch.load(args.sft_model_path, map_location=device))
-        ref_policy.load_state_dict(torch.load(args.sft_model_path, map_location=device))
-        print(f"loaded pretrained policy from {args.sft_model_path}")
-    policy.generation_config.eos_token_id = (
+    ref_policy = AutoModelForCausalLMWithScalarHead(AutoModelForCausalLM.from_pretrained(args.base_model, trust_remote_code=True))
+    policy = AutoModelForCausalLMWithScalarHead(AutoModelForCausalLM.from_pretrained(args.base_model, trust_remote_code=True))
+    policy.lm_backbone.generation_config.eos_token_id = (
         None  # disable `pad_token_id` and `eos_token_id` because we just want to
     )
-    policy.generation_config.pad_token_id = None  # generate tokens without truncation / padding
-    model = PolicyAndValueWrapper(policy, critic)
-    if args.optimizer == "tf_adam":
-        optimizer = AdamTensorFlowStyle(model.parameters(), lr=args.ppo.lr, eps=args.ppo.eps)
-    elif args.optimizer == "adam":
-        optimizer = optim.Adam(model.parameters(), lr=args.ppo.lr, eps=args.ppo.eps)
-    elif args.optimizer == "adamw":
-        optimizer = optim.AdamW(model.parameters(), lr=args.ppo.lr, eps=args.ppo.eps)
-
-    dataset = load_dataset(args.task.query_dataset, split="train")
-    validation_dataset = load_dataset(args.task.query_dataset, split="validation")
-    dataset = dataset.with_format("torch", columns=["query_token", "reference_response_token"])
-    dataset = dataset.shuffle(seed=local_seed)
+    policy.lm_backbone.generation_config.pad_token_id = None  # generate tokens without truncation / padding
+    # IMPORTANT: Layer norm produces weird gradients, which affects Adam optimizer to impact all the parameters systematically
+    # see https://github.com/pytorch/pytorch/issues/104857 for more details
+    if args.use_tensorflow_adam:
+        optimizer = AdamTensorFlowStyle(policy.parameters(), lr=args.ppo.lr, eps=args.ppo.eps)
+    else:
+        optimizer = optim.Adam(policy.parameters(), lr=args.ppo.lr, eps=args.ppo.eps)
+    dataset = MyDataset(
+        DATASET[args.task.query_dataset],
+        tokenizer,
+        args.task.query_length,
+        seed=local_seed,
+        start_text=args.task.start_text,
+        end_text=args.task.end_text,
+    )
     dataloader = DataLoader(dataset, batch_size=args.ppo.local_batch_size)
-    validation_dataset = validation_dataset.with_format("torch", columns=["query_token", "reference_response_token"])
-    validation_dataloader = DataLoader(validation_dataset, batch_size=args.ppo.local_batch_size)
-    model, optimizer, dataloader = accelerator.prepare(model, optimizer, dataloader)
-    validation_dataloader = accelerator.prepare(validation_dataloader)
+    policy, optimizer, dataloader = accelerator.prepare(policy, optimizer, dataloader)
     if args.deepspeed:
         import deepspeed
 
         deepspeed_states = AcceleratorState().deepspeed_plugin
-        # deepspeed_states.deepspeed_config["train_micro_batch_size_per_gpu"] = args.ppo.local_micro_batch_size
-        # deepspeed_states.deepspeed_config["checkpoint"] = {"use_node_local_storage": True}
+        deepspeed_states.deepspeed_config['train_micro_batch_size_per_gpu'] = args.ppo.local_micro_batch_size
+        deepspeed_states.deepspeed_config['checkpoint'] = {'use_node_local_storage': True}
+        off_load_device = "cpu"
+        stage = 3
         eval_ds_config = {
-            "train_micro_batch_size_per_gpu": deepspeed_states.deepspeed_config["train_micro_batch_size_per_gpu"],
-            # "steps_per_print": 10,
+            "train_micro_batch_size_per_gpu": deepspeed_states.deepspeed_config['train_micro_batch_size_per_gpu'],
+            "steps_per_print": 10,
             # "zero_optimization": {
             #     "stage": stage,
             #     "stage3_param_persistence_threshold": 1e4,
@@ -555,9 +532,11 @@ if __name__ == "__main__":
             #         "device": off_load_device
             #     }
             # },
-            "bf16": {"enabled": True},
+            "bf16": {
+                "enabled": True
+            },
             "prescale_gradients": False,
-            "wall_clock_breakdown": False,
+            "wall_clock_breakdown": False
         }
         reward_model, *_ = deepspeed.initialize(model=reward_model, config=eval_ds_config)
         reward_model.eval()
@@ -566,30 +545,14 @@ if __name__ == "__main__":
     else:
         ref_policy = ref_policy.to(device)
         reward_model = reward_model.to(device)
-
-    def repeat_generator():  # TODO: ideally we shuffle the dataloader as well
-        while True:
-            yield from dataloader
-
-    sample_validation_inds = np.arange(args.ppo.batch_size)
-    local_sample_validation_inds = sample_validation_inds[accelerator.process_index :: accelerator.num_processes]
-    sample_validation = validation_dataset[local_sample_validation_inds]
-    sample_validation_queries = torch.Tensor(sample_validation["query_token"]).to(device)
-    with torch.no_grad():
-        sample_validation_queries = right_padding_to_left_padding(sample_validation_queries, tokenizer.pad_token_id)
-        sample_validation_reference_response = torch.Tensor(sample_validation["reference_response_token"]).to(device)
-        sample_validation_query_reference_responses = torch.cat((sample_validation_queries, sample_validation_reference_response), dim=1)
-        sample_validation_query_reference_responses = right_padding_to_left_padding(sample_validation_query_reference_responses, tokenizer.pad_token_id)
-        _, sample_validation_reference_scores = get_reward(reward_model, sample_validation_query_reference_responses, tokenizer)
-
-    iter_dataloader = iter(repeat_generator())
+    iter_dataloader = iter(dataloader)
     kl_ctl = AdaptiveKLController(args.rewards.kl_coef, hparams=args.rewards.adaptive_kl)
     # WARNING: even with `max_new_tokens` and `min_new_tokens` set to the same value, the number of tokens generated
     # may not be the same. TODO: investigate further, we just want to generate a fixed number of tokens
     generation_config = GenerationConfig(
         max_new_tokens=args.task.response_length,
         min_new_tokens=args.task.response_length,
-        temperature=(args.task.temperature + 1e-7),
+        temperature=args.task.temperature,
         top_k=0.0,
         top_p=1.0,
         do_sample=True,
@@ -597,13 +560,62 @@ if __name__ == "__main__":
 
     print("===training policy===")
     global_step = 0
-    stats_shape = (args.ppo.noptepochs, args.ppo.nminibatches, args.ppo.gradient_accumulation_steps)
-    approxkls_stats = torch.zeros(stats_shape, device=device)
-    clipfracs_stats = torch.zeros(stats_shape, device=device)
-    pg_losses_stats = torch.zeros(stats_shape, device=device)
-    vf_losses_stats = torch.zeros(stats_shape, device=device)
-    vf_clipfrac_stats = torch.zeros(stats_shape, device=device)
-    entropies_stats = torch.zeros(stats_shape, device=device)
+    approxkls_stats = torch.zeros(
+        (
+            args.ppo.noptepochs,
+            args.ppo.nminibatches,
+            args.ppo.gradient_accumulation_steps,
+        ),
+        device=device,
+    )
+    clipfracs_stats = torch.zeros(
+        (
+            args.ppo.noptepochs,
+            args.ppo.nminibatches,
+            args.ppo.gradient_accumulation_steps,
+        ),
+        device=device,
+    )
+    pg_losses_stats = torch.zeros(
+        (
+            args.ppo.noptepochs,
+            args.ppo.nminibatches,
+            args.ppo.gradient_accumulation_steps,
+        ),
+        device=device,
+    )
+    vf_losses_stats = torch.zeros(
+        (
+            args.ppo.noptepochs,
+            args.ppo.nminibatches,
+            args.ppo.gradient_accumulation_steps,
+        ),
+        device=device,
+    )
+    vf_clipfrac_stats = torch.zeros(
+        (
+            args.ppo.noptepochs,
+            args.ppo.nminibatches,
+            args.ppo.gradient_accumulation_steps,
+        ),
+        device=device,
+    )
+    entropies_stats = torch.zeros(
+        (
+            args.ppo.noptepochs,
+            args.ppo.nminibatches,
+            args.ppo.gradient_accumulation_steps,
+        ),
+        device=device,
+    )
+    ratio_stats = torch.zeros(
+        (
+            args.ppo.noptepochs,
+            args.ppo.nminibatches,
+            args.ppo.gradient_accumulation_steps,
+        ),
+        device=device,
+    )
     for update in range(1, args.ppo.num_updates + 1):
         global_step += 1 * args.ppo.batch_size
         frac = 1.0 - (update - 1.0) / args.ppo.num_updates
@@ -611,13 +623,10 @@ if __name__ == "__main__":
         optimizer.param_groups[0]["lr"] = lrnow
         data = next(iter_dataloader)
         with torch.no_grad():
-            queries = data["query_token"].to(device)
-            reference_responses = data["reference_response_token"].to(device)
-            queries = right_padding_to_left_padding(data["query_token"], tokenizer.pad_token_id).to(device)
-            query_reference_responses = torch.cat((queries, reference_responses), dim=1)
-            query_reference_responses = right_padding_to_left_padding(query_reference_responses, tokenizer.pad_token_id)
+            queries = data["input_ids"].to(device)
+            queries = right_padding_to_left_padding(data["input_ids"], tokenizer.pad_token_id).to(device)
             query_responses = generate(
-                accelerator.unwrap_model(model).policy,
+                accelerator.unwrap_model(policy).lm_backbone,
                 queries,
                 tokenizer,
                 generation_config,
@@ -625,64 +634,62 @@ if __name__ == "__main__":
             context_length = queries.shape[1]
             responses = query_responses[:, context_length:]
 
-            # validation
-            sample_validation_query_responses = generate(
-                accelerator.unwrap_model(model).policy,
-                sample_validation_queries,
-                tokenizer,
-                generation_config,
-            )
-            sample_validation_responses = sample_validation_query_responses[:, context_length:]
-            postprocessed_sample_validation_responses = truncate_response(args, tokenizer, sample_validation_responses)
-            postprocessed_sample_validation_query_responses = torch.cat((sample_validation_queries, postprocessed_sample_validation_responses), 1)
-            torch.cuda.empty_cache()
-
-            output = forward(accelerator.unwrap_model(model).policy, query_responses, tokenizer)
+            output, full_values = forward(policy, query_responses, tokenizer)
+            values = full_values[:, context_length - 1 : -1].squeeze(-1)
             logits = output.logits[:, context_length - 1 : -1]
-            logits /= (args.task.temperature + 1e-7)
+            logits /= args.task.temperature
             all_logprobs = F.log_softmax(logits, dim=-1)
             logprobs = torch.gather(all_logprobs, 2, responses.unsqueeze(-1)).squeeze(-1)
             del output, logits, all_logprobs
             torch.cuda.empty_cache()
 
-            ref_output = forward(ref_policy, query_responses, tokenizer)
+            ref_output, _ = forward(ref_policy, query_responses, tokenizer)
             ref_logits = ref_output.logits[:, context_length - 1 : -1]
-            ref_logits /= (args.task.temperature + 1e-7)
+            ref_logits /= args.task.temperature
             ref_all_logprobs = F.log_softmax(ref_logits, dim=-1)
             ref_logprobs = torch.gather(ref_all_logprobs, 2, responses.unsqueeze(-1)).squeeze(-1)
             del ref_output, ref_logits, ref_all_logprobs
             torch.cuda.empty_cache()
 
             # **Response Processing**
-            postprocessed_responses = truncate_response(args, tokenizer, responses)
+            # 1. truncate at the first occurrence of `truncate_token` that appears at or after
+            # position truncate_after in the responses
+            # https://github.com/openai/lm-human-preferences/blob/cbfd210bb8b08f6bc5c26878c10984b90f516c66/lm_human_preferences/train_policy.py#L378
+            truncate_token_mask = responses == args.task.truncate_token
+            truncate_after_or_token_mask = torch.cat(
+                [
+                    torch.zeros_like(truncate_token_mask)[:, : args.task.truncate_after],
+                    truncate_token_mask[:, args.task.truncate_after :],
+                ],
+                dim=1,
+            )
+            truncate_mask = (torch.cumsum(truncate_after_or_token_mask, dim=1) - truncate_after_or_token_mask.long()).bool()
+            postprocessed_responses = torch.where(
+                truncate_mask,
+                torch.full_like(responses, tokenizer.pad_token_id),
+                responses,
+            )
+            del truncate_token_mask, truncate_after_or_token_mask, truncate_mask
             torch.cuda.empty_cache()
 
             # 2. run reward model on the truncated responses
             postprocessed_query_responses = torch.cat((queries, postprocessed_responses), 1)
-            postprocessed_query_responses = right_padding_to_left_padding(postprocessed_query_responses, tokenizer.pad_token_id)
-            full_values, _ = get_reward(accelerator.unwrap_model(model).critic, postprocessed_query_responses, tokenizer)
-            values = full_values[:, context_length - 1 : -1].squeeze(-1)
-            padding_mask = postprocessed_responses == tokenizer.pad_token_id
-            # logprobs = torch.masked_fill(logprobs, padding_mask, INVALID_LOGPROB)
-            # ref_logprobs = torch.masked_fill(ref_logprobs, padding_mask, INVALID_LOGPROB)
-            # values = torch.masked_fill(values, padding_mask, 0)
-
-            rew, scores = get_reward(reward_model, postprocessed_query_responses, tokenizer)
-
-            _, reference_scores = get_reward(reward_model, query_reference_responses, tokenizer)
-            _, validation_score = get_reward(reward_model, postprocessed_sample_validation_query_responses, tokenizer)
-            
-            # carperAI-style score normaliation
-            accelerator.print("before score", scores, scores.mean())
-            accelerator.print("reference_scores", reference_scores, reference_scores.mean())
-            scores = scores - reference_scores
-            accelerator.print("after score", scores, scores.mean())
+            postprocessed_query_responses = right_padding_to_left_padding(
+                postprocessed_query_responses, tokenizer.pad_token_id
+            )
+            scores = get_reward(reward_model, postprocessed_query_responses, tokenizer).flatten()
 
             # 3. filter response. Ensure that the sample contains truncate_token
             # responses not passing that filter will receive a low (fixed) score
             # only query humans on responses that pass that filter
-            contain_pad_token = torch.any(postprocessed_responses == tokenizer.pad_token_id, dim=-1)
-            scores = torch.where(contain_pad_token, scores, torch.full_like(scores, args.task.penalty_reward_value))
+            matches_token = postprocessed_responses[:, args.task.truncate_after :] == args.task.truncate_token
+            filter_mask = torch.any(matches_token, dim=-1)
+            scores = torch.where(
+                filter_mask,
+                scores,
+                torch.full_like(scores, args.task.penalty_reward_value),
+            )
+            del matches_token, filter_mask
             torch.cuda.empty_cache()
 
             # 4. compute rewards
@@ -694,48 +701,14 @@ if __name__ == "__main__":
             # 5. whiten rewards
             if args.ppo.whiten_rewards:
                 rewards = whiten(rewards, shift_mean=False)
-
-            if args.print_sample_output_freq > 0 and (update - 1) % args.print_sample_output_freq == 0:
-                try:
-                    all_decode_validation_queries = tokenizer.batch_decode(sample_validation_queries)
-                    all_sample_validation_query_responses = tokenizer.batch_decode(
-                        sample_validation_query_responses
-                    )
-                    all_sample_validation_query_responses_postprocessed = tokenizer.batch_decode(
-                        postprocessed_sample_validation_query_responses
-                    )
-                    all_sample_validation_responses = [
-                        x[len(y) :] for x, y in zip(all_sample_validation_query_responses, all_decode_validation_queries)
-                    ]
-                    all_sample_validation_postprocessed_responses = [
-                        x[len(y) :] for x, y in zip(all_sample_validation_query_responses_postprocessed, all_decode_validation_queries)
-                    ]
-                    all_sample_validation_reference_responses = tokenizer.batch_decode(
-                        sample_validation_reference_response
-                    )
-                    all_sample_validation_df = pd.DataFrame(
-                        {
-                            "query": all_decode_validation_queries,
-                            "response": all_sample_validation_responses,
-                            "postprocessed_response": all_sample_validation_postprocessed_responses,
-                            "reference_responses": all_sample_validation_reference_responses,
-                            "scores": validation_score.float().cpu().numpy(),
-                            "reference_scores": sample_validation_reference_scores.float().cpu().numpy(),
-                        }
-                    )
-                    if accelerator.is_main_process and args.track:
-                        wandb.log({"samples/query_responses": wandb.Table(dataframe=all_sample_validation_df)}, step=update)
-                    print_rich_table("stuff", all_sample_validation_df[:4], console)
-                    
-                except Exception as e:
-                    print(e)
-                del (
-                    all_decode_validation_queries,
-                    all_sample_validation_query_responses,
-                    all_sample_validation_responses,
-                    all_sample_validation_reference_responses,
-                    all_sample_validation_df,
+            try:
+                sample_kl = kl[0].sum().item()
+                postprocessed_responses = postprocessed_query_responses[:, context_length:]
+                console.print(
+                    f"[green]{tokenizer.decode(queries[0], skip_special_tokens=True)}[/]\n[yellow]{tokenizer.decode(postprocessed_responses[0], skip_special_tokens=True)}[/]\n[blue](NO POST-PROCESSING){tokenizer.decode(responses[0], skip_special_tokens=True)}[/]\n[red]score: {scores[0]}, kl: {kl[0].sum().item()}, total reward: {scores[0] - kl_ctl.value * sample_kl} [/]"
                 )
+            except Exception as e:
+                print(e)
             del postprocessed_query_responses
             torch.cuda.empty_cache()
 
@@ -755,6 +728,8 @@ if __name__ == "__main__":
             value_mean, value_var = values.mean(), values.var()
 
         # Do multiple epochs of PPO training, with a fresh random shuffle in each epoch
+        re_calculated_logprobs = torch.zeros_like(logprobs)
+        re_calculated_values = torch.zeros_like(values)
         for ppo_epoch_idx in range(args.ppo.noptepochs):
             b_inds = np.random.permutation(args.ppo.local_batch_size)
             minibatch_idx = 0
@@ -763,25 +738,37 @@ if __name__ == "__main__":
                 mini_batch_inds = b_inds[mini_batch_start:mini_batch_end]
                 gradient_accumulation_idx = 0
                 for micro_batch_start in range(0, args.ppo.local_mini_batch_size, args.ppo.local_micro_batch_size):
-                    with accelerator.accumulate(policy):
-                        micro_batch_end = micro_batch_start + args.ppo.local_micro_batch_size
-                        micro_batch_inds = mini_batch_inds[micro_batch_start:micro_batch_end]
-                        mb_return = returns[micro_batch_inds]
-                        mb_advantage = advantages[micro_batch_inds]
-                        mb_values = values[micro_batch_inds]
-                        mb_responses = responses[micro_batch_inds]
-                        mb_query_responses = query_responses[micro_batch_inds]
-                        mb_logprobs = logprobs[micro_batch_inds]
+                    micro_batch_end = micro_batch_start + args.ppo.local_micro_batch_size
+                    micro_batch_inds = mini_batch_inds[micro_batch_start:micro_batch_end]
+                    mb_return = returns[micro_batch_inds]
+                    mb_advantage = advantages[micro_batch_inds]
+                    mb_responses = responses[micro_batch_inds]
+                    mb_query_responses = query_responses[micro_batch_inds]
 
-                        output, (vpred_temp, _) = forward(model, mb_query_responses, tokenizer)
-                        
+                    # re-calculate logprobs and values for the first epoch, otherwise `bf16` will cause the logprobs to 
+                    # be much different because the logprobs are with a batch size of `local_batch_size` but the 
+                    # `new_logprobs` are with a batch size of `local_micro_batch_size`
+                    if ppo_epoch_idx == 0:
+                        with torch.no_grad():
+                            output, vpred_temp = forward(policy, mb_query_responses, tokenizer)
+                            logits = output.logits[:, context_length - 1 : -1]
+                            logits /= args.task.temperature
+                            new_all_logprobs = F.log_softmax(logits, dim=-1)
+                            new_logprobs = torch.gather(new_all_logprobs, 2, mb_responses.unsqueeze(-1)).squeeze(-1)
+                            vpred = vpred_temp[:, context_length - 1 : -1].squeeze(-1)
+                            re_calculated_logprobs[micro_batch_inds] = new_logprobs
+                            re_calculated_values[micro_batch_inds] = vpred
+                            del output, logits, new_all_logprobs
+                    mb_values = re_calculated_values[micro_batch_inds]
+                    mb_logprobs = re_calculated_logprobs[micro_batch_inds]
+
+                    with accelerator.accumulate(policy):
+                        output, vpred_temp = forward(policy, mb_query_responses, tokenizer)
                         logits = output.logits[:, context_length - 1 : -1]
-                        logits /= (args.task.temperature + 1e-7)
+                        logits /= args.task.temperature
                         new_all_logprobs = F.log_softmax(logits, dim=-1)
                         new_logprobs = torch.gather(new_all_logprobs, 2, mb_responses.unsqueeze(-1)).squeeze(-1)
-                        # new_logprobs = torch.masked_fill(new_logprobs, padding_mask[micro_batch_inds], INVALID_LOGPROB)
-                        vpred = vpred_temp[:, context_length - 1 : -1]
-                        # vpred = torch.masked_fill(vpred, padding_mask[micro_batch_inds], 0)
+                        vpred = vpred_temp[:, context_length - 1 : -1].squeeze(-1)
                         vpredclipped = torch.clamp(
                             vpred,
                             mb_values - args.ppo.cliprange_value,
@@ -801,8 +788,8 @@ if __name__ == "__main__":
                         accelerator.backward(loss)
                         optimizer.step()
                         optimizer.zero_grad()
-                        prob_dist = torch.nn.functional.softmax(logits, dim=-1)
-                        entropy = torch.logsumexp(logits, dim=-1) - torch.sum(prob_dist * logits, dim=-1)
+                        pd = torch.nn.functional.softmax(logits, dim=-1)
+                        entropy = torch.logsumexp(logits, dim=-1) - torch.sum(pd * logits, dim=-1)
                         approxkl = 0.5 * (logprobs_diff**2).mean()
                         with torch.no_grad():
                             approxkls_stats[ppo_epoch_idx, minibatch_idx, gradient_accumulation_idx] = approxkl
@@ -811,6 +798,7 @@ if __name__ == "__main__":
                             vf_losses_stats[ppo_epoch_idx, minibatch_idx, gradient_accumulation_idx] = vf_loss
                             vf_clipfrac_stats[ppo_epoch_idx, minibatch_idx, gradient_accumulation_idx] = vf_clipfrac
                             entropies_stats[ppo_epoch_idx, minibatch_idx, gradient_accumulation_idx] = entropy.mean()
+                            ratio_stats[ppo_epoch_idx, minibatch_idx, gradient_accumulation_idx] = ratio.mean()
                     gradient_accumulation_idx += 1
                 minibatch_idx += 1
                 if accelerator.is_main_process:
@@ -826,9 +814,13 @@ if __name__ == "__main__":
                         "ratio",
                         ratio.mean().item(),
                     )
+                breakpoint()
+        if accelerator.is_main_process:
+            console.print("ratio_stats", ratio_stats.mean())
+        breakpoint()
 
         with torch.no_grad():
-            if not args.deepspeed:  # for some reason there is a OOM with the `writer.add_histogram`
+            if not args.deepspeed: # for some reason there is a OOM with the `writer.add_histogram`
                 writer.add_histogram("ppo/val/ratio_hist", ratio, update)
             kl = logprobs - ref_logprobs
             mean_kl = kl.sum(1).mean()
@@ -836,55 +828,125 @@ if __name__ == "__main__":
             mean_non_score_reward = non_score_reward.sum(1).mean()
             writer.add_scalar("objective/kl_coef", kl_ctl.value, update)
             writer.add_scalar("objective/kl", accelerator.gather(mean_kl).mean().item(), update)
-            writer.add_scalar("objective/entropy", accelerator.gather(mean_entropy).mean().item(), update)
-            writer.add_scalar("objective/non_score_reward", accelerator.gather(mean_non_score_reward).mean().item(), update)
             writer.add_scalar(
-                "objective/score_total", accelerator.gather(mean_non_score_reward + scores.mean()).mean().item(), update
+                "objective/entropy",
+                accelerator.gather(mean_entropy).mean().item(),
+                update,
             )
-            writer.add_scalar("objective/scores", accelerator.gather(scores.mean()).mean().item(), update)
-            writer.add_scalar("objective/reference_scores", accelerator.gather(reference_scores.mean()).mean().item(), update)
-            writer.add_scalar("objective/validation_score", accelerator.gather(validation_score.mean()).mean().item(), update)
+            writer.add_scalar(
+                "objective/non_score_reward",
+                accelerator.gather(mean_non_score_reward).mean().item(),
+                update,
+            )
+            writer.add_scalar(
+                "objective/score_total",
+                accelerator.gather(mean_non_score_reward + scores.mean()).mean().item(),
+                update,
+            )
+            writer.add_scalar(
+                "objective/scores",
+                accelerator.gather(scores.mean()).mean().item(),
+                update,
+            )
             writer.add_scalar("ppo/loss/policy", accelerator.gather(pg_loss).mean().item(), update)
             writer.add_scalar("ppo/loss/value", accelerator.gather(vf_loss).mean().item(), update)
             writer.add_scalar("ppo/loss/total", accelerator.gather(loss).mean().item(), update)
-            writer.add_scalar("ppo/policy/entropy", accelerator.gather(entropy.mean()).mean().item(), update)
-            writer.add_scalar("ppo/policy/approxkl", accelerator.gather(approxkl).mean().item(), update)
-            writer.add_scalar("ppo/policy/clipfrac", accelerator.gather(pg_clipfrac).mean().item(), update)
-            writer.add_scalar("ppo/policy/approxkl_avg", accelerator.gather(approxkls_stats).mean().item(), update)
-            writer.add_scalar("ppo/policy/clipfrac_avg", accelerator.gather(clipfracs_stats).mean().item(), update)
-            writer.add_scalar("ppo/loss/policy_avg", accelerator.gather(pg_losses_stats).mean().item(), update)
-            writer.add_scalar("ppo/loss/value_avg", accelerator.gather(vf_losses_stats).mean().item(), update)
-            writer.add_scalar("ppo/val/clipfrac_avg", accelerator.gather(vf_clipfrac_stats).mean().item(), update)
-            writer.add_scalar("ppo/policy/entropy_avg", accelerator.gather(entropies_stats).mean().item(), update)
-            writer.add_scalar("ppo/returns/mean", accelerator.gather(return_mean).mean().item(), update)
+            writer.add_scalar(
+                "ppo/policy/entropy",
+                accelerator.gather(entropy.mean()).mean().item(),
+                update,
+            )
+            writer.add_scalar(
+                "ppo/policy/approxkl",
+                accelerator.gather(approxkl).mean().item(),
+                update,
+            )
+            writer.add_scalar(
+                "ppo/policy/clipfrac",
+                accelerator.gather(pg_clipfrac).mean().item(),
+                update,
+            )
+            writer.add_scalar(
+                "ppo/policy/approxkl_avg",
+                accelerator.gather(approxkls_stats).mean().item(),
+                update,
+            )
+            writer.add_scalar(
+                "ppo/policy/clipfrac_avg",
+                accelerator.gather(clipfracs_stats).mean().item(),
+                update,
+            )
+            writer.add_scalar(
+                "ppo/loss/policy_avg",
+                accelerator.gather(pg_losses_stats).mean().item(),
+                update,
+            )
+            writer.add_scalar(
+                "ppo/loss/value_avg",
+                accelerator.gather(vf_losses_stats).mean().item(),
+                update,
+            )
+            writer.add_scalar(
+                "ppo/val/clipfrac_avg",
+                accelerator.gather(vf_clipfrac_stats).mean().item(),
+                update,
+            )
+            writer.add_scalar(
+                "ppo/policy/entropy_avg",
+                accelerator.gather(entropies_stats).mean().item(),
+                update,
+            )
+            writer.add_scalar(
+                "ppo/returns/mean",
+                accelerator.gather(return_mean).mean().item(),
+                update,
+            )
             writer.add_scalar("ppo/returns/var", accelerator.gather(return_var).mean().item(), update)
             writer.add_scalar("ppo/val/vpred", accelerator.gather(vpred.mean()).mean().item(), update)
-            writer.add_scalar("ppo/val/error", accelerator.gather(vf_losses1.mean()).mean().item(), update)
-            writer.add_scalar("ppo/val/clipfrac", accelerator.gather(vf_clipfrac).mean().item(), update)
+            writer.add_scalar(
+                "ppo/val/error",
+                accelerator.gather(vf_losses1.mean()).mean().item(),
+                update,
+            )
+            writer.add_scalar(
+                "ppo/val/clipfrac",
+                accelerator.gather(vf_clipfrac).mean().item(),
+                update,
+            )
             writer.add_scalar("ppo/val/mean", accelerator.gather(value_mean).mean().item(), update)
             writer.add_scalar("ppo/val/var", accelerator.gather(value_var).mean().item(), update)
             writer.add_scalar("ppo/val/ratio", accelerator.gather(ratio.mean()).mean().item(), update)
-            writer.add_scalar("ppo/val/ratio_var", accelerator.gather(ratio.mean()).var().item(), update)
-            writer.add_scalar("ppo/val/advantage", accelerator.gather(advantages.mean()).mean().item(), update)
-            writer.add_scalar("ppo/val/advantage_var", accelerator.gather(advantages.mean()).var().item(), update)
-            writer.add_scalar("ppo/val/num_eos_tokens", (responses == tokenizer.eos_token_id).sum().item(), update)
+            writer.add_scalar(
+                "ppo/val/ratio_var",
+                accelerator.gather(ratio.mean()).var().item(),
+                update,
+            )
+            writer.add_scalar(
+                "ppo/val/advantage",
+                accelerator.gather(advantages.mean()).mean().item(),
+                update,
+            )
+            writer.add_scalar(
+                "ppo/val/advantage_var",
+                accelerator.gather(advantages.mean()).var().item(),
+                update,
+            )
+            writer.add_scalar(
+                "ppo/val/num_eos_tokens",
+                (responses == tokenizer.eos_token_id).sum().item(),
+                update,
+            )
             writer.add_scalar("ppo/lr", lrnow, update)
             writer.add_scalar("ppo/episode", global_step, update)
-            if args.rewards.use_adaptive_kl:
-                kl_ctl.update(mean_kl.item(), args.ppo.batch_size)
+            kl_ctl.update(mean_kl.item(), args.ppo.batch_size)
             del kl, mean_kl, mean_entropy, mean_non_score_reward, scores
 
     # save model
-    if accelerator.is_main_process and args.save_path:
+    if args.save_path:
         os.makedirs(os.path.dirname(args.save_path), exist_ok=True)
-        torch.save(policy.state_dict(), args.save_path)
+        torch.save(reward_model.state_dict(), args.save_path)
 
-        if args.upload_model:
-            repo_name = f"{args.exp_name}__{args.rewards.label_dataset}__seed{args.seed}__{int(time.time())}"
-            repo_id = f"{args.hf_entity}/{repo_name}" if args.hf_entity else repo_name
-            policy.save_pretrained(repo_id, safe_serialization=True, push_to_hub=True)
-            tokenizer.save_pretrained(repo_id, push_to_hub=True)
 
-# if __name__ == "__main__":
-#     args = tyro.cli(Args)   
-#     train(args)
+if __name__ == "__main__":
+    args = tyro.cli(Args)
+    train(args)

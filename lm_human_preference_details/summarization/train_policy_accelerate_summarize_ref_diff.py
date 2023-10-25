@@ -3,7 +3,7 @@ import random
 import time
 from dataclasses import asdict, dataclass, field
 from types import SimpleNamespace
-from typing import List, Literal, Optional
+from typing import List, Optional
 
 import numpy as np
 import pandas as pd
@@ -28,8 +28,8 @@ from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from transformers import AutoModelForCausalLM, AutoTokenizer, GenerationConfig
 
+from lm_human_preference_details.data import process_query
 
-INVALID_LOGPROB = 1.0
 
 @dataclass
 class AdaptiveKLParams:
@@ -42,7 +42,7 @@ class RewardHParams:
     kl_coef: float = 0.15
     use_adaptive_kl: bool = True
     adaptive_kl: Optional[AdaptiveKLParams] = field(default_factory=AdaptiveKLParams)
-    trained_model: Optional[str] = "models/gpt2medium_last_index_reward/pytorch_model.bin"
+    trained_model: Optional[str] = "models/reward.pt"
     label_dataset: tyro.conf.Suppress[Optional[str]] = None
 
 
@@ -77,7 +77,7 @@ class PpoHParams:
 class TaskHParams:
     # Query params
     query_length: int = 512
-    query_dataset: str = "vwxyzjn/summarize_from_feedback_tldr_3_filtered_oai_preprocessing"
+    query_dataset: str = "vwxyzjn/summarize_from_feedback_tldr_3_filtered"
 
     query_format_str: Optional[str] = "SUBREDDIT: r/{subreddit}\n\nTITLE: {title}\n\nPOST: {post}\n\nTL;DR:"
     query_truncate_field: Optional[str] = "post"
@@ -126,8 +126,6 @@ class Args:
     """Whether to use cuda if available."""
     run_name: tyro.conf.Suppress[str] = None
     """TO BE FILLED: a unique name of this run"""
-    load_from_cache_file: bool = False
-    """Whether to load data from the local cache file in `dataset.map`"""
     upload_model: bool = False
     "whether to upload the saved model to huggingface"
     hf_entity: str = ""
@@ -137,14 +135,14 @@ class Args:
     """the name of the pretrained model to use"""
     deepspeed: bool = False
     """Whether to use deepspeed to train the model"""
-    print_sample_output_freq: int = 1
+    print_sample_output_freq: int = 10
     """How often to print sample output"""
-    sft_model_path: str = ""
+    sft_model_path: str = "models/sft_policy.pt"
     """Where to load the SFT model"""
     save_path: str = "models/policy.pt"
     """Where to save the model"""
-    optimizer: Literal["tf_adam", "adam", "adamw"] = "adamw"
-    """Which optimizer to use"""
+    use_tensorflow_adam: bool = True
+    """Whether to use tensorflow-style Adam optimizer instead of PyTorch's"""
     task: TaskHParams = field(default_factory=TaskHParams)
     rewards: RewardHParams = field(default_factory=RewardHParams)
     ppo: PpoHParams = field(default_factory=PpoHParams)
@@ -347,6 +345,17 @@ def whiten(values, shift_mean=True):
     return whitened
 
 
+class AutoModelForCausalLMWithScalarHead(nn.Module):
+    def __init__(self, lm_backbone):
+        super().__init__()
+        self.lm_backbone = lm_backbone
+        self.scalar_head = layer_init(nn.Linear(lm_backbone.config.hidden_size, 1), std=0)
+
+    def forward(self, **kwargs):
+        output = self.lm_backbone(**kwargs)
+        return output, self.scalar_head(output.hidden_states[-1])
+
+
 class AutoModelForCausalLMWithRewardHead(nn.Module):
     def __init__(self, lm_backbone):
         super().__init__()
@@ -355,28 +364,20 @@ class AutoModelForCausalLMWithRewardHead(nn.Module):
             nn.Linear(lm_backbone.config.hidden_size, 1),
             std=1 / np.sqrt(lm_backbone.config.hidden_size + 1),
         )
-        # self.reward_gain = torch.nn.Parameter(torch.tensor(1.0), requires_grad=True)
-        # self.reward_bias = torch.nn.Parameter(torch.tensor(0.0), requires_grad=True)
+        self.reward_gain = torch.nn.Parameter(torch.tensor(1.0), requires_grad=True)
+        self.reward_bias = torch.nn.Parameter(torch.tensor(0.0), requires_grad=True)
 
     def forward(self, **kwargs):
         output = self.lm_backbone(**kwargs)
-        latents = output.hidden_states[-1] # shape: [batch_size, length, hidden_size]
-        scalars = self.scalar_head(latents).squeeze(-1) # shape: [batch_size, length]
-        last_scalar = scalars[:, -1] # shape: [batch_size, 1]
-        return scalars, last_scalar
+        reward_latents = output.hidden_states[-1]
+        # shape: [batch_size, length, hidden_size]
+        last_reward_latents = reward_latents
+        # shape: [batch_size, hidden_size]
+        reward = self.scalar_head(last_reward_latents)
+        # shape: [batch_size, 1]
+        reward = self.reward_gain * reward + self.reward_bias
+        return output, reward
 
-
-# taken from https://github.com/OpenLMLab/MOSS-RLHF/blob/40b91eb2f2b71b16919addede0341d2bef70825d/ppo/ppo_trainer.py#L29
-# we did this we can do a single `model = accelerator.prepare(model)`
-class PolicyAndValueWrapper(nn.Module):
-    def __init__(self, policy, critic) -> None:
-        super().__init__()
-        self.policy = policy
-        self.critic = critic
-    
-    def forward(self, **kwargs):
-        return self.policy(**kwargs), self.critic(**kwargs)
-    
 
 def right_padding_to_left_padding(tokens, pad_id):
     """Convert from right padding to left padding."""
@@ -402,7 +403,8 @@ def generate(lm_backbone, queries, tokenizer, generation_config):
     """generate in a way that does not affect padding tokens"""
     context_length = queries.shape[1]
     attention_mask = queries != tokenizer.pad_token_id
-    input_ids = torch.masked_fill(queries, ~attention_mask, 0)
+    input_ids = queries.clone()
+    input_ids[~attention_mask] = 0  # set padding tokens to 0
     output = lm_backbone.generate(
         input_ids=input_ids,
         attention_mask=attention_mask,
@@ -410,13 +412,15 @@ def generate(lm_backbone, queries, tokenizer, generation_config):
         generation_config=generation_config,
         return_dict_in_generate=True,
     )
+    # restore padding tokens
     return torch.cat((queries, output.sequences[:, context_length:]), dim=1)
 
 
-def get_reward(reward_model, query_responses, tokenizer):
-    attention_mask = query_responses != tokenizer.pad_token_id
+def get_reward(reward_model, query_responses, args):
+    attention_mask = query_responses != args.pad_token_id
     position_ids = attention_mask.cumsum(1) - attention_mask.long()  # exclusive cumsum
-    input_ids = torch.masked_fill(query_responses, ~attention_mask, 0)
+    input_ids = query_responses.clone()
+    input_ids[~attention_mask] = 0
     return reward_model(
         input_ids=input_ids,
         attention_mask=attention_mask,
@@ -429,7 +433,8 @@ def get_reward(reward_model, query_responses, tokenizer):
 def forward(policy, query_responses, tokenizer):
     attention_mask = query_responses != tokenizer.pad_token_id
     position_ids = attention_mask.cumsum(1) - attention_mask.long()  # exclusive cumsum
-    input_ids = torch.masked_fill(query_responses, ~attention_mask, 0)
+    input_ids = query_responses.clone()
+    input_ids[~attention_mask] = 0
     return policy(
         input_ids=input_ids,
         attention_mask=attention_mask,
@@ -439,23 +444,22 @@ def forward(policy, query_responses, tokenizer):
     )
 
 
-def truncate_response(args, tokenizer, responses):
-    trunc_idxs = first_true_indices(responses == args.task.truncate_token).unsqueeze(-1)
-    new_size = [1] * (len(responses.size()) - 1) + [args.task.response_length]
-    idxs = torch.arange(args.task.response_length, device=responses.device).view(*new_size)
-    postprocessed_responses = torch.masked_fill(responses, idxs > trunc_idxs, tokenizer.pad_token_id)
-    postprocessed_responses = right_padding_to_left_padding(postprocessed_responses, tokenizer.pad_token_id)
-    return postprocessed_responses
-
-# def train(args: Args):
-if __name__ == "__main__":
-    args = tyro.cli(Args)
+def train(args: Args):
     accelerator = Accelerator(gradient_accumulation_steps=args.ppo.gradient_accumulation_steps)
     args.ppo.world_size = accelerator.num_processes
     args.ppo.batch_size = int(args.ppo.local_batch_size * args.ppo.world_size)
     args.ppo.minibatch_size = exact_div(args.ppo.batch_size, args.ppo.nminibatches)
     args.ppo.local_mini_batch_size = exact_div(args.ppo.local_batch_size, args.ppo.nminibatches)
     args.ppo.local_micro_batch_size = exact_div(args.ppo.local_mini_batch_size, args.ppo.gradient_accumulation_steps)
+    patch_h = TaskQueryHParams(
+        length=args.task.query_length,
+        dataset=args.task.query_dataset,
+        format_str=args.task.query_format_str,
+        truncate_field=args.task.query_truncate_field,
+        truncate_text=args.task.query_truncate_text,
+        padding=args.task.query_padding,
+        pad_side=args.task.query_pad_side,
+    )
     if args.ppo.whiten_rewards:
         assert (
             args.ppo.local_mini_batch_size >= 8
@@ -504,41 +508,44 @@ if __name__ == "__main__":
     reward_model = AutoModelForCausalLMWithRewardHead(
         AutoModelForCausalLM.from_pretrained(args.base_model, trust_remote_code=True)
     )
-    critic = AutoModelForCausalLMWithRewardHead(
-        AutoModelForCausalLM.from_pretrained(args.base_model, trust_remote_code=True)
-    )
     if args.rewards.trained_model:
         reward_model.load_state_dict(torch.load(args.rewards.trained_model, map_location=device))
-        critic.load_state_dict(torch.load(args.rewards.trained_model, map_location=device))
         print(f"loaded pretrained reward model from {args.rewards.trained_model}")
     # each class should have a separate pretrained model that do not share weights
-    ref_policy = AutoModelForCausalLM.from_pretrained(args.base_model, trust_remote_code=True)
-    policy = AutoModelForCausalLM.from_pretrained(args.base_model, trust_remote_code=True)
+    ref_policy = AutoModelForCausalLMWithScalarHead(
+        AutoModelForCausalLM.from_pretrained(args.base_model, trust_remote_code=True)
+    )
+    policy = AutoModelForCausalLMWithScalarHead(AutoModelForCausalLM.from_pretrained(args.base_model, trust_remote_code=True))
     if args.sft_model_path:
-        policy.load_state_dict(torch.load(args.sft_model_path, map_location=device))
-        ref_policy.load_state_dict(torch.load(args.sft_model_path, map_location=device))
+        policy.lm_backbone.load_state_dict(torch.load(args.sft_model_path, map_location=device))
+        ref_policy.lm_backbone.load_state_dict(torch.load(args.sft_model_path, map_location=device))
         print(f"loaded pretrained policy from {args.sft_model_path}")
-    policy.generation_config.eos_token_id = (
+    policy.lm_backbone.generation_config.eos_token_id = (
         None  # disable `pad_token_id` and `eos_token_id` because we just want to
     )
-    policy.generation_config.pad_token_id = None  # generate tokens without truncation / padding
-    model = PolicyAndValueWrapper(policy, critic)
-    if args.optimizer == "tf_adam":
-        optimizer = AdamTensorFlowStyle(model.parameters(), lr=args.ppo.lr, eps=args.ppo.eps)
-    elif args.optimizer == "adam":
-        optimizer = optim.Adam(model.parameters(), lr=args.ppo.lr, eps=args.ppo.eps)
-    elif args.optimizer == "adamw":
-        optimizer = optim.AdamW(model.parameters(), lr=args.ppo.lr, eps=args.ppo.eps)
-
+    policy.lm_backbone.generation_config.pad_token_id = None  # generate tokens without truncation / padding
+    # IMPORTANT: Layer norm produces weird gradients, which affects Adam optimizer to impact all the parameters systematically
+    # see https://github.com/pytorch/pytorch/issues/104857 for more details
+    if args.use_tensorflow_adam:
+        optimizer = AdamTensorFlowStyle(policy.parameters(), lr=args.ppo.lr, eps=args.ppo.eps)
+    else:
+        optimizer = optim.Adam(policy.parameters(), lr=args.ppo.lr, eps=args.ppo.eps)
     dataset = load_dataset(args.task.query_dataset, split="train")
-    validation_dataset = load_dataset(args.task.query_dataset, split="validation")
-    dataset = dataset.with_format("torch", columns=["query_token", "reference_response_token"])
+
+    def process_query_data(x):
+        return {
+            **process_query(x, encoder=tokenizer, hparams=patch_h),
+            "reference_response": tokenizer.encode(
+                f" {x['summary']}", padding="max_length", max_length=args.task.response_length, truncation=True,
+                # with an extra leading space to account for the space between the query and response
+            ),
+        }
+
+    dataset = dataset.map(process_query_data)
+    dataset = dataset.with_format("torch", columns=["query_token", "reference_response"])
     dataset = dataset.shuffle(seed=local_seed)
     dataloader = DataLoader(dataset, batch_size=args.ppo.local_batch_size)
-    validation_dataset = validation_dataset.with_format("torch", columns=["query_token", "reference_response_token"])
-    validation_dataloader = DataLoader(validation_dataset, batch_size=args.ppo.local_batch_size)
-    model, optimizer, dataloader = accelerator.prepare(model, optimizer, dataloader)
-    validation_dataloader = accelerator.prepare(validation_dataloader)
+    policy, optimizer, dataloader = accelerator.prepare(policy, optimizer, dataloader)
     if args.deepspeed:
         import deepspeed
 
@@ -571,17 +578,6 @@ if __name__ == "__main__":
         while True:
             yield from dataloader
 
-    sample_validation_inds = np.arange(args.ppo.batch_size)
-    local_sample_validation_inds = sample_validation_inds[accelerator.process_index :: accelerator.num_processes]
-    sample_validation = validation_dataset[local_sample_validation_inds]
-    sample_validation_queries = torch.Tensor(sample_validation["query_token"]).to(device)
-    with torch.no_grad():
-        sample_validation_queries = right_padding_to_left_padding(sample_validation_queries, tokenizer.pad_token_id)
-        sample_validation_reference_response = torch.Tensor(sample_validation["reference_response_token"]).to(device)
-        sample_validation_query_reference_responses = torch.cat((sample_validation_queries, sample_validation_reference_response), dim=1)
-        sample_validation_query_reference_responses = right_padding_to_left_padding(sample_validation_query_reference_responses, tokenizer.pad_token_id)
-        _, sample_validation_reference_scores = get_reward(reward_model, sample_validation_query_reference_responses, tokenizer)
-
     iter_dataloader = iter(repeat_generator())
     kl_ctl = AdaptiveKLController(args.rewards.kl_coef, hparams=args.rewards.adaptive_kl)
     # WARNING: even with `max_new_tokens` and `min_new_tokens` set to the same value, the number of tokens generated
@@ -612,12 +608,12 @@ if __name__ == "__main__":
         data = next(iter_dataloader)
         with torch.no_grad():
             queries = data["query_token"].to(device)
-            reference_responses = data["reference_response_token"].to(device)
-            queries = right_padding_to_left_padding(data["query_token"], tokenizer.pad_token_id).to(device)
+            reference_responses = data["reference_response"].to(device)
             query_reference_responses = torch.cat((queries, reference_responses), dim=1)
-            query_reference_responses = right_padding_to_left_padding(query_reference_responses, tokenizer.pad_token_id)
+            queries = right_padding_to_left_padding(data["query_token"], tokenizer.pad_token_id).to(device)
+            query_reference_responses = right_padding_to_left_padding(query_reference_responses, tokenizer.pad_token_id).to(device)
             query_responses = generate(
-                accelerator.unwrap_model(model).policy,
+                accelerator.unwrap_model(policy).lm_backbone,
                 queries,
                 tokenizer,
                 generation_config,
@@ -625,19 +621,8 @@ if __name__ == "__main__":
             context_length = queries.shape[1]
             responses = query_responses[:, context_length:]
 
-            # validation
-            sample_validation_query_responses = generate(
-                accelerator.unwrap_model(model).policy,
-                sample_validation_queries,
-                tokenizer,
-                generation_config,
-            )
-            sample_validation_responses = sample_validation_query_responses[:, context_length:]
-            postprocessed_sample_validation_responses = truncate_response(args, tokenizer, sample_validation_responses)
-            postprocessed_sample_validation_query_responses = torch.cat((sample_validation_queries, postprocessed_sample_validation_responses), 1)
-            torch.cuda.empty_cache()
-
-            output = forward(accelerator.unwrap_model(model).policy, query_responses, tokenizer)
+            output, full_values = forward(policy, query_responses, tokenizer)
+            values = full_values[:, context_length - 1 : -1].squeeze(-1)
             logits = output.logits[:, context_length - 1 : -1]
             logits /= (args.task.temperature + 1e-7)
             all_logprobs = F.log_softmax(logits, dim=-1)
@@ -645,7 +630,7 @@ if __name__ == "__main__":
             del output, logits, all_logprobs
             torch.cuda.empty_cache()
 
-            ref_output = forward(ref_policy, query_responses, tokenizer)
+            ref_output, _ = forward(ref_policy, query_responses, tokenizer)
             ref_logits = ref_output.logits[:, context_length - 1 : -1]
             ref_logits /= (args.task.temperature + 1e-7)
             ref_all_logprobs = F.log_softmax(ref_logits, dim=-1)
@@ -654,35 +639,58 @@ if __name__ == "__main__":
             torch.cuda.empty_cache()
 
             # **Response Processing**
-            postprocessed_responses = truncate_response(args, tokenizer, responses)
+            # 1. truncate at the first occurrence of `truncate_token` that appears at or after
+            # position truncate_after in the responses
+            # https://github.com/openai/lm-human-preferences/blob/cbfd210bb8b08f6bc5c26878c10984b90f516c66/lm_human_preferences/train_policy.py#L378
+            truncate_token_mask = responses == args.task.truncate_token
+            truncate_after_or_token_mask = torch.cat(
+                [
+                    torch.zeros_like(truncate_token_mask)[:, : args.task.truncate_after],
+                    truncate_token_mask[:, args.task.truncate_after :],
+                ],
+                dim=1,
+            )
+            truncate_mask = (torch.cumsum(truncate_after_or_token_mask, dim=1) - truncate_after_or_token_mask.long()).bool()
+            postprocessed_responses = torch.where(
+                truncate_mask,
+                torch.full_like(responses, tokenizer.pad_token_id),
+                responses,
+            )
+            del truncate_token_mask, truncate_after_or_token_mask, truncate_mask
             torch.cuda.empty_cache()
 
             # 2. run reward model on the truncated responses
             postprocessed_query_responses = torch.cat((queries, postprocessed_responses), 1)
-            postprocessed_query_responses = right_padding_to_left_padding(postprocessed_query_responses, tokenizer.pad_token_id)
-            full_values, _ = get_reward(accelerator.unwrap_model(model).critic, postprocessed_query_responses, tokenizer)
-            values = full_values[:, context_length - 1 : -1].squeeze(-1)
-            padding_mask = postprocessed_responses == tokenizer.pad_token_id
-            # logprobs = torch.masked_fill(logprobs, padding_mask, INVALID_LOGPROB)
-            # ref_logprobs = torch.masked_fill(ref_logprobs, padding_mask, INVALID_LOGPROB)
-            # values = torch.masked_fill(values, padding_mask, 0)
+            postprocessed_query_responses = right_padding_to_left_padding(
+                postprocessed_query_responses, tokenizer.pad_token_id
+            )
+            scores = get_reward(reward_model, postprocessed_query_responses, tokenizer)[1]
+            last_response_indices = first_true_indices(query_responses == tokenizer.pad_token_id) - 1
+            last_response_indices = torch.max(
+                last_response_indices,
+                torch.zeros([1], dtype=last_response_indices.dtype, device=query_responses.device),
+            )
+            scores = scores[:, :, 0].gather(1, last_response_indices.unsqueeze(1)).view(-1)
 
-            rew, scores = get_reward(reward_model, postprocessed_query_responses, tokenizer)
-
-            _, reference_scores = get_reward(reward_model, query_reference_responses, tokenizer)
-            _, validation_score = get_reward(reward_model, postprocessed_sample_validation_query_responses, tokenizer)
-            
-            # carperAI-style score normaliation
-            accelerator.print("before score", scores, scores.mean())
-            accelerator.print("reference_scores", reference_scores, reference_scores.mean())
-            scores = scores - reference_scores
-            accelerator.print("after score", scores, scores.mean())
+            reference_scores = get_reward(reward_model, query_reference_responses, tokenizer)[1]
+            last_reference_response_indices = first_true_indices(query_reference_responses == tokenizer.pad_token_id) - 1
+            last_reference_response_indices = torch.max(
+                last_reference_response_indices,
+                torch.zeros([1], dtype=last_reference_response_indices.dtype, device=query_reference_responses.device),
+            )
+            reference_scores = reference_scores[:, :, 0].gather(1, last_reference_response_indices.unsqueeze(1)).view(-1)
 
             # 3. filter response. Ensure that the sample contains truncate_token
             # responses not passing that filter will receive a low (fixed) score
             # only query humans on responses that pass that filter
-            contain_pad_token = torch.any(postprocessed_responses == tokenizer.pad_token_id, dim=-1)
-            scores = torch.where(contain_pad_token, scores, torch.full_like(scores, args.task.penalty_reward_value))
+            matches_token = postprocessed_responses[:, args.task.truncate_after :] == args.task.truncate_token
+            filter_mask = torch.any(matches_token, dim=-1)
+            scores = torch.where(
+                filter_mask,
+                scores,
+                torch.full_like(scores, args.task.penalty_reward_value),
+            )
+            del matches_token, filter_mask
             torch.cuda.empty_cache()
 
             # 4. compute rewards
@@ -697,44 +705,38 @@ if __name__ == "__main__":
 
             if args.print_sample_output_freq > 0 and (update - 1) % args.print_sample_output_freq == 0:
                 try:
-                    all_decode_validation_queries = tokenizer.batch_decode(sample_validation_queries)
-                    all_sample_validation_query_responses = tokenizer.batch_decode(
-                        sample_validation_query_responses
+                    all_decode_queries = tokenizer.batch_decode(queries, skip_special_tokens=True)
+                    all_postprocessed_query_responses = tokenizer.batch_decode(
+                        postprocessed_query_responses, skip_special_tokens=True
                     )
-                    all_sample_validation_query_responses_postprocessed = tokenizer.batch_decode(
-                        postprocessed_sample_validation_query_responses
-                    )
-                    all_sample_validation_responses = [
-                        x[len(y) :] for x, y in zip(all_sample_validation_query_responses, all_decode_validation_queries)
+                    all_postprocessed_responses = [
+                        x[len(y) :] for x, y in zip(all_postprocessed_query_responses, all_decode_queries)
                     ]
-                    all_sample_validation_postprocessed_responses = [
-                        x[len(y) :] for x, y in zip(all_sample_validation_query_responses_postprocessed, all_decode_validation_queries)
-                    ]
-                    all_sample_validation_reference_responses = tokenizer.batch_decode(
-                        sample_validation_reference_response
-                    )
-                    all_sample_validation_df = pd.DataFrame(
+                    all_reference_responses = tokenizer.batch_decode(reference_responses, skip_special_tokens=True)
+
+                    kl_sum = kl.sum(axis=1)
+                    all_df = pd.DataFrame(
                         {
-                            "query": all_decode_validation_queries,
-                            "response": all_sample_validation_responses,
-                            "postprocessed_response": all_sample_validation_postprocessed_responses,
-                            "reference_responses": all_sample_validation_reference_responses,
-                            "scores": validation_score.float().cpu().numpy(),
-                            "reference_scores": sample_validation_reference_scores.float().cpu().numpy(),
+                            "query": all_decode_queries,
+                            "response": all_postprocessed_responses,
+                            "reference_responses": all_reference_responses,
+                            "score": scores.float().cpu().numpy(),
+                            "reference_scores": reference_scores.float().cpu().numpy(),
+                            "kl": kl_sum.float().cpu().numpy(),
+                            "reward": (scores - kl_ctl.value * kl_sum).float().cpu().numpy(),
                         }
                     )
                     if accelerator.is_main_process and args.track:
-                        wandb.log({"samples/query_responses": wandb.Table(dataframe=all_sample_validation_df)}, step=update)
-                    print_rich_table("stuff", all_sample_validation_df[:4], console)
-                    
+                        wandb.log({"query_responses": wandb.Table(dataframe=all_df)}, step=update)
+                    print_rich_table("stuff", all_df[:4], console)
                 except Exception as e:
                     print(e)
                 del (
-                    all_decode_validation_queries,
-                    all_sample_validation_query_responses,
-                    all_sample_validation_responses,
-                    all_sample_validation_reference_responses,
-                    all_sample_validation_df,
+                    all_decode_queries,
+                    all_postprocessed_query_responses,
+                    all_postprocessed_responses,
+                    kl_sum,
+                    all_df,
                 )
             del postprocessed_query_responses
             torch.cuda.empty_cache()
@@ -773,15 +775,12 @@ if __name__ == "__main__":
                         mb_query_responses = query_responses[micro_batch_inds]
                         mb_logprobs = logprobs[micro_batch_inds]
 
-                        output, (vpred_temp, _) = forward(model, mb_query_responses, tokenizer)
-                        
+                        output, vpred_temp = forward(policy, mb_query_responses, tokenizer)
                         logits = output.logits[:, context_length - 1 : -1]
                         logits /= (args.task.temperature + 1e-7)
                         new_all_logprobs = F.log_softmax(logits, dim=-1)
                         new_logprobs = torch.gather(new_all_logprobs, 2, mb_responses.unsqueeze(-1)).squeeze(-1)
-                        # new_logprobs = torch.masked_fill(new_logprobs, padding_mask[micro_batch_inds], INVALID_LOGPROB)
-                        vpred = vpred_temp[:, context_length - 1 : -1]
-                        # vpred = torch.masked_fill(vpred, padding_mask[micro_batch_inds], 0)
+                        vpred = vpred_temp[:, context_length - 1 : -1].squeeze(-1)
                         vpredclipped = torch.clamp(
                             vpred,
                             mb_values - args.ppo.cliprange_value,
@@ -843,7 +842,6 @@ if __name__ == "__main__":
             )
             writer.add_scalar("objective/scores", accelerator.gather(scores.mean()).mean().item(), update)
             writer.add_scalar("objective/reference_scores", accelerator.gather(reference_scores.mean()).mean().item(), update)
-            writer.add_scalar("objective/validation_score", accelerator.gather(validation_score.mean()).mean().item(), update)
             writer.add_scalar("ppo/loss/policy", accelerator.gather(pg_loss).mean().item(), update)
             writer.add_scalar("ppo/loss/value", accelerator.gather(vf_loss).mean().item(), update)
             writer.add_scalar("ppo/loss/total", accelerator.gather(loss).mean().item(), update)
@@ -882,9 +880,10 @@ if __name__ == "__main__":
         if args.upload_model:
             repo_name = f"{args.exp_name}__{args.rewards.label_dataset}__seed{args.seed}__{int(time.time())}"
             repo_id = f"{args.hf_entity}/{repo_name}" if args.hf_entity else repo_name
-            policy.save_pretrained(repo_id, safe_serialization=True, push_to_hub=True)
+            policy.lm_backbone.save_pretrained(repo_id, safe_serialization=True, push_to_hub=True)
             tokenizer.save_pretrained(repo_id, push_to_hub=True)
 
-# if __name__ == "__main__":
-#     args = tyro.cli(Args)   
-#     train(args)
+
+if __name__ == "__main__":
+    args = tyro.cli(Args)
+    train(args)

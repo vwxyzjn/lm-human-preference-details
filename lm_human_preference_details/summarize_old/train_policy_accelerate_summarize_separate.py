@@ -3,7 +3,7 @@ import random
 import time
 from dataclasses import asdict, dataclass, field
 from types import SimpleNamespace
-from typing import List, Literal, Optional
+from typing import List, Optional
 
 import numpy as np
 import pandas as pd
@@ -28,6 +28,7 @@ from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from transformers import AutoModelForCausalLM, AutoTokenizer, GenerationConfig
 
+from lm_human_preference_details.data import process_query
 
 INVALID_LOGPROB = 1.0
 
@@ -42,7 +43,7 @@ class RewardHParams:
     kl_coef: float = 0.15
     use_adaptive_kl: bool = True
     adaptive_kl: Optional[AdaptiveKLParams] = field(default_factory=AdaptiveKLParams)
-    trained_model: Optional[str] = "models/gpt2medium_last_index_reward/pytorch_model.bin"
+    trained_model: Optional[str] = "models/reward"
     label_dataset: tyro.conf.Suppress[Optional[str]] = None
 
 
@@ -77,7 +78,7 @@ class PpoHParams:
 class TaskHParams:
     # Query params
     query_length: int = 512
-    query_dataset: str = "vwxyzjn/summarize_from_feedback_tldr_3_filtered_oai_preprocessing"
+    query_dataset: str = "vwxyzjn/summarize_from_feedback_tldr_3_filtered"
 
     query_format_str: Optional[str] = "SUBREDDIT: r/{subreddit}\n\nTITLE: {title}\n\nPOST: {post}\n\nTL;DR:"
     query_truncate_field: Optional[str] = "post"
@@ -139,12 +140,12 @@ class Args:
     """Whether to use deepspeed to train the model"""
     print_sample_output_freq: int = 1
     """How often to print sample output"""
-    sft_model_path: str = ""
+    sft_model_path: str = "models/sft_policy"
     """Where to load the SFT model"""
     save_path: str = "models/policy.pt"
     """Where to save the model"""
-    optimizer: Literal["tf_adam", "adam", "adamw"] = "adamw"
-    """Which optimizer to use"""
+    use_tensorflow_adam: bool = True
+    """Whether to use tensorflow-style Adam optimizer instead of PyTorch's"""
     task: TaskHParams = field(default_factory=TaskHParams)
     rewards: RewardHParams = field(default_factory=RewardHParams)
     ppo: PpoHParams = field(default_factory=PpoHParams)
@@ -360,10 +361,14 @@ class AutoModelForCausalLMWithRewardHead(nn.Module):
 
     def forward(self, **kwargs):
         output = self.lm_backbone(**kwargs)
-        latents = output.hidden_states[-1] # shape: [batch_size, length, hidden_size]
-        scalars = self.scalar_head(latents).squeeze(-1) # shape: [batch_size, length]
-        last_scalar = scalars[:, -1] # shape: [batch_size, 1]
-        return scalars, last_scalar
+        last_reward_latents = output.hidden_states[-1]
+        # shape: [batch_size, length, hidden_size]
+        # last_reward_latents = reward_latents
+        # shape: [batch_size, hidden_size]
+        reward = self.scalar_head(last_reward_latents)
+        # # shape: [batch_size, 1]
+        # reward = self.reward_gain * reward + self.reward_bias
+        return output, reward
 
 
 # taken from https://github.com/OpenLMLab/MOSS-RLHF/blob/40b91eb2f2b71b16919addede0341d2bef70825d/ppo/ppo_trainer.py#L29
@@ -402,7 +407,8 @@ def generate(lm_backbone, queries, tokenizer, generation_config):
     """generate in a way that does not affect padding tokens"""
     context_length = queries.shape[1]
     attention_mask = queries != tokenizer.pad_token_id
-    input_ids = torch.masked_fill(queries, ~attention_mask, 0)
+    input_ids = queries.clone()
+    input_ids[~attention_mask] = 0  # set padding tokens to 0
     output = lm_backbone.generate(
         input_ids=input_ids,
         attention_mask=attention_mask,
@@ -410,6 +416,7 @@ def generate(lm_backbone, queries, tokenizer, generation_config):
         generation_config=generation_config,
         return_dict_in_generate=True,
     )
+    # restore padding tokens
     return torch.cat((queries, output.sequences[:, context_length:]), dim=1)
 
 
@@ -426,10 +433,21 @@ def get_reward(reward_model, query_responses, tokenizer):
     )
 
 
+def get_reward_complete(reward_model, query_responses, tokenizer):
+    reward = get_reward(reward_model, query_responses, tokenizer)[1]
+    last_response_indices = first_true_indices(query_responses == tokenizer.pad_token_id) - 1
+    last_response_indices = torch.max(
+        last_response_indices,
+        torch.zeros([1], dtype=last_response_indices.dtype, device=query_responses.device),
+    )
+    return reward[:, :, 0].gather(1, last_response_indices.unsqueeze(1)).view(-1)
+
+
 def forward(policy, query_responses, tokenizer):
     attention_mask = query_responses != tokenizer.pad_token_id
     position_ids = attention_mask.cumsum(1) - attention_mask.long()  # exclusive cumsum
-    input_ids = torch.masked_fill(query_responses, ~attention_mask, 0)
+    input_ids = query_responses.clone()
+    input_ids[~attention_mask] = 0
     return policy(
         input_ids=input_ids,
         attention_mask=attention_mask,
@@ -438,14 +456,6 @@ def forward(policy, query_responses, tokenizer):
         output_hidden_states=True,
     )
 
-
-def truncate_response(args, tokenizer, responses):
-    trunc_idxs = first_true_indices(responses == args.task.truncate_token).unsqueeze(-1)
-    new_size = [1] * (len(responses.size()) - 1) + [args.task.response_length]
-    idxs = torch.arange(args.task.response_length, device=responses.device).view(*new_size)
-    postprocessed_responses = torch.masked_fill(responses, idxs > trunc_idxs, tokenizer.pad_token_id)
-    postprocessed_responses = right_padding_to_left_padding(postprocessed_responses, tokenizer.pad_token_id)
-    return postprocessed_responses
 
 # def train(args: Args):
 if __name__ == "__main__":
@@ -456,6 +466,15 @@ if __name__ == "__main__":
     args.ppo.minibatch_size = exact_div(args.ppo.batch_size, args.ppo.nminibatches)
     args.ppo.local_mini_batch_size = exact_div(args.ppo.local_batch_size, args.ppo.nminibatches)
     args.ppo.local_micro_batch_size = exact_div(args.ppo.local_mini_batch_size, args.ppo.gradient_accumulation_steps)
+    patch_h = TaskQueryHParams(
+        length=args.task.query_length,
+        dataset=args.task.query_dataset,
+        format_str=args.task.query_format_str,
+        truncate_field=args.task.query_truncate_field,
+        truncate_text=args.task.query_truncate_text,
+        padding=args.task.query_padding,
+        pad_side=args.task.query_pad_side,
+    )
     if args.ppo.whiten_rewards:
         assert (
             args.ppo.local_mini_batch_size >= 8
@@ -523,19 +542,28 @@ if __name__ == "__main__":
     )
     policy.generation_config.pad_token_id = None  # generate tokens without truncation / padding
     model = PolicyAndValueWrapper(policy, critic)
-    if args.optimizer == "tf_adam":
+    if args.use_tensorflow_adam:
         optimizer = AdamTensorFlowStyle(model.parameters(), lr=args.ppo.lr, eps=args.ppo.eps)
-    elif args.optimizer == "adam":
+    else:
         optimizer = optim.Adam(model.parameters(), lr=args.ppo.lr, eps=args.ppo.eps)
-    elif args.optimizer == "adamw":
-        optimizer = optim.AdamW(model.parameters(), lr=args.ppo.lr, eps=args.ppo.eps)
-
     dataset = load_dataset(args.task.query_dataset, split="train")
     validation_dataset = load_dataset(args.task.query_dataset, split="validation")
-    dataset = dataset.with_format("torch", columns=["query_token", "reference_response_token"])
+
+    def process_query_data(x):
+        return {
+            **process_query(x, encoder=tokenizer, hparams=patch_h),
+            "reference_response": tokenizer.encode(
+                f" {x['summary']}<|endoftext|>", padding="max_length", max_length=args.task.response_length, truncation=True,
+                # with an extra leading space to account for the space between the query and response
+            ),
+        }
+
+    dataset = dataset.map(process_query_data, load_from_cache_file=args.load_from_cache_file)
+    dataset = dataset.with_format("torch", columns=["query_token", "reference_response"])
     dataset = dataset.shuffle(seed=local_seed)
     dataloader = DataLoader(dataset, batch_size=args.ppo.local_batch_size)
-    validation_dataset = validation_dataset.with_format("torch", columns=["query_token", "reference_response_token"])
+    validation_dataset = validation_dataset.map(process_query_data, load_from_cache_file=args.load_from_cache_file)
+    validation_dataset = validation_dataset.with_format("torch", columns=["query_token", "reference_response"])
     validation_dataloader = DataLoader(validation_dataset, batch_size=args.ppo.local_batch_size)
     model, optimizer, dataloader = accelerator.prepare(model, optimizer, dataloader)
     validation_dataloader = accelerator.prepare(validation_dataloader)
@@ -574,13 +602,15 @@ if __name__ == "__main__":
     sample_validation_inds = np.arange(args.ppo.batch_size)
     local_sample_validation_inds = sample_validation_inds[accelerator.process_index :: accelerator.num_processes]
     sample_validation = validation_dataset[local_sample_validation_inds]
-    sample_validation_queries = torch.Tensor(sample_validation["query_token"]).to(device)
+    sample_validation = {k: v.to(device) for k, v in sample_validation.items()}
+    sample_validation_queries = sample_validation["query_token"]
     with torch.no_grad():
+        print(sample_validation_queries.shape)
         sample_validation_queries = right_padding_to_left_padding(sample_validation_queries, tokenizer.pad_token_id)
-        sample_validation_reference_response = torch.Tensor(sample_validation["reference_response_token"]).to(device)
+        sample_validation_reference_response = sample_validation["reference_response"]
         sample_validation_query_reference_responses = torch.cat((sample_validation_queries, sample_validation_reference_response), dim=1)
-        sample_validation_query_reference_responses = right_padding_to_left_padding(sample_validation_query_reference_responses, tokenizer.pad_token_id)
-        _, sample_validation_reference_scores = get_reward(reward_model, sample_validation_query_reference_responses, tokenizer)
+        sample_validation_reference_scores = get_reward_complete(reward_model, sample_validation_query_reference_responses, tokenizer)
+    # breakpoint()
 
     iter_dataloader = iter(repeat_generator())
     kl_ctl = AdaptiveKLController(args.rewards.kl_coef, hparams=args.rewards.adaptive_kl)
@@ -594,6 +624,33 @@ if __name__ == "__main__":
         top_p=1.0,
         do_sample=True,
     )
+
+    # print("===Normalize reward model *before* training===")
+    # print(
+    #     "before normalization. "
+    #     + f"Gain: {accelerator.unwrap_model(reward_model).reward_gain.data}"
+    #     + f" Bias: {accelerator.unwrap_model(reward_model).reward_bias.data}"
+    # )
+
+    # normalize(
+    #     tokenizer,
+    #     accelerator,
+    #     device,
+    #     reward_model,
+    #     reward_model,
+    #     dataloader,
+    #     validation_dataloader,
+    # )
+    # print(
+    #     "after normalization. "
+    #     + f"Gain: {accelerator.unwrap_model(reward_model).reward_gain.data}"
+    #     + f" Bias: {accelerator.unwrap_model(reward_model).reward_bias.data}"
+    # )
+    # # # save model
+    # # if args.save_path:
+    # #     os.makedirs(os.path.dirname("models/correct_reward.pt"), exist_ok=True)
+    # #     torch.save(accelerator.unwrap_model(reward_model).state_dict(), "models/correct_reward.pt")
+    # raise
 
     print("===training policy===")
     global_step = 0
@@ -611,11 +668,21 @@ if __name__ == "__main__":
         optimizer.param_groups[0]["lr"] = lrnow
         data = next(iter_dataloader)
         with torch.no_grad():
+            """
+            let's use `P` to denote the padding token, `T` to denote the truncate token, and `X` to denote the
+            actual tokens.
+            queries: `PPXXX`
+            query_responses: `PPXXX,XXXXTXX` # the space separates the query and response
+            response: `XXXXTXX`
+            postprocessed_responses: `XXXXTXX` -> `XXXXTPP`
+            postprocessed_query_responses: `PPXXX,XXXXTPP`
+            scores:                                  ↑    # corresponding to this `X` token
+            
+            """
             queries = data["query_token"].to(device)
-            reference_responses = data["reference_response_token"].to(device)
+            reference_responses = data["reference_response"].to(device)
             queries = right_padding_to_left_padding(data["query_token"], tokenizer.pad_token_id).to(device)
             query_reference_responses = torch.cat((queries, reference_responses), dim=1)
-            query_reference_responses = right_padding_to_left_padding(query_reference_responses, tokenizer.pad_token_id)
             query_responses = generate(
                 accelerator.unwrap_model(model).policy,
                 queries,
@@ -633,11 +700,29 @@ if __name__ == "__main__":
                 generation_config,
             )
             sample_validation_responses = sample_validation_query_responses[:, context_length:]
-            postprocessed_sample_validation_responses = truncate_response(args, tokenizer, sample_validation_responses)
+            truncate_token_mask = sample_validation_responses == args.task.truncate_token
+            truncate_after_or_token_mask = torch.cat(
+                [
+                    torch.zeros_like(truncate_token_mask)[:, : args.task.truncate_after],
+                    truncate_token_mask[:, args.task.truncate_after :],
+                ],
+                dim=1,
+            )
+            truncate_mask = (torch.cumsum(truncate_after_or_token_mask, dim=1) - truncate_after_or_token_mask.long()).bool()
+            postprocessed_sample_validation_responses = torch.where(
+                truncate_mask,
+                torch.full_like(sample_validation_responses, tokenizer.pad_token_id),
+                sample_validation_responses,
+            )
             postprocessed_sample_validation_query_responses = torch.cat((sample_validation_queries, postprocessed_sample_validation_responses), 1)
+            del truncate_token_mask, truncate_after_or_token_mask, truncate_mask
             torch.cuda.empty_cache()
 
+
+
             output = forward(accelerator.unwrap_model(model).policy, query_responses, tokenizer)
+            full_values = get_reward(accelerator.unwrap_model(model).critic, query_responses, tokenizer)[1]
+            values = full_values[:, context_length - 1 : -1].squeeze(-1)
             logits = output.logits[:, context_length - 1 : -1]
             logits /= (args.task.temperature + 1e-7)
             all_logprobs = F.log_softmax(logits, dim=-1)
@@ -654,23 +739,58 @@ if __name__ == "__main__":
             torch.cuda.empty_cache()
 
             # **Response Processing**
-            postprocessed_responses = truncate_response(args, tokenizer, responses)
+            # 1. truncate at the first occurrence of `truncate_token` that appears at or after
+            # position truncate_after in the responses
+            # https://github.com/openai/lm-human-preferences/blob/cbfd210bb8b08f6bc5c26878c10984b90f516c66/lm_human_preferences/train_policy.py#L378
+            # truncate_token_mask = responses == args.task.truncate_token
+            # truncate_after_or_token_mask = torch.cat(
+            #     [
+            #         torch.zeros_like(truncate_token_mask)[:, : args.task.truncate_after],
+            #         truncate_token_mask[:, args.task.truncate_after :],
+            #     ],
+            #     dim=1,
+            # )
+            # truncate_mask = (torch.cumsum(truncate_after_or_token_mask, dim=1) - truncate_after_or_token_mask.long()).bool()
+            # postprocessed_responses = torch.where(
+            #     truncate_mask,
+            #     torch.full_like(responses, tokenizer.pad_token_id),
+            #     responses,
+            # )
+            # del truncate_token_mask, truncate_after_or_token_mask, truncate_mask
+
+            trunc_idxs = first_true_indices(responses == args.task.truncate_token).unsqueeze(-1)
+            new_size = [1] * (len(responses.size()) - 1) + [args.task.response_length]
+            idxs = torch.arange(args.task.response_length, device=responses.device).view(*new_size)
+            postprocessed_responses = torch.masked_fill(responses, idxs > trunc_idxs, tokenizer.pad_token_id)
             torch.cuda.empty_cache()
 
             # 2. run reward model on the truncated responses
             postprocessed_query_responses = torch.cat((queries, postprocessed_responses), 1)
-            postprocessed_query_responses = right_padding_to_left_padding(postprocessed_query_responses, tokenizer.pad_token_id)
-            full_values, _ = get_reward(accelerator.unwrap_model(model).critic, postprocessed_query_responses, tokenizer)
-            values = full_values[:, context_length - 1 : -1].squeeze(-1)
             padding_mask = postprocessed_responses == tokenizer.pad_token_id
-            # logprobs = torch.masked_fill(logprobs, padding_mask, INVALID_LOGPROB)
-            # ref_logprobs = torch.masked_fill(ref_logprobs, padding_mask, INVALID_LOGPROB)
-            # values = torch.masked_fill(values, padding_mask, 0)
+            logprobs = torch.masked_fill(logprobs, padding_mask, INVALID_LOGPROB)
+            ref_logprobs = torch.masked_fill(ref_logprobs, padding_mask, INVALID_LOGPROB)
+            values = torch.masked_fill(values, padding_mask, 0)
 
-            rew, scores = get_reward(reward_model, postprocessed_query_responses, tokenizer)
+            scores = get_reward_complete(reward_model, postprocessed_query_responses, tokenizer)
+            rew = get_reward(reward_model, postprocessed_query_responses, tokenizer)[1]
 
-            _, reference_scores = get_reward(reward_model, query_reference_responses, tokenizer)
-            _, validation_score = get_reward(reward_model, postprocessed_sample_validation_query_responses, tokenizer)
+            qr = postprocessed_query_responses
+            attention_mask = qr != tokenizer.pad_token_id
+            position_ids = attention_mask.cumsum(1) - attention_mask.long()  # exclusive cumsum
+            input_ids = torch.masked_fill(qr, ~attention_mask, 0)
+            output = reward_model.lm_backbone(input_ids=input_ids, attention_mask=attention_mask, position_ids=position_ids, return_dict=True, output_hidden_states=True)
+            last_reward_latents = output.hidden_states[-1] # TODO: investigate whether it should be output.hidden_states[0] or output.hidden_states[-1]
+            reward = reward_model.scalar_head(last_reward_latents)
+
+            print(postprocessed_query_responses[0:5,537:])
+            print(rew.squeeze(-1)[0:5,537:])
+            print(scores)
+            breakpoint()
+
+
+            reference_scores = get_reward_complete(reward_model, query_reference_responses, tokenizer)
+            # note that we do not truncate the validation responses
+            validation_score = get_reward_complete(reward_model, postprocessed_sample_validation_query_responses, tokenizer)
             
             # carperAI-style score normaliation
             accelerator.print("before score", scores, scores.mean())
@@ -773,15 +893,25 @@ if __name__ == "__main__":
                         mb_query_responses = query_responses[micro_batch_inds]
                         mb_logprobs = logprobs[micro_batch_inds]
 
-                        output, (vpred_temp, _) = forward(model, mb_query_responses, tokenizer)
+                        # output, vpred_temp = forward(policy, mb_query_responses, tokenizer)
+                        output, (_, vpred_temp) = forward(model, mb_query_responses, tokenizer)
+                        # TODO: value also use the EOS token index!!!!!!!!!!!!!!!!!!!
+                        # TODO: value also use the EOS token index!!!!!!!!!!!!!!!!!!!
+                        # TODO: value also use the EOS token index!!!!!!!!!!!!!!!!!!!
+                        # TODO: value also use the EOS token index!!!!!!!!!!!!!!!!!!!
+                        # TODO: value also use the EOS token index!!!!!!!!!!!!!!!!!!!
+                        # TODO: value also use the EOS token index!!!!!!!!!!!!!!!!!!!
+                        # TODO: value also use the EOS token index!!!!!!!!!!!!!!!!!!!
+                        # TODO: value also use the EOS token index!!!!!!!!!!!!!!!!!!!
+                        # TODO: value also use the EOS token index!!!!!!!!!!!!!!!!!!!
                         
                         logits = output.logits[:, context_length - 1 : -1]
                         logits /= (args.task.temperature + 1e-7)
                         new_all_logprobs = F.log_softmax(logits, dim=-1)
                         new_logprobs = torch.gather(new_all_logprobs, 2, mb_responses.unsqueeze(-1)).squeeze(-1)
-                        # new_logprobs = torch.masked_fill(new_logprobs, padding_mask[micro_batch_inds], INVALID_LOGPROB)
-                        vpred = vpred_temp[:, context_length - 1 : -1]
-                        # vpred = torch.masked_fill(vpred, padding_mask[micro_batch_inds], 0)
+                        new_logprobs = torch.masked_fill(new_logprobs, padding_mask[micro_batch_inds], INVALID_LOGPROB)
+                        vpred = vpred_temp[:, context_length - 1 : -1].squeeze(-1)
+                        vpred = torch.masked_fill(vpred, padding_mask[micro_batch_inds], 0)
                         vpredclipped = torch.clamp(
                             vpred,
                             mb_values - args.ppo.cliprange_value,
@@ -799,6 +929,7 @@ if __name__ == "__main__":
                         pg_clipfrac = (pg_losses2 > pg_losses).float().mean()
                         loss = pg_loss + args.ppo.vf_coef * vf_loss
                         accelerator.backward(loss)
+                        breakpoint()
                         optimizer.step()
                         optimizer.zero_grad()
                         prob_dist = torch.nn.functional.softmax(logits, dim=-1)
