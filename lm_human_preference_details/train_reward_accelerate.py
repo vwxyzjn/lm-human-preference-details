@@ -107,7 +107,7 @@ class Args:
     """Whether, after training, to normalize the rewards on the ref policy to mean 0, var 1 (so the KL coefficient always has the same meaning)."""
     print_sample_output_freq: int = 10
     """How often to print sample output"""
-    save_path: str = "models/reward.pt"
+    save_path: str = "models/reward"
     """Where to save the model"""
     use_tensorflow_adam: bool = True
     """Whether to use tensorflow-style Adam optimizer instead of PyTorch's"""
@@ -325,12 +325,11 @@ def exact_div(a, b):
     return q
 
 
-def generate(lm_backbone, queries, args, generation_config):
+def generate(lm_backbone, queries, tokenizer, generation_config):
     """generate in a way that does not affect padding tokens"""
     context_length = queries.shape[1]
-    attention_mask = queries != args.pad_token_id
-    input_ids = queries.clone()
-    input_ids[~attention_mask] = 0  # set padding tokens to 0
+    attention_mask = queries != tokenizer.pad_token_id
+    input_ids = torch.masked_fill(queries, ~attention_mask, 0)
     output = lm_backbone.generate(
         input_ids=input_ids,
         attention_mask=attention_mask,
@@ -342,11 +341,10 @@ def generate(lm_backbone, queries, args, generation_config):
     return torch.cat((queries, output.sequences[:, context_length:]), dim=1)
 
 
-def get_reward(reward_model, query_responses, args):
-    attention_mask = query_responses != args.pad_token_id
+def get_reward(reward_model, query_responses, tokenizer):
+    attention_mask = query_responses != tokenizer.pad_token_id
     position_ids = attention_mask.cumsum(1) - attention_mask.long()  # exclusive cumsum
-    input_ids = query_responses.clone()
-    input_ids[~attention_mask] = 0
+    input_ids = torch.masked_fill(query_responses, ~attention_mask, 0)
     return reward_model(
         input_ids=input_ids,
         attention_mask=attention_mask,
@@ -364,6 +362,7 @@ def normalize(
     reward_model,
     iter_dataloader,
     generation_config,
+    tokenizer,
 ):
     with torch.no_grad():
         # reset reward scales
@@ -375,14 +374,14 @@ def normalize(
         for _ in range(n_batches):
             data = next(iter_dataloader)
             queries = data["query_token"].to(device)
-            queries = right_padding_to_left_padding(data["query_token"], args.pad_token_id).to(device)
-            query_responses = generate(lm_backbone, queries, args, generation_config)
+            queries = right_padding_to_left_padding(data["query_token"], tokenizer.pad_token_id).to(device)
+            query_responses = generate(lm_backbone, queries, tokenizer, generation_config)
             sample_queries_responses.append(query_responses)
 
         # compute reward statistics
         rewards = []
         for query_responses in sample_queries_responses:
-            rewards.append(get_reward(reward_model, query_responses, args)[1])
+            rewards.append(get_reward(reward_model, query_responses, tokenizer)[1])
         rewards = torch.cat(rewards)
         rewards = accelerator.gather(rewards)
         mean, std = rewards.mean(), rewards.std()
@@ -402,12 +401,12 @@ def normalize(
         for _ in range(n_batches):
             data = next(iter_dataloader)
             queries = data["query_token"].to(device)
-            queries = right_padding_to_left_padding(data["query_token"], args.pad_token_id).to(device)
-            query_responses = generate(lm_backbone, queries, args, generation_config)
+            queries = right_padding_to_left_padding(data["query_token"], tokenizer.pad_token_id).to(device)
+            query_responses = generate(lm_backbone, queries, tokenizer, generation_config)
             sample_queries_responses.append(query_responses)
         rewards = []
         for query_responses in sample_queries_responses:
-            rewards.append(get_reward(reward_model, query_responses, args)[1])
+            rewards.append(get_reward(reward_model, query_responses, tokenizer)[1])
         rewards = torch.cat(rewards)
         rewards = accelerator.gather(rewards)
         mean, std = rewards.mean(), rewards.std()
@@ -464,7 +463,6 @@ def train(args: Args):
     )
     # we use the padding token manually but do not resize the token embedding of the model
     tokenizer.add_special_tokens({"pad_token": "[PAD]"})
-    args.pad_token_id = tokenizer.pad_token_id
     untrained_model = AutoModelForCausalLMWithRewardHead(
         AutoModelForCausalLM.from_pretrained(args.base_model, trust_remote_code=True)
     )
@@ -559,6 +557,7 @@ def train(args: Args):
             reward_model,
             iter_dataloader,
             generation_config,
+            tokenizer,
         )
         print(
             "after normalization. "
@@ -603,15 +602,15 @@ def train(args: Args):
                     torch.from_numpy(np.stack(mb_data[f"sample{i}"])).to(device) for i in range(args.labels.num_labels)
                 ]
                 # hack: deal with openai's padding token
-                mb_query[mb_query == OPENAI_PAD_TOKEN_ID] = args.pad_token_id
+                mb_query[mb_query == OPENAI_PAD_TOKEN_ID] = tokenizer.pad_token_id
                 for item in mb_responses:
-                    item[item == OPENAI_PAD_TOKEN_ID] = args.pad_token_id
+                    item[item == OPENAI_PAD_TOKEN_ID] = tokenizer.pad_token_id
 
                 predicted_rewards = []
                 for i in range(args.labels.num_labels):
                     query_responses = torch.cat([mb_query, mb_responses[i]], dim=1)
-                    query_responses = right_padding_to_left_padding(query_responses, args.pad_token_id)
-                    reward = get_reward(reward_model, query_responses, args)[1]
+                    query_responses = right_padding_to_left_padding(query_responses, tokenizer.pad_token_id)
+                    reward = get_reward(reward_model, query_responses, tokenizer)[1]
                     predicted_rewards.append(reward.view(-1))
                 predicted_rewards = torch.stack(
                     predicted_rewards, dim=1
@@ -644,20 +643,20 @@ def train(args: Args):
                         micro_batch_inds = b_inds[micro_batch_start:micro_batch_end]
                         mb_data = label[micro_batch_inds]
                         mb_query = torch.from_numpy(np.stack(mb_data["query"]))
-                        mb_query = right_padding_to_left_padding(mb_query, args.pad_token_id).to(device)
+                        mb_query = right_padding_to_left_padding(mb_query, tokenizer.pad_token_id).to(device)
                         mb_best = torch.from_numpy(np.stack(mb_data["best"])).to(device)
                         mb_responses = [
                             torch.from_numpy(np.stack(mb_data[f"sample{i}"])).to(device) for i in range(args.labels.num_labels)
                         ]
                         # hack: deal with openai's padding token
-                        mb_query[mb_query == OPENAI_PAD_TOKEN_ID] = args.pad_token_id
+                        mb_query[mb_query == OPENAI_PAD_TOKEN_ID] = tokenizer.pad_token_id
                         for item in mb_responses:
-                            item[item == OPENAI_PAD_TOKEN_ID] = args.pad_token_id
+                            item[item == OPENAI_PAD_TOKEN_ID] = tokenizer.pad_token_id
                         predicted_rewards = []
                         for i in range(args.labels.num_labels):
                             query_responses = torch.cat([mb_query, mb_responses[i]], dim=1)
-                            query_responses = right_padding_to_left_padding(query_responses, args.pad_token_id)
-                            reward = get_reward(reward_model, query_responses, args)[1]
+                            query_responses = right_padding_to_left_padding(query_responses, tokenizer.pad_token_id)
+                            reward = get_reward(reward_model, query_responses, tokenizer)[1]
                             predicted_rewards.append(reward.view(-1))
                         predicted_rewards = torch.stack(
                             predicted_rewards, dim=1
@@ -673,16 +672,16 @@ def train(args: Args):
                 data = next(iter_dataloader)
                 queries = data["query_token"].to(device)
                 context_length = queries.shape[1]
-                queries = right_padding_to_left_padding(data["query_token"], args.pad_token_id).to(device)
+                queries = right_padding_to_left_padding(data["query_token"], tokenizer.pad_token_id).to(device)
                 query_responses = generate(
                     accelerator.unwrap_model(reward_model).lm_backbone,
                     queries,
-                    args,
+                    tokenizer,
                     generation_config,
                 )
                 responses = query_responses[:, context_length:]
 
-                output, reward = get_reward(reward_model, query_responses, args)
+                output, reward = get_reward(reward_model, query_responses, tokenizer)
                 logits = output.logits[:, context_length - 1 : -1]
                 logits /= args.task.temperature
                 all_logprobs = F.log_softmax(logits, dim=-1)
@@ -690,7 +689,7 @@ def train(args: Args):
                 del output, logits, all_logprobs
                 torch.cuda.empty_cache()
 
-                output, _ = get_reward(untrained_model, query_responses, args)
+                output, _ = get_reward(untrained_model, query_responses, tokenizer)
                 logits = output.logits[:, context_length - 1 : -1]
                 logits /= args.task.temperature
                 all_logprobs = F.log_softmax(logits, dim=-1)
@@ -740,6 +739,7 @@ def train(args: Args):
             reward_model,
             iter_dataloader,
             generation_config,
+            tokenizer,
         )
         print(
             "after normalization. "
@@ -749,8 +749,7 @@ def train(args: Args):
 
     # save model
     if args.save_path:
-        os.makedirs(os.path.dirname(args.save_path), exist_ok=True)
-        torch.save(accelerator.unwrap_model(reward_model).state_dict(), args.save_path)
+        accelerator.save_model(reward_model, args.save_path)
 
     if accelerator.is_main_process and args.track:
         wandb.finish()

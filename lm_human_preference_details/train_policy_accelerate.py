@@ -40,7 +40,7 @@ class AdaptiveKLParams:
 class RewardHParams:
     kl_coef: float = 0.15
     adaptive_kl: Optional[AdaptiveKLParams] = field(default_factory=AdaptiveKLParams)
-    trained_model: Optional[str] = "models/reward.pt"
+    trained_model: Optional[str] = "models/reward/pytorch_model.bin"
     label_dataset: tyro.conf.Suppress[Optional[str]] = None
 
 
@@ -117,7 +117,7 @@ class Args:
     """Whether to use deepspeed to train the model"""
     print_sample_output_freq: int = 10
     """How often to print sample output"""
-    save_path: str = "models/policy.pt"
+    save_path: str = "models/policy"
     """Where to save the model"""
     use_tensorflow_adam: bool = True
     """Whether to use tensorflow-style Adam optimizer instead of PyTorch's"""
@@ -284,6 +284,12 @@ class AdamTensorFlowStyle(optim.Adam):
         return loss
 
 
+def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
+    torch.nn.init.normal_(layer.weight, std=std)
+    torch.nn.init.constant_(layer.bias, val=bias_const)
+    return layer
+
+
 class AdaptiveKLController:
     def __init__(self, init_kl_coef: float, hparams: AdaptiveKLParams):
         self.value = init_kl_coef
@@ -294,12 +300,6 @@ class AdaptiveKLController:
         proportional_error = np.clip(current / target - 1, -0.2, 0.2)
         mult = 1 + proportional_error * n_steps / self.hparams.horizon
         self.value *= mult
-
-
-def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
-    torch.nn.init.normal_(layer.weight, std=std)
-    torch.nn.init.constant_(layer.bias, val=bias_const)
-    return layer
 
 
 def whiten(values, shift_mean=True):
@@ -333,6 +333,17 @@ class AutoModelForCausalLMWithRewardHead(nn.Module):
         self.reward_gain = torch.nn.Parameter(torch.tensor(1.0), requires_grad=True)
         self.reward_bias = torch.nn.Parameter(torch.tensor(0.0), requires_grad=True)
 
+    def forward(self, **kwargs):
+        output = self.lm_backbone(**kwargs)
+        reward_latents = output.hidden_states[-1]
+        # shape: [batch_size, length, hidden_size]
+        last_reward_latents = reward_latents[:, -1, :]
+        # shape: [batch_size, hidden_size]
+        reward = self.scalar_head(last_reward_latents)
+        # shape: [batch_size, 1]
+        reward = self.reward_gain * reward + self.reward_bias
+        return output, reward
+
 
 def right_padding_to_left_padding(tokens, pad_id):
     """Convert from right padding to left padding."""
@@ -358,8 +369,7 @@ def generate(lm_backbone, queries, tokenizer, generation_config):
     """generate in a way that does not affect padding tokens"""
     context_length = queries.shape[1]
     attention_mask = queries != tokenizer.pad_token_id
-    input_ids = queries.clone()
-    input_ids[~attention_mask] = 0  # set padding tokens to 0
+    input_ids = torch.masked_fill(queries, ~attention_mask, 0)
     output = lm_backbone.generate(
         input_ids=input_ids,
         attention_mask=attention_mask,
@@ -374,20 +384,14 @@ def generate(lm_backbone, queries, tokenizer, generation_config):
 def get_reward(reward_model, query_responses, tokenizer):
     attention_mask = query_responses != tokenizer.pad_token_id
     position_ids = attention_mask.cumsum(1) - attention_mask.long()  # exclusive cumsum
-    input_ids = query_responses.clone()
-    input_ids[~attention_mask] = 0
-    output = reward_model.lm_backbone(
+    input_ids = torch.masked_fill(query_responses, ~attention_mask, 0)
+    return reward_model(
         input_ids=input_ids,
         attention_mask=attention_mask,
         position_ids=position_ids,
         return_dict=True,
         output_hidden_states=True,
     )
-    reward = reward_model.scalar_head(output.hidden_states[-1])
-    reward = reward_model.reward_gain * reward + reward_model.reward_bias
-    # but we only care about the reward of the last token
-    reward = reward[:, -1]
-    return reward
 
 
 def forward(policy, query_responses, tokenizer):
@@ -471,8 +475,6 @@ def train(args: Args):
         None  # disable `pad_token_id` and `eos_token_id` because we just want to
     )
     policy.lm_backbone.generation_config.pad_token_id = None  # generate tokens without truncation / padding
-    # IMPORTANT: Layer norm produces weird gradients, which affects Adam optimizer to impact all the parameters systematically
-    # see https://github.com/pytorch/pytorch/issues/104857 for more details
     if args.use_tensorflow_adam:
         optimizer = AdamTensorFlowStyle(policy.parameters(), lr=args.ppo.lr, eps=args.ppo.eps)
     else:
@@ -609,7 +611,7 @@ def train(args: Args):
             postprocessed_query_responses = right_padding_to_left_padding(
                 postprocessed_query_responses, tokenizer.pad_token_id
             )
-            scores = get_reward(reward_model, postprocessed_query_responses, tokenizer).flatten()
+            scores = get_reward(reward_model, postprocessed_query_responses, tokenizer)[1].flatten()
 
             # 3. filter response. Ensure that the sample contains truncate_token
             # responses not passing that filter will receive a low (fixed) score
@@ -656,7 +658,7 @@ def train(args: Args):
                     )
                     if accelerator.is_main_process and args.track:
                         wandb.log({"query_responses": wandb.Table(dataframe=all_df)}, step=update)
-                    print_rich_table("stuff", all_df[:4], console)
+                    print_rich_table(f"Sample Output at Episode {global_step}", all_df[:4], console)
                 except Exception as e:
                     print(e)
                 del (
@@ -799,15 +801,22 @@ def train(args: Args):
             del kl, mean_kl, mean_entropy, mean_non_score_reward, scores
 
     # save model
-    if accelerator.is_main_process and args.save_path:
-        os.makedirs(os.path.dirname(args.save_path), exist_ok=True)
-        torch.save(policy.state_dict(), args.save_path)
+    if args.save_path:
+        accelerator.save_model(policy, args.save_path)
 
-        if args.upload_model:
-            repo_name = f"{args.exp_name}__{args.rewards.label_dataset}__seed{args.seed}__{int(time.time())}"
-            repo_id = f"{args.hf_entity}/{repo_name}" if args.hf_entity else repo_name
-            policy.lm_backbone.save_pretrained(repo_id, safe_serialization=True, push_to_hub=True)
-            tokenizer.save_pretrained(repo_id, push_to_hub=True)
+        if accelerator.is_main_process and args.upload_model:
+            from huggingface_hub import add_collection_item, create_collection, whoami
+
+            repo_name = f"{args.exp_name}__{args.rewards.label_dataset.replace('/', '_')}__seed{args.seed}"
+            if not args.hf_entity:
+                args.hf_entity = whoami()["name"]
+            repo_id = f"{args.hf_entity}/{repo_name}"
+            accelerator.unwrap_model(policy).lm_backbone.save_pretrained(
+                repo_id, repo_id=repo_id, safe_serialization=True, push_to_hub=True
+            )
+            tokenizer.save_pretrained(repo_id, repo_id=repo_id, push_to_hub=True)
+            collection = create_collection(title=f"lm-human-preference-details", namespace=args.hf_entity, exists_ok=True)
+            add_collection_item(collection.slug, repo_id, item_type="model")
 
 
 if __name__ == "__main__":
