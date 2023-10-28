@@ -26,9 +26,7 @@ from torch.optim.optimizer import (
 )
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
-from transformers import AutoModelForCausalLM, AutoTokenizer, GenerationConfig, get_scheduler
-
-from lm_human_preference_details.data import process_query
+from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer, GenerationConfig, get_scheduler
 
 
 @dataclass
@@ -38,7 +36,6 @@ class SFTHParams:
     noptepochs: int = 1
     lr: float = 6.35e-5
     eps: float = 1e-5
-    lm_loss_on_response_only: bool = False
     total_episodes: tyro.conf.Suppress[int] = None
     local_batch_size:tyro.conf.Suppress[int] = None
     batch_size: tyro.conf.Suppress[int] = None
@@ -52,7 +49,7 @@ class SFTHParams:
 class TaskHParams:
     # Query params
     query_length: int = 512
-    query_dataset: str = "vwxyzjn/summarize_from_feedback_tldr_3_filtered"
+    query_dataset: str = "vwxyzjn/summarize_from_feedback_tldr_3_filtered_oai_preprocessing"
 
     query_format_str: Optional[str] = "SUBREDDIT: r/{subreddit}\n\nTITLE: {title}\n\nPOST: {post}\n\nTL;DR:"
     query_truncate_field: Optional[str] = "post"
@@ -124,6 +121,16 @@ class Args:
     """Number of warm up steps for the scheduler"""
     task: TaskHParams = field(default_factory=TaskHParams)
     sft: SFTHParams = field(default_factory=SFTHParams)
+
+
+# taken from https://github.com/microsoft/DeepSpeedExamples/blob/737c6740bec38b77a24a59135b6481a53d566b38/applications/DeepSpeed-Chat/training/utils/model/model_utils.py#L20C1-L26C52
+def configure_dropout(model_config, dropout):
+    if dropout is not None:
+        for key in ('dropout', 'attention_dropout', 'hidden_dropout',
+                    'activation_dropout'):
+            if hasattr(model_config, key):
+                print(f"Setting model_config.{key} to {dropout}")
+                setattr(model_config, key, dropout)
 
 
 def print_rich_table(title: str, df: pd.DataFrame, console: Console) -> Table:
@@ -284,13 +291,15 @@ class AdamTensorFlowStyle(optim.Adam):
         return loss
 
 
-def right_padding_to_left_padding(tokens, pad_id):
-    """Convert from right padding to left padding."""
-    assert tokens.ndim == 2
-    return torch.tensor(
-        [[pad_id] * (row == pad_id).sum() + [x for x in row if x != pad_id] for row in tokens],
-        device=tokens.device,
-    )
+def shift_pad_id_left(data, pad_id):
+    # Step 1: Create a boolean mask
+    mask = (data == pad_id).long()
+    # Step 3: Use argsort on the inverted boolean mask to get sorted indices
+    sorted_indices = torch.argsort(~mask, axis=1)
+    # Step 4: Use advanced indexing to rearrange the elements
+    rows_range = torch.arange(data.shape[0], device=data.device)
+    shifted_data = data[rows_range[:, None], sorted_indices]
+    return shifted_data
 
 
 def ceil_div(a, b):
@@ -308,8 +317,7 @@ def generate(lm_backbone, queries, tokenizer, generation_config):
     """generate in a way that does not affect padding tokens"""
     context_length = queries.shape[1]
     attention_mask = queries != tokenizer.pad_token_id
-    input_ids = queries.clone()
-    input_ids[~attention_mask] = 0  # set padding tokens to 0
+    input_ids = torch.masked_fill(queries, ~attention_mask, 0)
     output = lm_backbone.generate(
         input_ids=input_ids,
         attention_mask=attention_mask,
@@ -317,7 +325,6 @@ def generate(lm_backbone, queries, tokenizer, generation_config):
         generation_config=generation_config,
         return_dict_in_generate=True,
     )
-    # restore padding tokens
     return torch.cat((queries, output.sequences[:, context_length:]), dim=1)
 
 
@@ -340,19 +347,10 @@ if __name__ == "__main__":
     args.sft.world_size = accelerator.num_processes
     args.sft.local_batch_size = args.sft.local_micro_batch_size * args.sft.gradient_accumulation_steps
     args.sft.batch_size = int(args.sft.local_batch_size * args.sft.world_size)
-    patch_h = TaskQueryHParams(
-        length=args.task.query_length,
-        dataset=args.task.query_dataset,
-        format_str=args.task.query_format_str,
-        truncate_field=args.task.query_truncate_field,
-        truncate_text=args.task.query_truncate_text,
-        padding=args.task.query_padding,
-        pad_side=args.task.query_pad_side,
-    )
     dataset = load_dataset(args.task.query_dataset, split="train")
-    test_dataset = load_dataset(args.task.query_dataset, split="test")
+    validation_dataset = load_dataset(args.task.query_dataset, split="validation")
     accelerator.print("The number of samples in dataset", len(dataset))
-    accelerator.print("The number of samples in test_dataset", len(test_dataset))
+    accelerator.print("The number of samples in validation_dataset", len(validation_dataset))
     args.sft.total_episodes = len(dataset)
     args.sft.num_updates = args.sft.total_episodes // args.sft.batch_size
 
@@ -392,7 +390,9 @@ if __name__ == "__main__":
     )
     # we use the padding token manually but do not resize the token embedding of the model
     tokenizer.add_special_tokens({"pad_token": "[PAD]"})
-    policy = AutoModelForCausalLM.from_pretrained(args.base_model, trust_remote_code=True)
+    model_config = AutoConfig.from_pretrained(args.base_model)
+    configure_dropout(model_config, 0.0) # disable dropout
+    policy = AutoConfig, AutoModelForCausalLM.from_pretrained(args.base_model, trust_remote_code=True, config=model_config)
     policy.generation_config.eos_token_id = None  # disable `pad_token_id` and `eos_token_id` because we just want to
     policy.generation_config.pad_token_id = None  # generate tokens without truncation / padding
     # IMPORTANT: Layer norm produces weird gradients, which affects Adam optimizer to impact all the parameters systematically
@@ -411,31 +411,19 @@ if __name__ == "__main__":
         num_training_steps=args.sft.num_updates // args.sft.gradient_accumulation_steps,
     )
 
-    def process_query_data(x):
-        return {
-            **process_query(x, encoder=tokenizer, hparams=patch_h),
-            "reference_response": tokenizer.encode(
-                f" {x['summary']}<|endoftext|>", padding="max_length", max_length=args.task.response_length, truncation=True,
-                # with an extra leading space to account for the space between the query and response
-            ),
-        }
-
-    dataset = dataset.map(process_query_data, load_from_cache_file=args.load_from_cache_file)
-    dataset = dataset.with_format("torch", columns=["query_token", "reference_response"])
+    dataset = dataset.with_format("torch", columns=["query_token", "reference_response_token"])
     dataset = dataset.shuffle(seed=local_seed)
-    test_dataset = test_dataset.map(process_query_data, load_from_cache_file=args.load_from_cache_file)
-    test_dataset = test_dataset.with_format("torch", columns=["query_token", "reference_response"])
-    test_dataset = test_dataset.shuffle(seed=local_seed)
     dataloader = DataLoader(dataset, batch_size=args.sft.local_micro_batch_size)
-    test_dataloader = DataLoader(test_dataset, batch_size=args.sft.local_micro_batch_size)
-    policy, optimizer, dataloader, test_dataloader, scheduler = accelerator.prepare(policy, optimizer, dataloader, test_dataloader, scheduler)
+    validation_dataset = validation_dataset.with_format("torch", columns=["query_token", "reference_response_token"])
+    validation_dataloader = DataLoader(validation_dataset, batch_size=args.sft.local_micro_batch_size)
+    policy, optimizer, dataloader, validation_dataloader, scheduler = accelerator.prepare(policy, optimizer, dataloader, validation_dataloader, scheduler)
     iter_dataloader = iter(dataloader)
     # WARNING: even with `max_new_tokens` and `min_new_tokens` set to the same value, the number of tokens generated
     # may not be the same. TODO: investigate further, we just want to generate a fixed number of tokens
     generation_config = GenerationConfig(
         max_new_tokens=args.task.response_length,
         min_new_tokens=args.task.response_length,
-        temperature=args.task.temperature,
+        temperature=(args.task.temperature + 1e-7),
         top_k=0.0,
         top_p=1.0,
         do_sample=True,
@@ -451,17 +439,14 @@ if __name__ == "__main__":
         global_step += args.sft.batch_size
         accelerator.print(f"update {update}, global_step {global_step}")
         data = next(iter_dataloader)
-        reference_responses = data["reference_response"].to(device, non_blocking=True)
+        reference_responses = data["reference_response_token"].to(device, non_blocking=True)
         queries = data["query_token"].to(device, non_blocking=True)
-        queries = right_padding_to_left_padding(queries, tokenizer.pad_token_id).to(device)
         query_responses = torch.cat((queries, reference_responses), dim=1)
+        query_responses = shift_pad_id_left(query_responses, tokenizer.pad_token_id)
         with accelerator.accumulate(policy):
             output = forward(policy, query_responses, tokenizer)
             # mask out gradient effects on response padding tokens
             labels = query_responses.masked_fill(query_responses == tokenizer.pad_token_id, -1)
-            if args.sft.lm_loss_on_response_only:
-                # mask out gradient effects on query tokens
-                labels[:, :queries.shape[1]] = -1
             lm_logits = output.logits
             # hand-rolled transformer loss: Shift so that tokens < n predict n
             # but unlike `transformers` we mask the padding tokens via `ignore_index=-1`
@@ -480,59 +465,59 @@ if __name__ == "__main__":
         if update == 1 or update == args.sft.num_updates - 1:
             policy.eval()
             rouge_scores = collections.defaultdict(list)
-            all_decode_test_queries = []
-            all_decode_test_query_responses = []
-            all_decode_test_responses = []
-            all_decode_test_reference_responses = []
-            all_test_losses = []
-            for test_idx, test_data in enumerate(test_dataloader):
+            all_decode_validation_queries = []
+            all_decode_validation_query_responses = []
+            all_decode_validation_responses = []
+            all_decode_validation_reference_responses = []
+            all_validation_losses = []
+            for validation_idx, validation_data in enumerate(validation_dataloader):
                 with torch.no_grad():
-                    test_reference_responses = test_data["reference_response"].to(device, non_blocking=True)
-                    test_queries = test_data["query_token"].to(device, non_blocking=True)
-                    test_queries = right_padding_to_left_padding(test_queries, tokenizer.pad_token_id)
-                    test_query_reference_responses = torch.cat((test_queries, test_reference_responses), dim=1)
+                    validation_reference_responses = validation_data["reference_response_token"].to(device, non_blocking=True)
+                    validation_queries = validation_data["query_token"].to(device, non_blocking=True)
+                    validation_queries = shift_pad_id_left(validation_queries, tokenizer.pad_token_id)
+                    validation_query_reference_responses = torch.cat((validation_queries, validation_reference_responses), dim=1)
 
-                    test_output = forward(policy, test_query_reference_responses, tokenizer)
-                    test_labels = test_query_reference_responses.masked_fill(test_query_reference_responses == tokenizer.pad_token_id, -1)
+                    validation_output = forward(policy, validation_query_reference_responses, tokenizer)
+                    validation_labels = validation_query_reference_responses.masked_fill(validation_query_reference_responses == tokenizer.pad_token_id, -1)
                     if args.sft.lm_loss_on_response_only:
-                        test_labels[:, :queries.shape[1]] = -1
-                    test_lm_logits = test_output.logits
+                        validation_labels[:, :queries.shape[1]] = -1
+                    validation_lm_logits = validation_output.logits
                     # hand-rolled transformer loss: Shift so that tokens < n predict n
                     # but unlike `transformers` we mask the padding tokens via `ignore_index=-1`
-                    test_shift_logits = test_lm_logits[..., :-1, :].contiguous()
-                    test_shift_labels = test_labels[..., 1:].contiguous()
-                    test_loss = F.cross_entropy(test_shift_logits.view(-1, test_shift_logits.size(-1)), test_shift_labels.view(-1), ignore_index=-1)
-                    test_loss = accelerator.gather(test_loss)
-                    all_test_losses.append(test_loss)
+                    validation_shift_logits = validation_lm_logits[..., :-1, :].contiguous()
+                    validation_shift_labels = validation_labels[..., 1:].contiguous()
+                    validation_loss = F.cross_entropy(validation_shift_logits.view(-1, validation_shift_logits.size(-1)), validation_shift_labels.view(-1), ignore_index=-1)
+                    validation_loss = accelerator.gather(validation_loss)
+                    all_validation_losses.append(validation_loss)
 
-                    generated_responses = generate(accelerator.unwrap_model(policy), test_queries, tokenizer, generation_config)
-                    decode_test_queries = tokenizer.batch_decode(accelerator.gather(test_queries))
-                    decode_test_query_responses = tokenizer.batch_decode(accelerator.gather(generated_responses))
-                    decode_test_reference_responses = tokenizer.batch_decode(
-                        accelerator.gather(test_reference_responses)
+                    generated_responses = generate(accelerator.unwrap_model(policy), validation_queries, tokenizer, generation_config)
+                    decode_validation_queries = tokenizer.batch_decode(accelerator.gather(validation_queries))
+                    decode_validation_query_responses = tokenizer.batch_decode(accelerator.gather(generated_responses))
+                    decode_validation_reference_responses = tokenizer.batch_decode(
+                        accelerator.gather(validation_reference_responses)
                     )
-                    decode_test_responses = [
-                        x[len(y) :] for x, y in zip(decode_test_query_responses, decode_test_queries)
+                    decode_validation_responses = [
+                        x[len(y) :] for x, y in zip(decode_validation_query_responses, decode_validation_queries)
                     ]
-                    rouge_score = rouge.compute(predictions=decode_test_responses, references=decode_test_reference_responses)
+                    rouge_score = rouge.compute(predictions=decode_validation_responses, references=decode_validation_reference_responses)
                     rouge_scores["rouge1"].append(rouge_score["rouge1"])
                     rouge_scores["rouge2"].append(rouge_score["rouge2"])
                     rouge_scores["rougeL"].append(rouge_score["rougeL"])
 
-                    all_decode_test_queries.extend(decode_test_queries)
-                    accelerator.print("len(all_decode_test_queries)", len(all_decode_test_queries), decode_test_responses)
-                    all_decode_test_query_responses.extend(decode_test_query_responses)
-                    all_decode_test_responses.extend(decode_test_responses)
-                    all_decode_test_reference_responses.extend(decode_test_reference_responses)
-                if test_idx == 10:
+                    all_decode_validation_queries.extend(decode_validation_queries)
+                    accelerator.print("len(all_decode_validation_queries)", len(all_decode_validation_queries), decode_validation_responses)
+                    all_decode_validation_query_responses.extend(decode_validation_query_responses)
+                    all_decode_validation_responses.extend(decode_validation_responses)
+                    all_decode_validation_reference_responses.extend(decode_validation_reference_responses)
+                if validation_idx == 10:
                     break
 
             try:
                 all_df = pd.DataFrame(
                     {
-                        "query": all_decode_test_queries,
-                        "response": all_decode_test_responses,
-                        "reference": all_decode_test_reference_responses,
+                        "query": all_decode_validation_queries,
+                        "response": all_decode_validation_responses,
+                        "reference": all_decode_validation_reference_responses,
                     }
                 )
                 accelerator.print(all_df)
@@ -547,7 +532,7 @@ if __name__ == "__main__":
                 rouge_metric = accelerator.gather(rouge_metric)
                 writer.add_scalar(f"rouge/{k}", rouge_metric.mean().item(), update)
                 accelerator.print(f"rouge/{k}: {rouge_metric.mean().item()} {rouge_metric.shape} {rouge_metric}")
-            writer.add_scalar("test_loss", torch.stack(all_test_losses).mean().item(), update)
+            writer.add_scalar("validation_loss", torch.stack(all_validation_losses).mean().item(), update)
             policy.train()
 
     # save model

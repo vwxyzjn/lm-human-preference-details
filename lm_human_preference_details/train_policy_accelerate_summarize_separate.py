@@ -137,14 +137,14 @@ class Args:
     """the name of the pretrained model to use"""
     deepspeed: bool = False
     """Whether to use deepspeed to train the model"""
-    print_sample_output_freq: int = 1
+    print_sample_output_freq: int = 10
     """How often to print sample output"""
-    sft_model_path: str = ""
-    """Where to load the SFT model"""
-    save_path: str = "models/policy.pt"
+    save_path: str = "models/ppo_policy"
     """Where to save the model"""
     optimizer: Literal["tf_adam", "adam", "adamw"] = "adamw"
     """Which optimizer to use"""
+    sft_model_path: str = ""
+    """Where to load the SFT model"""
     task: TaskHParams = field(default_factory=TaskHParams)
     rewards: RewardHParams = field(default_factory=RewardHParams)
     ppo: PpoHParams = field(default_factory=PpoHParams)
@@ -378,13 +378,23 @@ class PolicyAndValueWrapper(nn.Module):
         return self.policy(**kwargs), self.critic(**kwargs)
     
 
-def right_padding_to_left_padding(tokens, pad_id):
+def shift_pad_id_left(tokens, pad_id):
     """Convert from right padding to left padding."""
     assert tokens.ndim == 2
     return torch.tensor(
         [[pad_id] * (row == pad_id).sum() + [x for x in row if x != pad_id] for row in tokens],
         device=tokens.device,
     )
+
+def shift_pad_id_left(data, pad_id):
+    # Step 1: Create a boolean mask
+    mask = (data == pad_id).long()
+    # Step 3: Use argsort on the inverted boolean mask to get sorted indices
+    sorted_indices = torch.argsort(~mask, axis=1)
+    # Step 4: Use advanced indexing to rearrange the elements
+    rows_range = torch.arange(data.shape[0], device=data.device)
+    shifted_data = data[rows_range[:, None], sorted_indices]
+    return shifted_data
 
 
 def ceil_div(a, b):
@@ -444,7 +454,6 @@ def truncate_response(args, tokenizer, responses):
     new_size = [1] * (len(responses.size()) - 1) + [args.task.response_length]
     idxs = torch.arange(args.task.response_length, device=responses.device).view(*new_size)
     postprocessed_responses = torch.masked_fill(responses, idxs > trunc_idxs, tokenizer.pad_token_id)
-    postprocessed_responses = right_padding_to_left_padding(postprocessed_responses, tokenizer.pad_token_id)
     return postprocessed_responses
 
 # def train(args: Args):
@@ -576,10 +585,10 @@ if __name__ == "__main__":
     sample_validation = validation_dataset[local_sample_validation_inds]
     sample_validation_queries = torch.Tensor(sample_validation["query_token"]).to(device)
     with torch.no_grad():
-        sample_validation_queries = right_padding_to_left_padding(sample_validation_queries, tokenizer.pad_token_id)
+        sample_validation_queries = shift_pad_id_left(sample_validation_queries, tokenizer.pad_token_id)
         sample_validation_reference_response = torch.Tensor(sample_validation["reference_response_token"]).to(device)
         sample_validation_query_reference_responses = torch.cat((sample_validation_queries, sample_validation_reference_response), dim=1)
-        sample_validation_query_reference_responses = right_padding_to_left_padding(sample_validation_query_reference_responses, tokenizer.pad_token_id)
+        sample_validation_query_reference_responses = shift_pad_id_left(sample_validation_query_reference_responses, tokenizer.pad_token_id)
         _, sample_validation_reference_scores = get_reward(reward_model, sample_validation_query_reference_responses, tokenizer)
 
     iter_dataloader = iter(repeat_generator())
@@ -613,9 +622,9 @@ if __name__ == "__main__":
         with torch.no_grad():
             queries = data["query_token"].to(device)
             reference_responses = data["reference_response_token"].to(device)
-            queries = right_padding_to_left_padding(data["query_token"], tokenizer.pad_token_id).to(device)
+            queries = shift_pad_id_left(queries, tokenizer.pad_token_id)
             query_reference_responses = torch.cat((queries, reference_responses), dim=1)
-            query_reference_responses = right_padding_to_left_padding(query_reference_responses, tokenizer.pad_token_id)
+            query_reference_responses= shift_pad_id_left(query_reference_responses, tokenizer.pad_token_id)
             query_responses = generate(
                 accelerator.unwrap_model(model).policy,
                 queries,
@@ -635,8 +644,10 @@ if __name__ == "__main__":
             sample_validation_responses = sample_validation_query_responses[:, context_length:]
             postprocessed_sample_validation_responses = truncate_response(args, tokenizer, sample_validation_responses)
             postprocessed_sample_validation_query_responses = torch.cat((sample_validation_queries, postprocessed_sample_validation_responses), 1)
+            postprocessed_sample_validation_query_responses = shift_pad_id_left(postprocessed_sample_validation_query_responses, tokenizer.pad_token_id)
             torch.cuda.empty_cache()
 
+            # TODO: do I do this with query response or post-processed query response?
             output = forward(accelerator.unwrap_model(model).policy, query_responses, tokenizer)
             logits = output.logits[:, context_length - 1 : -1]
             logits /= (args.task.temperature + 1e-7)
@@ -659,7 +670,7 @@ if __name__ == "__main__":
 
             # 2. run reward model on the truncated responses
             postprocessed_query_responses = torch.cat((queries, postprocessed_responses), 1)
-            postprocessed_query_responses = right_padding_to_left_padding(postprocessed_query_responses, tokenizer.pad_token_id)
+            postprocessed_query_responses = shift_pad_id_left(postprocessed_query_responses, tokenizer.pad_token_id)
             full_values, _ = get_reward(accelerator.unwrap_model(model).critic, postprocessed_query_responses, tokenizer)
             values = full_values[:, context_length - 1 : -1].squeeze(-1)
             padding_mask = postprocessed_responses == tokenizer.pad_token_id
@@ -673,10 +684,10 @@ if __name__ == "__main__":
             _, validation_score = get_reward(reward_model, postprocessed_sample_validation_query_responses, tokenizer)
             
             # carperAI-style score normaliation
-            accelerator.print("before score", scores, scores.mean())
-            accelerator.print("reference_scores", reference_scores, reference_scores.mean())
+            # accelerator.print("before score", scores, scores.mean())
+            # accelerator.print("reference_scores", reference_scores, reference_scores.mean())
             scores = scores - reference_scores
-            accelerator.print("after score", scores, scores.mean())
+            # accelerator.print("after score", scores, scores.mean())
 
             # 3. filter response. Ensure that the sample contains truncate_token
             # responses not passing that filter will receive a low (fixed) score
@@ -697,16 +708,13 @@ if __name__ == "__main__":
 
             if args.print_sample_output_freq > 0 and (update - 1) % args.print_sample_output_freq == 0:
                 try:
-                    all_decode_validation_queries = tokenizer.batch_decode(sample_validation_queries)
-                    all_sample_validation_query_responses = tokenizer.batch_decode(
-                        sample_validation_query_responses
+                    all_decode_validation_queries = tokenizer.batch_decode(sample_validation_queries, skip_special_tokens=True)
+                    all_sample_validation_responses = tokenizer.batch_decode(
+                        postprocessed_sample_validation_responses
                     )
                     all_sample_validation_query_responses_postprocessed = tokenizer.batch_decode(
-                        postprocessed_sample_validation_query_responses
+                        postprocessed_sample_validation_query_responses, skip_special_tokens=True
                     )
-                    all_sample_validation_responses = [
-                        x[len(y) :] for x, y in zip(all_sample_validation_query_responses, all_decode_validation_queries)
-                    ]
                     all_sample_validation_postprocessed_responses = [
                         x[len(y) :] for x, y in zip(all_sample_validation_query_responses_postprocessed, all_decode_validation_queries)
                     ]
@@ -731,7 +739,6 @@ if __name__ == "__main__":
                     print(e)
                 del (
                     all_decode_validation_queries,
-                    all_sample_validation_query_responses,
                     all_sample_validation_responses,
                     all_sample_validation_reference_responses,
                     all_sample_validation_df,

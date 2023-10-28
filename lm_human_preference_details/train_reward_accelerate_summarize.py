@@ -46,7 +46,7 @@ class LabelHParams:
 class TaskHParams:
     # Query params
     query_length: int = 512
-    query_dataset: str = "vwxyzjn/summarize_from_feedback_tldr_3_filtered"
+    query_dataset: str = "vwxyzjn/summarize_from_feedback_tldr_3_filtered_oai_preprocessing"
 
     query_format_str: Optional[str] = "SUBREDDIT: r/{subreddit}\n\nTITLE: {title}\n\nPOST: {post}\n\nTL;DR:"
     query_truncate_field: Optional[str] = "post"
@@ -339,13 +339,15 @@ class AutoModelForCausalLMWithRewardHead(nn.Module):
         return reward
 
 
-def right_padding_to_left_padding(tokens, pad_id):
-    """Convert from right padding to left padding."""
-    assert tokens.ndim == 2
-    return torch.tensor(
-        [[pad_id] * (row == pad_id).sum() + [x for x in row if x != pad_id] for row in tokens],
-        device=tokens.device,
-    )
+def shift_pad_id_left(data, pad_id):
+    # Step 1: Create a boolean mask
+    mask = (data == pad_id).long()
+    # Step 3: Use argsort on the inverted boolean mask to get sorted indices
+    sorted_indices = torch.argsort(~mask, axis=1)
+    # Step 4: Use advanced indexing to rearrange the elements
+    rows_range = torch.arange(data.shape[0], device=data.device)
+    shifted_data = data[rows_range[:, None], sorted_indices]
+    return shifted_data
 
 
 def ceil_div(a, b):
@@ -371,7 +373,6 @@ def generate(lm_backbone, queries, tokenizer, generation_config):
         generation_config=generation_config,
         return_dict_in_generate=True,
     )
-    # restore padding tokens
     return torch.cat((queries, output.sequences[:, context_length:]), dim=1)
 
 
@@ -411,7 +412,7 @@ def evaluate(args, accelerator, tokenizer, device, reward_model, validation_labe
                 ]
                 mb_query_tiled = mb_query.unsqueeze(1).repeat(1, len(mb_responses), 1)
                 query_responses = torch.cat([mb_query_tiled, torch.stack(mb_responses).transpose(0,1)], dim=2).flatten(0, 1)
-                query_responses = right_padding_to_left_padding(query_responses, tokenizer.pad_token_id)
+                query_responses = shift_pad_id_left(query_responses, tokenizer.pad_token_id)
                 predicted_reward = get_reward(reward_model, query_responses, tokenizer)
                 predicted_reward = predicted_reward.view(-1, len(mb_responses))
                 accuracy = (predicted_reward.argmax(1) == mb_best).float().mean()
@@ -436,6 +437,7 @@ def train(args: Args):
     args.batch_size = int(args.local_batch_size * args.world_size)
     args.rollout_batch_size = int(args.local_rollout_batch_size * args.world_size)
     args.local_micro_batch_size = exact_div(args.local_batch_size, args.gradient_accumulation_steps)
+    args.num_updates = args.labels.num_train // args.batch_size
 
     console = Console(force_terminal=True)
     run_name = f"{args.exp_name}__{args.seed}__{int(time.time())}"
@@ -566,7 +568,7 @@ def train(args: Args):
                     ]
                     mb_query_tiled = mb_query.unsqueeze(1).repeat(1, len(mb_responses), 1)
                     query_responses = torch.cat([mb_query_tiled, torch.stack(mb_responses).transpose(0,1)], dim=2).flatten(0, 1)
-                    query_responses = right_padding_to_left_padding(query_responses, tokenizer.pad_token_id)
+                    query_responses = shift_pad_id_left(query_responses, tokenizer.pad_token_id)
                     predicted_reward = get_reward(reward_model, query_responses, tokenizer)
                     predicted_reward = predicted_reward.view(-1, len(mb_responses))
                     accuracy = (predicted_reward.argmax(1) == mb_best).float().mean()
