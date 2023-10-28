@@ -33,8 +33,6 @@ from transformers import (
     GenerationConfig,
 )
 
-INVALID_LOGPROB = 1.0
-
 
 @dataclass
 class AdaptiveKLParams:
@@ -700,8 +698,6 @@ if __name__ == "__main__":
             full_values, _ = get_reward(accelerator.unwrap_model(model).critic, postprocessed_query_responses, tokenizer)
             values = full_values[:, context_length - 1 : -1].squeeze(-1)
             padding_mask = postprocessed_responses == tokenizer.pad_token_id
-            # logprobs = torch.masked_fill(logprobs, padding_mask, INVALID_LOGPROB)
-            # ref_logprobs = torch.masked_fill(ref_logprobs, padding_mask, INVALID_LOGPROB)
             # values = torch.masked_fill(values, padding_mask, 0)
 
             rew, scores = get_reward(reward_model, postprocessed_query_responses, tokenizer)
@@ -806,7 +802,6 @@ if __name__ == "__main__":
                         logits /= args.task.temperature + 1e-7
                         new_all_logprobs = F.log_softmax(logits, dim=-1)
                         new_logprobs = torch.gather(new_all_logprobs, 2, mb_responses.unsqueeze(-1)).squeeze(-1)
-                        # new_logprobs = torch.masked_fill(new_logprobs, padding_mask[micro_batch_inds], INVALID_LOGPROB)
                         vpred = vpred_temp[:, context_length - 1 : -1]
                         # vpred = torch.masked_fill(vpred, padding_mask[micro_batch_inds], 0)
                         vpredclipped = torch.clamp(
