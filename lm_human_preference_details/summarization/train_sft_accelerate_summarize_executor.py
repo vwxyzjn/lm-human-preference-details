@@ -2,16 +2,17 @@ import collections
 import os
 import random
 import time
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import asdict, dataclass, field
 from types import SimpleNamespace
 from typing import List, Optional
 
+import evaluate
 import numpy as np
 import pandas as pd
 import torch
 import torch.optim as optim
 import tyro
-import evaluate
 from accelerate import Accelerator
 from datasets import load_dataset
 from rich.console import Console
@@ -28,7 +29,6 @@ from torch.utils.tensorboard import SummaryWriter
 from transformers import AutoModelForCausalLM, AutoTokenizer, GenerationConfig
 
 from lm_human_preference_details.data import process_query
-from concurrent.futures import ProcessPoolExecutor
 
 
 @dataclass
@@ -39,7 +39,7 @@ class SFTHParams:
     lr: float = 6.35e-5
     eps: float = 1e-5
     total_episodes: tyro.conf.Suppress[int] = None
-    local_batch_size:tyro.conf.Suppress[int] = None
+    local_batch_size: tyro.conf.Suppress[int] = None
     batch_size: tyro.conf.Suppress[int] = None
     mini_batch_size: tyro.conf.Suppress[int] = None
     world_size: tyro.conf.Suppress[int] = None
@@ -138,12 +138,8 @@ def calculate_rouge(
     tokenizer = AutoTokenizer.from_pretrained(base_model, trust_remote_code=True)
     all_decode_test_queries = tokenizer.batch_decode(test_queries, skip_special_tokens=True)
     all_decode_test_query_responses = tokenizer.batch_decode(generated_responses, skip_special_tokens=True)
-    all_decode_test_reference_responses = tokenizer.batch_decode(
-        test_reference_responses, skip_special_tokens=True
-    )
-    all_decode_test_responses = [
-        x[len(y) :] for x, y in zip(all_decode_test_query_responses, all_decode_test_queries)
-    ]
+    all_decode_test_reference_responses = tokenizer.batch_decode(test_reference_responses, skip_special_tokens=True)
+    all_decode_test_responses = [x[len(y) :] for x, y in zip(all_decode_test_query_responses, all_decode_test_queries)]
     rouge = evaluate.load("rouge")
     return rouge.compute(predictions=predictions, references=references)
 
@@ -417,7 +413,10 @@ def train(args: Args):
         return {
             **process_query(x, encoder=tokenizer, hparams=patch_h),
             "reference_response": tokenizer.encode(
-                f" {x['summary']}", padding="max_length", max_length=args.task.response_length, truncation=True,
+                f" {x['summary']}",
+                padding="max_length",
+                max_length=args.task.response_length,
+                truncation=True,
                 # with an extra leading space to account for the space between the query and response
             ),
         }
@@ -442,7 +441,7 @@ def train(args: Args):
         top_p=1.0,
         do_sample=True,
     )
-    executor = ProcessPoolExecutor()
+    ProcessPoolExecutor()
     # rouge = evaluate.load("rouge")
 
     print("===training policy===")
@@ -486,11 +485,10 @@ def train(args: Args):
             for test_idx, test_data in enumerate(test_dataloader):
                 with torch.no_grad():
                     test_queries = test_data["query_token"].to(device)
-                    test_reference_responses = test_data["reference_response"]
+                    test_data["reference_response"]
                     # test_queries = right_padding_to_left_padding(test_queries, tokenizer.pad_token_id)
-                    generated_responses = generate(accelerator.unwrap_model(policy), test_queries, tokenizer, generation_config)
+                    generate(accelerator.unwrap_model(policy), test_queries, tokenizer, generation_config)
                     accelerator.print(update, test_idx)
-                    
 
                     # futures.append(
                     #     executor.submit(
@@ -516,7 +514,7 @@ def train(args: Args):
                     #     except Exception as e:
                     #         print(e)
 
-            rouge_scores = [f.result() for f in futures] # list of dicts
+            rouge_scores = [f.result() for f in futures]  # list of dicts
             rouge_scores = {k: np.mean([x[k] for x in rouge_scores]) for k in rouge_scores[0].keys()}
             for k, v in rouge_scores.items():
                 rouge_metric = torch.tensor(v, device=device)
@@ -534,6 +532,7 @@ def train(args: Args):
             repo_id = f"{args.hf_entity}/{repo_name}" if args.hf_entity else repo_name
             policy.save_pretrained(repo_id, safe_serialization=True, push_to_hub=True)
             tokenizer.save_pretrained(repo_id, push_to_hub=True)
+
 
 if __name__ == "__main__":
     args = tyro.cli(Args)

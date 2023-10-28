@@ -14,7 +14,6 @@ import torch.optim as optim
 import transformers
 import tyro
 from accelerate import Accelerator
-from accelerate.state import AcceleratorState
 from accelerate.utils import DistributedDataParallelKwargs, broadcast
 from datasets import load_dataset
 from rich.console import Console
@@ -470,17 +469,16 @@ def evaluate(args, accelerator, device, reward_model, validation_label):
                 mb_query = right_padding_to_left_padding(mb_query, args.pad_token_id).to(device)
                 mb_best = torch.from_numpy(np.stack(mb_data["choice"])).to(device)
                 mb_responses = [
-                            torch.from_numpy(np.stack(mb_data[f"response{i}_token"])).to(device)
-                            for i in range(args.labels.num_labels)
-                        ]
+                    torch.from_numpy(np.stack(mb_data[f"response{i}_token"])).to(device) for i in range(args.labels.num_labels)
+                ]
                 predicted_rewards = []
                 for i in range(args.labels.num_labels):
                     query_responses = torch.cat([mb_query, mb_responses[i]], dim=1)
                     score, _ = get_reward_complete(reward_model, query_responses, args)
                     predicted_rewards.append(score)
                 predicted_rewards = torch.stack(
-                            predicted_rewards, dim=1
-                        )  # shape (batch_size, num_labels), basically a reward prediction for each label
+                    predicted_rewards, dim=1
+                )  # shape (batch_size, num_labels), basically a reward prediction for each label
                 accuracy = (predicted_rewards.argmax(1) == mb_best).float().mean()
                 test_accuracies.append(accuracy)
         test_accuracy = accelerator.gather(torch.stack(test_accuracies).mean()).mean().item()
@@ -587,7 +585,10 @@ def train(args: Args):
         return {
             **process_query(x, encoder=tokenizer, hparams=patch_h),
             "reference_response": tokenizer.encode(
-                f" {x['summary']}<|endoftext|>", padding="max_length", max_length=args.task.response_length, truncation=True,
+                f" {x['summary']}<|endoftext|>",
+                padding="max_length",
+                max_length=args.task.response_length,
+                truncation=True,
                 # with an extra leading space to account for the space between the query and response
             ),
         }
@@ -603,7 +604,7 @@ def train(args: Args):
     validation_dataloader = DataLoader(validation_dataset, batch_size=args.local_rollout_batch_size)
     reward_model, optimizer, dataloader, scheduler = accelerator.prepare(reward_model, optimizer, dataloader, scheduler)
 
-    iter_dataloader = iter(dataloader)
+    iter(dataloader)
     generation_config = GenerationConfig(
         max_new_tokens=args.task.response_length,
         min_new_tokens=args.task.response_length,
@@ -648,10 +649,16 @@ def train(args: Args):
         return {
             **process_query(x["info"], encoder=tokenizer, hparams=patch_h),
             "response0_token": tokenizer.encode(
-                f" {x['summaries'][0]['text']}<|endoftext|>", padding="max_length", max_length=args.task.response_length, truncation=True
+                f" {x['summaries'][0]['text']}<|endoftext|>",
+                padding="max_length",
+                max_length=args.task.response_length,
+                truncation=True,
             ),
             "response1_token": tokenizer.encode(
-                f" {x['summaries'][1]['text']}<|endoftext|>", padding="max_length", max_length=args.task.response_length, truncation=True
+                f" {x['summaries'][1]['text']}<|endoftext|>",
+                padding="max_length",
+                max_length=args.task.response_length,
+                truncation=True,
             ),
         }
 
@@ -665,7 +672,7 @@ def train(args: Args):
     # ensure that all processes have the same shuffled indices
     all_inds = broadcast(torch.tensor(all_inds, device=device), 0)
     all_inds = all_inds.cpu().numpy()
-    
+
     for (global_step, start) in enumerate(range(0, args.labels.num_train, args.batch_size)):
         # # linear rate annealing
         # lr = (1 - start / args.labels.num_train) * args.lr
@@ -675,14 +682,15 @@ def train(args: Args):
         b_inds_all = all_inds[start:end]
         b_inds = b_inds_all[accelerator.process_index :: accelerator.num_processes]  #  multi-GPU slicing
         # accelerator.print(f"global_step: {global_step}, start: {start}, end: {end}, b_inds: {b_inds}")
-        if accelerator.is_main_process: pprint(
-            {
-                "global_step": global_step,
-                "start:end": f"{start}:{end}",
-                "b_inds_all": b_inds_all,
-                "b_inds": b_inds,
-            }
-        )
+        if accelerator.is_main_process:
+            pprint(
+                {
+                    "global_step": global_step,
+                    "start:end": f"{start}:{end}",
+                    "b_inds_all": b_inds_all,
+                    "b_inds": b_inds,
+                }
+            )
         losses = torch.zeros((args.gradient_accumulation_steps,), device=device)
         accuracies = torch.zeros((args.gradient_accumulation_steps,), device=device)
         gradient_accumulation_step = 0
@@ -702,7 +710,7 @@ def train(args: Args):
                     torch.from_numpy(np.stack(mb_data[f"response{i}_token"])).to(device) for i in range(args.labels.num_labels)
                 ]
                 mb_query_tiled = mb_query.unsqueeze(1).repeat(1, len(mb_responses), 1)
-                query_responses = torch.cat([mb_query_tiled, torch.stack(mb_responses).transpose(0,1)], dim=2).flatten(0, 1)
+                query_responses = torch.cat([mb_query_tiled, torch.stack(mb_responses).transpose(0, 1)], dim=2).flatten(0, 1)
                 predicted_rewards, score_all = get_reward_complete(reward_model, query_responses, tokenizer)
                 breakpoint()
 
@@ -730,7 +738,7 @@ def train(args: Args):
         accelerator.print("train/accuracy", train_accuracy)
 
         # if args.print_sample_output_freq > 0 and global_step % args.print_sample_output_freq == 0:
-        if global_step == num_updates - 1: # first and last update
+        if global_step == num_updates - 1:  # first and last update
             dev_validation_accuracy = evaluate(args, accelerator, device, reward_model, dev_validation_label)
             writer.add_scalar("dev_validation/accuracy", dev_validation_accuracy, global_step)
             accelerator.print("dev_validation/accuracy", dev_validation_accuracy, global_step)
@@ -770,7 +778,6 @@ def train(args: Args):
 
     if accelerator.is_main_process and args.track:
         wandb.finish()
-
 
 
 if __name__ == "__main__":

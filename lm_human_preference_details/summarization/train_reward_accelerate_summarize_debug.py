@@ -591,7 +591,10 @@ if __name__ == "__main__":
         return {
             **process_query(x, encoder=tokenizer, hparams=patch_h),
             "reference_response": tokenizer.encode(
-                f" {x['summary']}", padding="max_length", max_length=args.task.response_length, truncation=True,
+                f" {x['summary']}",
+                padding="max_length",
+                max_length=args.task.response_length,
+                truncation=True,
                 # with an extra leading space to account for the space between the query and response
             ),
         }
@@ -674,7 +677,6 @@ if __name__ == "__main__":
     #     torch.save(accelerator.unwrap_model(reward_model).state_dict(), "models/correct_reward.pt")
     raise
 
-
     print("===training policy===")
     global_step = 0
     stats_shape = (args.ppo.noptepochs, args.ppo.nminibatches, args.ppo.gradient_accumulation_steps)
@@ -695,7 +697,9 @@ if __name__ == "__main__":
             reference_responses = data["reference_response"].to(device)
             query_reference_responses = torch.cat((queries, reference_responses), dim=1)
             queries = right_padding_to_left_padding(data["query_token"], tokenizer.pad_token_id).to(device)
-            query_reference_responses = right_padding_to_left_padding(query_reference_responses, tokenizer.pad_token_id).to(device)
+            query_reference_responses = right_padding_to_left_padding(query_reference_responses, tokenizer.pad_token_id).to(
+                device
+            )
             query_responses = generate(
                 accelerator.unwrap_model(policy).lm_backbone,
                 queries,
@@ -708,7 +712,7 @@ if __name__ == "__main__":
             output, full_values = forward(policy, query_responses, tokenizer)
             values = full_values[:, context_length - 1 : -1].squeeze(-1)
             logits = output.logits[:, context_length - 1 : -1]
-            logits /= (args.task.temperature + 1e-7)
+            logits /= args.task.temperature + 1e-7
             all_logprobs = F.log_softmax(logits, dim=-1)
             logprobs = torch.gather(all_logprobs, 2, responses.unsqueeze(-1)).squeeze(-1)
             del output, logits, all_logprobs
@@ -716,7 +720,7 @@ if __name__ == "__main__":
 
             ref_output, _ = forward(ref_policy, query_responses, tokenizer)
             ref_logits = ref_output.logits[:, context_length - 1 : -1]
-            ref_logits /= (args.task.temperature + 1e-7)
+            ref_logits /= args.task.temperature + 1e-7
             ref_all_logprobs = F.log_softmax(ref_logits, dim=-1)
             ref_logprobs = torch.gather(ref_all_logprobs, 2, responses.unsqueeze(-1)).squeeze(-1)
             del ref_output, ref_logits, ref_all_logprobs
@@ -763,7 +767,7 @@ if __name__ == "__main__":
                 torch.zeros([1], dtype=last_reference_response_indices.dtype, device=query_reference_responses.device),
             )
             reference_scores = reference_scores[:, :, 0].gather(1, last_reference_response_indices.unsqueeze(1)).view(-1)
-            
+
             print(reference_scores.mean())
             # normalization again
             scores = scores - reference_scores

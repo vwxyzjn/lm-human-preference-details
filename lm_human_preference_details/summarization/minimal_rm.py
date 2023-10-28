@@ -1,4 +1,3 @@
-import numpy as np
 import torch
 import torch.nn as nn
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -31,13 +30,14 @@ def get_reward(reward_model, query_responses, tokenizer):
         output_hidden_states=True,
     )
 
+
 base_model = "gpt2"
 tokenizer = AutoTokenizer.from_pretrained(base_model, padding_side="left")
 tokenizer.add_special_tokens({"pad_token": "[PAD]"})
 reward_model = AutoModelForCausalLMWithRewardHead(AutoModelForCausalLM.from_pretrained(base_model))
 reward_model.train()
 mb_query = torch.randint(0, len(tokenizer), (1, 10))
-mb_query[:,0:4] = tokenizer.pad_token_id
+mb_query[:, 0:4] = tokenizer.pad_token_id
 mb_responses = torch.randint(0, len(tokenizer), (1, 2, 10))
 mb_query_tiled = mb_query.unsqueeze(1).repeat(1, mb_responses.shape[1], 1)
 query_responses = torch.cat([mb_query_tiled, mb_responses], dim=2).flatten(0, 1)

@@ -11,7 +11,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-from tqdm import tqdm
 import transformers
 import tyro
 from accelerate import Accelerator
@@ -27,11 +26,9 @@ from torch.optim.optimizer import (
     _get_value,
     _use_grad_for_differentiable,
 )
-from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
-from transformers import AutoModelForCausalLM, AutoTokenizer, GenerationConfig, get_scheduler
-
-from lm_human_preference_details.data import process_query
+from tqdm import tqdm
+from transformers import AutoModelForCausalLM, AutoTokenizer, get_scheduler
 
 
 @dataclass
@@ -151,7 +148,6 @@ class Args:
     """Whether to call `model.train()`"""
     task: TaskHParams = field(default_factory=TaskHParams)
     labels: LabelHParams = field(default_factory=LabelHParams)
-
 
 
 def print_rich_table(title: str, df: pd.DataFrame, console: Console) -> Table:
@@ -411,7 +407,7 @@ def evaluate(args, accelerator, tokenizer, device, reward_model, validation_labe
                     torch.from_numpy(np.stack(mb_data[f"response{i}_token"])).to(device) for i in range(args.labels.num_labels)
                 ]
                 mb_query_tiled = mb_query.unsqueeze(1).repeat(1, len(mb_responses), 1)
-                query_responses = torch.cat([mb_query_tiled, torch.stack(mb_responses).transpose(0,1)], dim=2).flatten(0, 1)
+                query_responses = torch.cat([mb_query_tiled, torch.stack(mb_responses).transpose(0, 1)], dim=2).flatten(0, 1)
                 query_responses = shift_pad_id_left(query_responses, tokenizer.pad_token_id)
                 predicted_reward = get_reward(reward_model, query_responses, tokenizer)
                 predicted_reward = predicted_reward.view(-1, len(mb_responses))
@@ -513,11 +509,10 @@ def train(args: Args):
     )
 
     if args.deepspeed:
-        import deepspeed
+        pass
 
         deepspeed_states = AcceleratorState().deepspeed_plugin
         deepspeed_states.deepspeed_config["train_micro_batch_size_per_gpu"] = args.local_micro_batch_size
-
 
     reward_model, optimizer, scheduler = accelerator.prepare(reward_model, optimizer, scheduler)
 
@@ -543,14 +538,15 @@ def train(args: Args):
             end = start + args.batch_size
             b_inds_all = all_inds[start:end]
             b_inds = b_inds_all[accelerator.process_index :: accelerator.num_processes]  #  multi-GPU slicing
-            if accelerator.is_main_process: pprint(
-                {
-                    "global_step": global_step,
-                    "start:end": f"{start}:{end}",
-                    "b_inds_all": b_inds_all,
-                    "b_inds": b_inds,
-                }
-            )
+            if accelerator.is_main_process:
+                pprint(
+                    {
+                        "global_step": global_step,
+                        "start:end": f"{start}:{end}",
+                        "b_inds_all": b_inds_all,
+                        "b_inds": b_inds,
+                    }
+                )
             losses = torch.zeros((args.gradient_accumulation_steps,), device=device)
             accuracies = torch.zeros((args.gradient_accumulation_steps,), device=device)
             reward_preferreds = torch.zeros((args.gradient_accumulation_steps,), device=device)
@@ -564,10 +560,13 @@ def train(args: Args):
                     mb_query = torch.from_numpy(np.stack(mb_data["query_token"])).to(device)
                     mb_best = torch.from_numpy(np.stack(mb_data["choice"])).to(device)
                     mb_responses = [
-                        torch.from_numpy(np.stack(mb_data[f"response{i}_token"])).to(device) for i in range(args.labels.num_labels)
+                        torch.from_numpy(np.stack(mb_data[f"response{i}_token"])).to(device)
+                        for i in range(args.labels.num_labels)
                     ]
                     mb_query_tiled = mb_query.unsqueeze(1).repeat(1, len(mb_responses), 1)
-                    query_responses = torch.cat([mb_query_tiled, torch.stack(mb_responses).transpose(0,1)], dim=2).flatten(0, 1)
+                    query_responses = torch.cat([mb_query_tiled, torch.stack(mb_responses).transpose(0, 1)], dim=2).flatten(
+                        0, 1
+                    )
                     query_responses = shift_pad_id_left(query_responses, tokenizer.pad_token_id)
                     predicted_reward = get_reward(reward_model, query_responses, tokenizer)
                     predicted_reward = predicted_reward.view(-1, len(mb_responses))
@@ -602,8 +601,8 @@ def train(args: Args):
             accelerator.print("train/accuracy", train_accuracy)
 
             # if args.print_sample_output_freq > 0 and global_step % args.print_sample_output_freq == 0:
-            if global_step == args.num_updates - 1: # first and last update
-            # if global_step == 1:
+            if global_step == args.num_updates - 1:  # first and last update
+                # if global_step == 1:
                 dev_validation_accuracy = evaluate(args, accelerator, tokenizer, device, reward_model, dev_validation_label)
                 writer.add_scalar("dev_validation/accuracy", dev_validation_accuracy, global_step)
                 accelerator.print("dev_validation/accuracy", dev_validation_accuracy, global_step)

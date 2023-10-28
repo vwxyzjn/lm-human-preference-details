@@ -660,7 +660,7 @@ def train(args: Args):
             # 5. whiten rewards
             if args.ppo.whiten_rewards:
                 rewards = whiten(rewards, shift_mean=False)
-            
+
             if args.print_sample_output_freq > 0 and (update - 1) % args.print_sample_output_freq == 0:
                 try:
                     all_decode_queries = tokenizer.batch_decode(queries, skip_special_tokens=True)

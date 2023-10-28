@@ -6,19 +6,19 @@ from dataclasses import asdict, dataclass, field
 from types import SimpleNamespace
 from typing import List, Literal, Optional
 
+import evaluate
 import numpy as np
 import pandas as pd
 import torch
 import torch.optim as optim
-from torch.nn import functional as F
 import tyro
-import evaluate
 from accelerate import Accelerator
 from datasets import load_dataset
 from rich.console import Console
 from rich.pretty import pprint
 from rich.table import Table
 from torch import Tensor, optim
+from torch.nn import functional as F
 from torch.optim.optimizer import (
     _dispatch_sqrt,
     _get_value,
@@ -26,7 +26,13 @@ from torch.optim.optimizer import (
 )
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
-from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer, GenerationConfig, get_scheduler
+from transformers import (
+    AutoConfig,
+    AutoModelForCausalLM,
+    AutoTokenizer,
+    GenerationConfig,
+    get_scheduler,
+)
 
 
 @dataclass
@@ -37,7 +43,7 @@ class SFTHParams:
     lr: float = 6.35e-5
     eps: float = 1e-5
     total_episodes: tyro.conf.Suppress[int] = None
-    local_batch_size:tyro.conf.Suppress[int] = None
+    local_batch_size: tyro.conf.Suppress[int] = None
     batch_size: tyro.conf.Suppress[int] = None
     mini_batch_size: tyro.conf.Suppress[int] = None
     world_size: tyro.conf.Suppress[int] = None
@@ -126,8 +132,7 @@ class Args:
 # taken from https://github.com/microsoft/DeepSpeedExamples/blob/737c6740bec38b77a24a59135b6481a53d566b38/applications/DeepSpeed-Chat/training/utils/model/model_utils.py#L20C1-L26C52
 def configure_dropout(model_config, dropout):
     if dropout is not None:
-        for key in ('dropout', 'attention_dropout', 'hidden_dropout',
-                    'activation_dropout'):
+        for key in ("dropout", "attention_dropout", "hidden_dropout", "activation_dropout"):
             if hasattr(model_config, key):
                 print(f"Setting model_config.{key} to {dropout}")
                 setattr(model_config, key, dropout)
@@ -391,7 +396,7 @@ if __name__ == "__main__":
     # we use the padding token manually but do not resize the token embedding of the model
     tokenizer.add_special_tokens({"pad_token": "[PAD]"})
     model_config = AutoConfig.from_pretrained(args.base_model)
-    configure_dropout(model_config, 0.0) # disable dropout
+    configure_dropout(model_config, 0.0)  # disable dropout
     policy = AutoConfig, AutoModelForCausalLM.from_pretrained(args.base_model, trust_remote_code=True, config=model_config)
     policy.generation_config.eos_token_id = None  # disable `pad_token_id` and `eos_token_id` because we just want to
     policy.generation_config.pad_token_id = None  # generate tokens without truncation / padding
@@ -416,7 +421,9 @@ if __name__ == "__main__":
     dataloader = DataLoader(dataset, batch_size=args.sft.local_micro_batch_size)
     validation_dataset = validation_dataset.with_format("torch", columns=["query_token", "reference_response_token"])
     validation_dataloader = DataLoader(validation_dataset, batch_size=args.sft.local_micro_batch_size)
-    policy, optimizer, dataloader, validation_dataloader, scheduler = accelerator.prepare(policy, optimizer, dataloader, validation_dataloader, scheduler)
+    policy, optimizer, dataloader, validation_dataloader, scheduler = accelerator.prepare(
+        policy, optimizer, dataloader, validation_dataloader, scheduler
+    )
     iter_dataloader = iter(dataloader)
     # WARNING: even with `max_new_tokens` and `min_new_tokens` set to the same value, the number of tokens generated
     # may not be the same. TODO: investigate further, we just want to generate a fixed number of tokens
@@ -475,22 +482,32 @@ if __name__ == "__main__":
                     validation_reference_responses = validation_data["reference_response_token"].to(device, non_blocking=True)
                     validation_queries = validation_data["query_token"].to(device, non_blocking=True)
                     validation_queries = shift_pad_id_left(validation_queries, tokenizer.pad_token_id)
-                    validation_query_reference_responses = torch.cat((validation_queries, validation_reference_responses), dim=1)
+                    validation_query_reference_responses = torch.cat(
+                        (validation_queries, validation_reference_responses), dim=1
+                    )
 
                     validation_output = forward(policy, validation_query_reference_responses, tokenizer)
-                    validation_labels = validation_query_reference_responses.masked_fill(validation_query_reference_responses == tokenizer.pad_token_id, -1)
+                    validation_labels = validation_query_reference_responses.masked_fill(
+                        validation_query_reference_responses == tokenizer.pad_token_id, -1
+                    )
                     if args.sft.lm_loss_on_response_only:
-                        validation_labels[:, :queries.shape[1]] = -1
+                        validation_labels[:, : queries.shape[1]] = -1
                     validation_lm_logits = validation_output.logits
                     # hand-rolled transformer loss: Shift so that tokens < n predict n
                     # but unlike `transformers` we mask the padding tokens via `ignore_index=-1`
                     validation_shift_logits = validation_lm_logits[..., :-1, :].contiguous()
                     validation_shift_labels = validation_labels[..., 1:].contiguous()
-                    validation_loss = F.cross_entropy(validation_shift_logits.view(-1, validation_shift_logits.size(-1)), validation_shift_labels.view(-1), ignore_index=-1)
+                    validation_loss = F.cross_entropy(
+                        validation_shift_logits.view(-1, validation_shift_logits.size(-1)),
+                        validation_shift_labels.view(-1),
+                        ignore_index=-1,
+                    )
                     validation_loss = accelerator.gather(validation_loss)
                     all_validation_losses.append(validation_loss)
 
-                    generated_responses = generate(accelerator.unwrap_model(policy), validation_queries, tokenizer, generation_config)
+                    generated_responses = generate(
+                        accelerator.unwrap_model(policy), validation_queries, tokenizer, generation_config
+                    )
                     decode_validation_queries = tokenizer.batch_decode(accelerator.gather(validation_queries))
                     decode_validation_query_responses = tokenizer.batch_decode(accelerator.gather(generated_responses))
                     decode_validation_reference_responses = tokenizer.batch_decode(
@@ -499,13 +516,17 @@ if __name__ == "__main__":
                     decode_validation_responses = [
                         x[len(y) :] for x, y in zip(decode_validation_query_responses, decode_validation_queries)
                     ]
-                    rouge_score = rouge.compute(predictions=decode_validation_responses, references=decode_validation_reference_responses)
+                    rouge_score = rouge.compute(
+                        predictions=decode_validation_responses, references=decode_validation_reference_responses
+                    )
                     rouge_scores["rouge1"].append(rouge_score["rouge1"])
                     rouge_scores["rouge2"].append(rouge_score["rouge2"])
                     rouge_scores["rougeL"].append(rouge_score["rougeL"])
 
                     all_decode_validation_queries.extend(decode_validation_queries)
-                    accelerator.print("len(all_decode_validation_queries)", len(all_decode_validation_queries), decode_validation_responses)
+                    accelerator.print(
+                        "len(all_decode_validation_queries)", len(all_decode_validation_queries), decode_validation_responses
+                    )
                     all_decode_validation_query_responses.extend(decode_validation_query_responses)
                     all_decode_validation_responses.extend(decode_validation_responses)
                     all_decode_validation_reference_responses.extend(decode_validation_reference_responses)
@@ -526,7 +547,7 @@ if __name__ == "__main__":
                     print_rich_table(f"Sample Output at Step {update}", all_df[:4], console)
             except Exception as e:
                 print(e)
-            
+
             for k, v in rouge_scores.items():
                 rouge_metric = torch.tensor(v, device=device)
                 rouge_metric = accelerator.gather(rouge_metric)

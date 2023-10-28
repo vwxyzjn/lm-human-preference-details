@@ -1,32 +1,23 @@
-import collections
 import os
 import random
 import time
 from dataclasses import asdict, dataclass, field
 from types import SimpleNamespace
-from typing import List, Optional
+from typing import Optional
 
 import numpy as np
-import pandas as pd
 import torch
 import torch.optim as optim
-from torch.nn import functional as F
 import tyro
-import evaluate
 from accelerate import Accelerator
 from datasets import load_dataset
 from rich.console import Console
 from rich.pretty import pprint
-from rich.table import Table
-from torch import Tensor, optim
-from torch.optim.optimizer import (
-    _dispatch_sqrt,
-    _get_value,
-    _use_grad_for_differentiable,
-)
+from torch import optim
+from torch.nn import functional as F
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
-from transformers import AutoModelForCausalLM, AutoTokenizer, GenerationConfig
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from lm_human_preference_details.data import process_query
 
@@ -40,7 +31,7 @@ class SFTHParams:
     eps: float = 1e-5
     lm_loss_on_response_only: bool = False
     total_episodes: tyro.conf.Suppress[int] = None
-    local_batch_size:tyro.conf.Suppress[int] = None
+    local_batch_size: tyro.conf.Suppress[int] = None
     batch_size: tyro.conf.Suppress[int] = None
     mini_batch_size: tyro.conf.Suppress[int] = None
     world_size: tyro.conf.Suppress[int] = None
@@ -228,7 +219,10 @@ if __name__ == "__main__":
         return {
             **process_query(x, encoder=tokenizer, hparams=patch_h),
             "reference_response": tokenizer.encode(
-                f" {x['summary']}<|endoftext|>", padding="max_length", max_length=args.task.response_length, truncation=True,
+                f" {x['summary']}<|endoftext|>",
+                padding="max_length",
+                max_length=args.task.response_length,
+                truncation=True,
                 # with an extra leading space to account for the space between the query and response
             ),
         }
@@ -282,7 +276,7 @@ if __name__ == "__main__":
             labels = query_responses.masked_fill(query_responses == tokenizer.pad_token_id, -1)
             if args.sft.lm_loss_on_response_only:
                 # mask out gradient effects on query tokens
-                labels[:, :queries.shape[1]] = -1
+                labels[:, : queries.shape[1]] = -1
             lm_logits = output.logits
             # hand-rolled transformer loss: Shift so that tokens < n predict n
             # but unlike `transformers` we mask the padding tokens via `ignore_index=-1`

@@ -5,22 +5,23 @@ from dataclasses import asdict, dataclass, field
 from types import SimpleNamespace
 from typing import Optional
 
-from accelerate import Accelerator
-from accelerate.utils import DistributedDataParallelKwargs, broadcast
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.optim as optim
 import torch.nn.functional as F
+import torch.optim as optim
 import tyro
-from rich.console import Console
+from accelerate import Accelerator
+from accelerate.utils import DistributedDataParallelKwargs, broadcast
 from datasets import load_dataset
+from rich.console import Console
 from rich.pretty import pprint
 from torch.utils.data import DataLoader, IterableDataset
 from torch.utils.tensorboard import SummaryWriter
 from transformers import AutoModelForCausalLM, AutoTokenizer, GenerationConfig
 
 from lm_human_preference_details.datamod import DATASET
+
 
 @dataclass
 class LabelHParams:
@@ -50,7 +51,7 @@ class TaskHParams:
 @dataclass
 class Args:
     # common args
-    exp_name: str = os.path.basename(__file__)[:-len(".py")]
+    exp_name: str = os.path.basename(__file__)[: -len(".py")]
     """the name of this experiment"""
     seed: int = 1
     """seed of the experiment"""
@@ -201,10 +202,7 @@ class MyDataset(IterableDataset):
 def left_padding_to_right_padding(query, pad_id):
     # got to convert to right padding, otherwise `transformers` has weird issues
     # even with `position_ids`
-    return torch.tensor([
-        [pad_id]*(row==pad_id).sum() + [x for x in row if x != pad_id]
-        for row in query
-    ])
+    return torch.tensor([[pad_id] * (row == pad_id).sum() + [x for x in row if x != pad_id] for row in query])
 
 
 def ceil_div(a, b):
@@ -216,7 +214,7 @@ def generate(pretrained_model, queries, tokenizer, generation_config):
     context_length = queries.shape[1]
     attention_mask = queries != tokenizer.pad_token_id
     input_ids = queries.clone()
-    input_ids[~attention_mask] = 0 # set padding tokens to 0
+    input_ids[~attention_mask] = 0  # set padding tokens to 0
     output = pretrained_model.generate(
         input_ids=input_ids,
         attention_mask=attention_mask,
@@ -224,13 +222,13 @@ def generate(pretrained_model, queries, tokenizer, generation_config):
         generation_config=generation_config,
         return_dict_in_generate=True,
     )
-    # restore padding tokens    
+    # restore padding tokens
     return torch.cat((queries, output.sequences[:, context_length:]), dim=1)
 
 
 def get_reward(reward_model, query_responses, tokenizer):
     attention_mask = query_responses != tokenizer.pad_token_id
-    position_ids = attention_mask.cumsum(1) - attention_mask.long() # exclusive cumsum
+    position_ids = attention_mask.cumsum(1) - attention_mask.long()  # exclusive cumsum
     input_ids = query_responses.clone()
     input_ids[~attention_mask] = 0
     return reward_model(
@@ -241,7 +239,19 @@ def get_reward(reward_model, query_responses, tokenizer):
         output_hidden_states=True,
     )
 
-def normalize(args, accelerator, device, tokenizer, pretrained_model, reward_model, iter_dataloader, generation_config, query_prefix_tokens, query_suffix_tokens):
+
+def normalize(
+    args,
+    accelerator,
+    device,
+    tokenizer,
+    pretrained_model,
+    reward_model,
+    iter_dataloader,
+    generation_config,
+    query_prefix_tokens,
+    query_suffix_tokens,
+):
     with torch.no_grad():
         # reset reward scales
         reward_model.module.reward_gain.data.fill_(1.0)
@@ -257,13 +267,13 @@ def normalize(args, accelerator, device, tokenizer, pretrained_model, reward_mod
             queries = left_padding_to_right_padding(data["input_ids"], tokenizer.pad_token_id).to(device)
             query_responses = generate(pretrained_model, queries, tokenizer, generation_config)
             sample_queries_responses.append(query_responses)
-        
+
         # compute reward statistics
         rewards = []
         for query_responses in sample_queries_responses:
             rewards.append(get_reward(reward_model, query_responses, tokenizer)[1])
         rewards = torch.cat(rewards)
-        rewards= accelerator.gather(rewards)
+        rewards = accelerator.gather(rewards)
         mean, std = rewards.mean(), rewards.std()
         print(f"mean: {mean}, std: {std}")
 
@@ -289,7 +299,7 @@ def normalize(args, accelerator, device, tokenizer, pretrained_model, reward_mod
         for query_responses in sample_queries_responses:
             rewards.append(get_reward(reward_model, query_responses, tokenizer)[1])
         rewards = torch.cat(rewards)
-        rewards= accelerator.gather(rewards)
+        rewards = accelerator.gather(rewards)
         mean, std = rewards.mean(), rewards.std()
         print(f"after mean: {mean}, after std: {std}")
 
@@ -304,14 +314,16 @@ def train(args: Args):
     args.task.query_prefix = args.task.query_prefix.replace("\\n", "\n")
     args.task.query_suffix = args.task.query_suffix.replace("\\n", "\n")
     accelerator = Accelerator(
-        kwargs_handlers=[DistributedDataParallelKwargs(broadcast_buffers=False)] # this is needed to avoid https://github.com/pytorch/pytorch/issues/22095#issuecomment-505099500
+        kwargs_handlers=[
+            DistributedDataParallelKwargs(broadcast_buffers=False)
+        ]  # this is needed to avoid https://github.com/pytorch/pytorch/issues/22095#issuecomment-505099500
     )
     args.world_size = accelerator.num_processes
     args.batch_size = int(args.local_batch_size * args.world_size)
 
     console = Console(force_terminal=True)
     run_name = f"{args.exp_name}__{args.seed}__{int(time.time())}"
-    writer = SimpleNamespace() # dummy writer
+    writer = SimpleNamespace()  # dummy writer
     writer.add_scalar = lambda x, y, z: None
     if accelerator.is_main_process:
         if args.track:
@@ -347,9 +359,15 @@ def train(args: Args):
     tokenizer.add_special_tokens({"pad_token": "[PAD]"})
     query_prefix_tokens = torch.LongTensor(tokenizer.encode(args.task.query_prefix))
     query_suffix_tokens = torch.LongTensor(tokenizer.encode(args.task.query_suffix))
-    untrained_model = AutoModelForCausalLMWithRewardHead(AutoModelForCausalLM.from_pretrained(args.base_model, use_auth_token=True)).to(device)
-    reward_model = AutoModelForCausalLMWithRewardHead(AutoModelForCausalLM.from_pretrained(args.base_model, use_auth_token=True)).to(device)
-    reward_model.pretrained_model.generation_config.eos_token_id = None  # disable `pad_token_id` and `eos_token_id` because we just want to
+    untrained_model = AutoModelForCausalLMWithRewardHead(
+        AutoModelForCausalLM.from_pretrained(args.base_model, use_auth_token=True)
+    ).to(device)
+    reward_model = AutoModelForCausalLMWithRewardHead(
+        AutoModelForCausalLM.from_pretrained(args.base_model, use_auth_token=True)
+    ).to(device)
+    reward_model.pretrained_model.generation_config.eos_token_id = (
+        None  # disable `pad_token_id` and `eos_token_id` because we just want to
+    )
     reward_model.pretrained_model.generation_config.pad_token_id = None  # generate tokens without truncation / padding
     optimizer = optim.Adam(reward_model.parameters(), lr=args.lr, eps=args.eps)
     dataset = MyDataset(
@@ -382,7 +400,18 @@ def train(args: Args):
 
     print("before====", reward_model.module.reward_gain.data)
     if args.normalize_before:
-        normalize(args, accelerator, device, tokenizer, accelerator.unwrap_model(reward_model).pretrained_model, reward_model, iter_dataloader, generation_config, query_prefix_tokens, query_suffix_tokens)
+        normalize(
+            args,
+            accelerator,
+            device,
+            tokenizer,
+            accelerator.unwrap_model(reward_model).pretrained_model,
+            reward_model,
+            iter_dataloader,
+            generation_config,
+            query_prefix_tokens,
+            query_suffix_tokens,
+        )
     print("after====", reward_model.module.reward_gain.data)
 
     print("===training reward model===")
@@ -396,7 +425,7 @@ def train(args: Args):
         global_step += 1
         end = start + args.batch_size
         b_inds_all = all_inds[start:end]
-        b_inds = b_inds_all[accelerator.process_index::accelerator.num_processes] #  multi-GPU slicing
+        b_inds = b_inds_all[accelerator.process_index :: accelerator.num_processes]  #  multi-GPU slicing
         lr = (1 - start / args.labels.num_train) * args.lr
         optimizer.param_groups[0]["lr"] = lr
         mb_data = label[b_inds]
@@ -405,10 +434,7 @@ def train(args: Args):
         mb_query = format_query(query_prefix_tokens, mb_query, query_suffix_tokens)
         mb_query = left_padding_to_right_padding(mb_query, tokenizer.pad_token_id).to(device)
         mb_best = torch.from_numpy(np.stack(mb_data["best"])).to(device)
-        mb_responses = [
-            torch.from_numpy(np.stack(mb_data[f"sample{i}"])).to(device)
-            for i in range(args.labels.num_labels)
-        ]
+        mb_responses = [torch.from_numpy(np.stack(mb_data[f"sample{i}"])).to(device) for i in range(args.labels.num_labels)]
         # hack: deal with openai's padding token
         # assert (mb_query == tokenizer.pad_token_id).sum() == 0
         mb_query[mb_query == OPENAI_PAD_TOKEN_ID] = tokenizer.pad_token_id
@@ -420,9 +446,7 @@ def train(args: Args):
         for i in range(args.labels.num_labels):
             query_responses = torch.cat([mb_query, mb_responses[i]], dim=1)
             reward = get_reward(reward_model, query_responses, tokenizer)[1]
-            predicted_rewards.append(
-                reward.squeeze()
-            )
+            predicted_rewards.append(reward.squeeze())
         predicted_rewards = torch.stack(
             predicted_rewards, dim=1
         )  # shape (batch_size, num_labels), basically a reward prediction for each label
@@ -442,18 +466,19 @@ def train(args: Args):
                 queries = format_query(query_prefix_tokens, queries, query_suffix_tokens)
                 context_length = queries.shape[1]
                 queries = left_padding_to_right_padding(queries, tokenizer.pad_token_id).to(device)
-                query_responses = generate(accelerator.unwrap_model(reward_model).pretrained_model, queries, tokenizer, generation_config)
+                query_responses = generate(
+                    accelerator.unwrap_model(reward_model).pretrained_model, queries, tokenizer, generation_config
+                )
                 responses = query_responses[:, context_length:]
-                
 
                 output, reward = get_reward(reward_model, query_responses, tokenizer)
-                logits = output.logits[:,context_length-1:-1]
+                logits = output.logits[:, context_length - 1 : -1]
                 logits /= args.task.temperature
                 all_logprobs = F.log_softmax(logits, dim=-1)
                 logprobs = torch.gather(all_logprobs, 2, responses.unsqueeze(-1)).squeeze(-1)
 
                 output, _ = get_reward(untrained_model, query_responses, tokenizer)
-                logits = output.logits[:,context_length-1:-1]
+                logits = output.logits[:, context_length - 1 : -1]
                 logits /= args.task.temperature
                 all_logprobs = F.log_softmax(logits, dim=-1)
                 ref_logprobs = torch.gather(all_logprobs, 2, responses.unsqueeze(-1)).squeeze(-1)
@@ -475,7 +500,7 @@ def train(args: Args):
             for start in range(args.labels.num_train, len(label), args.batch_size):
                 end = start + args.batch_size
                 b_inds_all = all_inds[start:end]
-                b_inds = b_inds_all[accelerator.process_index::accelerator.num_processes] #  multi-GPU slicing
+                b_inds = b_inds_all[accelerator.process_index :: accelerator.num_processes]  #  multi-GPU slicing
                 mb_data = label[b_inds]
                 # print("accelerator.process_index", accelerator.process_index, b_inds, b_inds_all)
                 mb_query = torch.from_numpy(np.stack(mb_data["query"]))
@@ -483,8 +508,7 @@ def train(args: Args):
                 mb_query = left_padding_to_right_padding(mb_query, tokenizer.pad_token_id).to(device)
                 mb_best = torch.from_numpy(np.stack(mb_data["best"])).to(device)
                 mb_responses = [
-                    torch.from_numpy(np.stack(mb_data[f"sample{i}"])).to(device)
-                    for i in range(args.labels.num_labels)
+                    torch.from_numpy(np.stack(mb_data[f"sample{i}"])).to(device) for i in range(args.labels.num_labels)
                 ]
                 # hack: deal with openai's padding token
                 # assert (mb_query == tokenizer.pad_token_id).sum() == 0
@@ -497,9 +521,7 @@ def train(args: Args):
                 for i in range(args.labels.num_labels):
                     query_responses = torch.cat([mb_query, mb_responses[i]], dim=1)
                     reward = get_reward(reward_model, query_responses, tokenizer)[1]
-                    predicted_rewards.append(
-                        reward.squeeze()
-                    )
+                    predicted_rewards.append(reward.squeeze())
                 predicted_rewards = torch.stack(
                     predicted_rewards, dim=1
                 )  # shape (batch_size, num_labels), basically a reward prediction for each label
@@ -512,7 +534,18 @@ def train(args: Args):
 
     torch.cuda.empty_cache()
     if args.normalize_after:
-        normalize(args, accelerator, device, tokenizer, accelerator.unwrap_model(reward_model).pretrained_model, reward_model, iter_dataloader, generation_config, query_prefix_tokens, query_suffix_tokens)
+        normalize(
+            args,
+            accelerator,
+            device,
+            tokenizer,
+            accelerator.unwrap_model(reward_model).pretrained_model,
+            reward_model,
+            iter_dataloader,
+            generation_config,
+            query_prefix_tokens,
+            query_suffix_tokens,
+        )
 
     # save model
     if args.save_path:

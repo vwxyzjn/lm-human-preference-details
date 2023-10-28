@@ -6,12 +6,12 @@ from dataclasses import asdict, dataclass, field
 from types import SimpleNamespace
 from typing import List, Optional
 
+import evaluate
 import numpy as np
 import pandas as pd
 import torch
 import torch.optim as optim
 import tyro
-import evaluate
 from accelerate import Accelerator
 from datasets import load_dataset
 from rich.console import Console
@@ -38,7 +38,7 @@ class SFTHParams:
     lr: float = 6.35e-5
     eps: float = 1e-5
     total_episodes: tyro.conf.Suppress[int] = None
-    local_batch_size:tyro.conf.Suppress[int] = None
+    local_batch_size: tyro.conf.Suppress[int] = None
     batch_size: tyro.conf.Suppress[int] = None
     mini_batch_size: tyro.conf.Suppress[int] = None
     world_size: tyro.conf.Suppress[int] = None
@@ -395,11 +395,14 @@ def train(args: Args):
         optimizer = optim.Adam(policy.parameters(), lr=args.sft.lr, eps=args.sft.eps)
 
     def process_query_data(x):
-        pad_summary_w_leading_space = " " + x['summary']
+        pad_summary_w_leading_space = " " + x["summary"]
         return {
             **process_query(x, encoder=tokenizer, hparams=patch_h),
             "reference_response": tokenizer.encode(
-                pad_summary_w_leading_space, padding="max_length", max_length=args.task.response_length, truncation=True,
+                pad_summary_w_leading_space,
+                padding="max_length",
+                max_length=args.task.response_length,
+                truncation=True,
                 # with an extra leading space to account for the space between the query and response
             ),
         }
@@ -468,9 +471,11 @@ def train(args: Args):
                     test_queries = test_data["query_token"].to(device)
                     test_reference_responses = test_data["reference_response"].to(device)
                     test_queries = right_padding_to_left_padding(test_queries, tokenizer.pad_token_id)
-                    generated_responses = generate(accelerator.unwrap_model(policy), test_queries, tokenizer, generation_config)
+                    generated_responses = generate(
+                        accelerator.unwrap_model(policy), test_queries, tokenizer, generation_config
+                    )
                     accelerator.print(update, test_idx)
-                    
+
                     all_decode_test_queries = tokenizer.batch_decode(test_queries, skip_special_tokens=True)
                     all_decode_test_query_responses = tokenizer.batch_decode(generated_responses, skip_special_tokens=True)
                     all_decode_test_reference_responses = tokenizer.batch_decode(
@@ -479,7 +484,9 @@ def train(args: Args):
                     all_decode_test_responses = [
                         x[len(y) :] for x, y in zip(all_decode_test_query_responses, all_decode_test_queries)
                     ]
-                    rouge_score = rouge.compute(predictions=all_decode_test_responses, references=all_decode_test_reference_responses)
+                    rouge_score = rouge.compute(
+                        predictions=all_decode_test_responses, references=all_decode_test_reference_responses
+                    )
                     rouge_scores["rouge1"].append(rouge_score["rouge1"])
                     rouge_scores["rouge2"].append(rouge_score["rouge2"])
                     rouge_scores["rougeL"].append(rouge_score["rougeL"])
@@ -498,7 +505,7 @@ def train(args: Args):
                             print_rich_table(f"Sample Output at Step {update}", all_df[:4], console)
                         except Exception as e:
                             print(e)
-            
+
             for k, v in rouge_scores.items():
                 rouge_metric = torch.tensor(v, device=device)
                 rouge_metric = accelerator.gather(rouge_metric)
@@ -515,6 +522,7 @@ def train(args: Args):
             repo_id = f"{args.hf_entity}/{repo_name}" if args.hf_entity else repo_name
             policy.save_pretrained(repo_id, safe_serialization=True, push_to_hub=True)
             tokenizer.save_pretrained(repo_id, push_to_hub=True)
+
 
 if __name__ == "__main__":
     args = tyro.cli(Args)

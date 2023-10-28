@@ -617,7 +617,7 @@ def train(args: Args):
             output, full_values = forward(policy, query_responses, tokenizer)
             values = full_values[:, context_length - 1 : -1].squeeze(-1)
             logits = output.logits[:, context_length - 1 : -1]
-            logits /= (args.task.temperature + 1e-7)
+            logits /= args.task.temperature + 1e-7
             all_logprobs = F.log_softmax(logits, dim=-1)
             logprobs = torch.gather(all_logprobs, 2, responses.unsqueeze(-1)).squeeze(-1)
             del output, logits, all_logprobs
@@ -625,7 +625,7 @@ def train(args: Args):
 
             ref_output, _ = forward(ref_policy, query_responses, tokenizer)
             ref_logits = ref_output.logits[:, context_length - 1 : -1]
-            ref_logits /= (args.task.temperature + 1e-7)
+            ref_logits /= args.task.temperature + 1e-7
             ref_all_logprobs = F.log_softmax(ref_logits, dim=-1)
             ref_logprobs = torch.gather(ref_all_logprobs, 2, responses.unsqueeze(-1)).squeeze(-1)
             del ref_output, ref_logits, ref_all_logprobs
@@ -759,7 +759,7 @@ def train(args: Args):
 
                         output, vpred_temp = forward(policy, mb_query_responses, tokenizer)
                         logits = output.logits[:, context_length - 1 : -1]
-                        logits /= (args.task.temperature + 1e-7)
+                        logits /= args.task.temperature + 1e-7
                         new_all_logprobs = F.log_softmax(logits, dim=-1)
                         new_logprobs = torch.gather(new_all_logprobs, 2, mb_responses.unsqueeze(-1)).squeeze(-1)
                         vpred = vpred_temp[:, context_length - 1 : -1].squeeze(-1)

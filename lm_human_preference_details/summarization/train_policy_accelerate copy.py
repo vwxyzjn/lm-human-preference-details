@@ -487,12 +487,16 @@ def train(args: Args):
     )
     # we use the padding token manually but do not resize the token embedding of the model
     tokenizer.add_special_tokens({"pad_token": "[PAD]"})
-    reward_model = AutoModelForCausalLMWithRewardHead(AutoModelForCausalLM.from_pretrained(args.base_model, trust_remote_code=True))
+    reward_model = AutoModelForCausalLMWithRewardHead(
+        AutoModelForCausalLM.from_pretrained(args.base_model, trust_remote_code=True)
+    )
     if args.rewards.trained_model:
         reward_model.load_state_dict(torch.load(args.rewards.trained_model, map_location=device))
         print(f"loaded pretrained reward model from {args.rewards.trained_model}")
     # each class should have a separate pretrained model that do not share weights
-    ref_policy = AutoModelForCausalLMWithScalarHead(AutoModelForCausalLM.from_pretrained(args.base_model, trust_remote_code=True))
+    ref_policy = AutoModelForCausalLMWithScalarHead(
+        AutoModelForCausalLM.from_pretrained(args.base_model, trust_remote_code=True)
+    )
     policy = AutoModelForCausalLMWithScalarHead(AutoModelForCausalLM.from_pretrained(args.base_model, trust_remote_code=True))
     policy.lm_backbone.generation_config.eos_token_id = (
         None  # disable `pad_token_id` and `eos_token_id` because we just want to
@@ -518,12 +522,10 @@ def train(args: Args):
         import deepspeed
 
         deepspeed_states = AcceleratorState().deepspeed_plugin
-        deepspeed_states.deepspeed_config['train_micro_batch_size_per_gpu'] = args.ppo.local_micro_batch_size
-        deepspeed_states.deepspeed_config['checkpoint'] = {'use_node_local_storage': True}
-        off_load_device = "cpu"
-        stage = 3
+        deepspeed_states.deepspeed_config["train_micro_batch_size_per_gpu"] = args.ppo.local_micro_batch_size
+        deepspeed_states.deepspeed_config["checkpoint"] = {"use_node_local_storage": True}
         eval_ds_config = {
-            "train_micro_batch_size_per_gpu": deepspeed_states.deepspeed_config['train_micro_batch_size_per_gpu'],
+            "train_micro_batch_size_per_gpu": deepspeed_states.deepspeed_config["train_micro_batch_size_per_gpu"],
             "steps_per_print": 10,
             # "zero_optimization": {
             #     "stage": stage,
@@ -532,11 +534,9 @@ def train(args: Args):
             #         "device": off_load_device
             #     }
             # },
-            "bf16": {
-                "enabled": True
-            },
+            "bf16": {"enabled": True},
             "prescale_gradients": False,
-            "wall_clock_breakdown": False
+            "wall_clock_breakdown": False,
         }
         reward_model, *_ = deepspeed.initialize(model=reward_model, config=eval_ds_config)
         reward_model.eval()
@@ -632,7 +632,7 @@ def train(args: Args):
             logits /= args.task.temperature
             all_logprobs = F.log_softmax(logits, dim=-1)
             logprobs = torch.gather(all_logprobs, 2, responses.unsqueeze(-1)).squeeze(-1)
-    
+
             output4, _ = forward(policy, query_responses, tokenizer)
             logits4 = output4.logits[:, context_length - 1 : -1]
             logits4 /= args.task.temperature
@@ -750,15 +750,11 @@ def train(args: Args):
 
                     with accelerator.accumulate(policy):
 
-
-
                         output, vpred_temp = forward(policy, mb_query_responses, tokenizer)
                         logits = output.logits[:, context_length - 1 : -1]
                         logits /= args.task.temperature
                         new_all_logprobs = F.log_softmax(logits, dim=-1)
                         new_logprobs = torch.gather(new_all_logprobs, 2, mb_responses.unsqueeze(-1)).squeeze(-1)
-
-
 
                         vpred = vpred_temp[:, context_length - 1 : -1].squeeze(-1)
                         vpredclipped = torch.clamp(
@@ -771,12 +767,14 @@ def train(args: Args):
                         vf_loss = 0.5 * torch.max(vf_losses1, vf_losses2).mean()
                         vf_clipfrac = (vf_losses2 > vf_losses1).float().mean()
                         logprobs_diff = new_logprobs - mb_logprobs
-                        pprint({
-                            "new_logprobs": new_logprobs,
-                            "new_logprobs2": new_logprobs2,
-                            "mb_logprobs": mb_logprobs,
-                            "mb_logprobs2": logprobs4[micro_batch_inds],
-                        })
+                        pprint(
+                            {
+                                "new_logprobs": new_logprobs,
+                                "new_logprobs2": new_logprobs2,
+                                "mb_logprobs": mb_logprobs,
+                                "mb_logprobs2": logprobs4[micro_batch_inds],
+                            }
+                        )
                         ratio = torch.exp(logprobs_diff)
                         print(ratio.mean())
                         breakpoint()
@@ -815,7 +813,7 @@ def train(args: Args):
                     )
 
         with torch.no_grad():
-            if not args.deepspeed: # for some reason there is a OOM with the `writer.add_histogram`
+            if not args.deepspeed:  # for some reason there is a OOM with the `writer.add_histogram`
                 writer.add_histogram("ppo/val/ratio_hist", ratio, update)
             kl = logprobs - ref_logprobs
             mean_kl = kl.sum(1).mean()

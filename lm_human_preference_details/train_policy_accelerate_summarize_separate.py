@@ -28,8 +28,8 @@ from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from transformers import AutoModelForCausalLM, AutoTokenizer, GenerationConfig
 
-
 INVALID_LOGPROB = 1.0
+
 
 @dataclass
 class AdaptiveKLParams:
@@ -360,9 +360,9 @@ class AutoModelForCausalLMWithRewardHead(nn.Module):
 
     def forward(self, **kwargs):
         output = self.lm_backbone(**kwargs)
-        latents = output.hidden_states[-1] # shape: [batch_size, length, hidden_size]
-        scalars = self.scalar_head(latents).squeeze(-1) # shape: [batch_size, length]
-        last_scalar = scalars[:, -1] # shape: [batch_size, 1]
+        latents = output.hidden_states[-1]  # shape: [batch_size, length, hidden_size]
+        scalars = self.scalar_head(latents).squeeze(-1)  # shape: [batch_size, length]
+        last_scalar = scalars[:, -1]  # shape: [batch_size, 1]
         return scalars, last_scalar
 
 
@@ -373,10 +373,10 @@ class PolicyAndValueWrapper(nn.Module):
         super().__init__()
         self.policy = policy
         self.critic = critic
-    
+
     def forward(self, **kwargs):
         return self.policy(**kwargs), self.critic(**kwargs)
-    
+
 
 def shift_pad_id_left(tokens, pad_id):
     """Convert from right padding to left padding."""
@@ -385,6 +385,7 @@ def shift_pad_id_left(tokens, pad_id):
         [[pad_id] * (row == pad_id).sum() + [x for x in row if x != pad_id] for row in tokens],
         device=tokens.device,
     )
+
 
 def shift_pad_id_left(data, pad_id):
     # Step 1: Create a boolean mask
@@ -456,6 +457,7 @@ def truncate_response(args, tokenizer, responses):
     postprocessed_responses = torch.masked_fill(responses, idxs > trunc_idxs, tokenizer.pad_token_id)
     return postprocessed_responses
 
+
 # def train(args: Args):
 if __name__ == "__main__":
     args = tyro.cli(Args)
@@ -513,9 +515,7 @@ if __name__ == "__main__":
     reward_model = AutoModelForCausalLMWithRewardHead(
         AutoModelForCausalLM.from_pretrained(args.base_model, trust_remote_code=True)
     )
-    critic = AutoModelForCausalLMWithRewardHead(
-        AutoModelForCausalLM.from_pretrained(args.base_model, trust_remote_code=True)
-    )
+    critic = AutoModelForCausalLMWithRewardHead(AutoModelForCausalLM.from_pretrained(args.base_model, trust_remote_code=True))
     if args.rewards.trained_model:
         reward_model.load_state_dict(torch.load(args.rewards.trained_model, map_location=device))
         critic.load_state_dict(torch.load(args.rewards.trained_model, map_location=device))
@@ -527,9 +527,7 @@ if __name__ == "__main__":
         policy.load_state_dict(torch.load(args.sft_model_path, map_location=device))
         ref_policy.load_state_dict(torch.load(args.sft_model_path, map_location=device))
         print(f"loaded pretrained policy from {args.sft_model_path}")
-    policy.generation_config.eos_token_id = (
-        None  # disable `pad_token_id` and `eos_token_id` because we just want to
-    )
+    policy.generation_config.eos_token_id = None  # disable `pad_token_id` and `eos_token_id` because we just want to
     policy.generation_config.pad_token_id = None  # generate tokens without truncation / padding
     model = PolicyAndValueWrapper(policy, critic)
     if args.optimizer == "tf_adam":
@@ -587,9 +585,15 @@ if __name__ == "__main__":
     with torch.no_grad():
         sample_validation_queries = shift_pad_id_left(sample_validation_queries, tokenizer.pad_token_id)
         sample_validation_reference_response = torch.Tensor(sample_validation["reference_response_token"]).to(device)
-        sample_validation_query_reference_responses = torch.cat((sample_validation_queries, sample_validation_reference_response), dim=1)
-        sample_validation_query_reference_responses = shift_pad_id_left(sample_validation_query_reference_responses, tokenizer.pad_token_id)
-        _, sample_validation_reference_scores = get_reward(reward_model, sample_validation_query_reference_responses, tokenizer)
+        sample_validation_query_reference_responses = torch.cat(
+            (sample_validation_queries, sample_validation_reference_response), dim=1
+        )
+        sample_validation_query_reference_responses = shift_pad_id_left(
+            sample_validation_query_reference_responses, tokenizer.pad_token_id
+        )
+        _, sample_validation_reference_scores = get_reward(
+            reward_model, sample_validation_query_reference_responses, tokenizer
+        )
 
     iter_dataloader = iter(repeat_generator())
     kl_ctl = AdaptiveKLController(args.rewards.kl_coef, hparams=args.rewards.adaptive_kl)
@@ -624,7 +628,7 @@ if __name__ == "__main__":
             reference_responses = data["reference_response_token"].to(device)
             queries = shift_pad_id_left(queries, tokenizer.pad_token_id)
             query_reference_responses = torch.cat((queries, reference_responses), dim=1)
-            query_reference_responses= shift_pad_id_left(query_reference_responses, tokenizer.pad_token_id)
+            query_reference_responses = shift_pad_id_left(query_reference_responses, tokenizer.pad_token_id)
             query_responses = generate(
                 accelerator.unwrap_model(model).policy,
                 queries,
@@ -643,14 +647,18 @@ if __name__ == "__main__":
             )
             sample_validation_responses = sample_validation_query_responses[:, context_length:]
             postprocessed_sample_validation_responses = truncate_response(args, tokenizer, sample_validation_responses)
-            postprocessed_sample_validation_query_responses = torch.cat((sample_validation_queries, postprocessed_sample_validation_responses), 1)
-            postprocessed_sample_validation_query_responses = shift_pad_id_left(postprocessed_sample_validation_query_responses, tokenizer.pad_token_id)
+            postprocessed_sample_validation_query_responses = torch.cat(
+                (sample_validation_queries, postprocessed_sample_validation_responses), 1
+            )
+            postprocessed_sample_validation_query_responses = shift_pad_id_left(
+                postprocessed_sample_validation_query_responses, tokenizer.pad_token_id
+            )
             torch.cuda.empty_cache()
 
             # TODO: do I do this with query response or post-processed query response?
             output = forward(accelerator.unwrap_model(model).policy, query_responses, tokenizer)
             logits = output.logits[:, context_length - 1 : -1]
-            logits /= (args.task.temperature + 1e-7)
+            logits /= args.task.temperature + 1e-7
             all_logprobs = F.log_softmax(logits, dim=-1)
             logprobs = torch.gather(all_logprobs, 2, responses.unsqueeze(-1)).squeeze(-1)
             del output, logits, all_logprobs
@@ -658,7 +666,7 @@ if __name__ == "__main__":
 
             ref_output = forward(ref_policy, query_responses, tokenizer)
             ref_logits = ref_output.logits[:, context_length - 1 : -1]
-            ref_logits /= (args.task.temperature + 1e-7)
+            ref_logits /= args.task.temperature + 1e-7
             ref_all_logprobs = F.log_softmax(ref_logits, dim=-1)
             ref_logprobs = torch.gather(ref_all_logprobs, 2, responses.unsqueeze(-1)).squeeze(-1)
             del ref_output, ref_logits, ref_all_logprobs
@@ -682,7 +690,7 @@ if __name__ == "__main__":
 
             _, reference_scores = get_reward(reward_model, query_reference_responses, tokenizer)
             _, validation_score = get_reward(reward_model, postprocessed_sample_validation_query_responses, tokenizer)
-            
+
             # carperAI-style score normaliation
             # accelerator.print("before score", scores, scores.mean())
             # accelerator.print("reference_scores", reference_scores, reference_scores.mean())
@@ -709,18 +717,15 @@ if __name__ == "__main__":
             if args.print_sample_output_freq > 0 and (update - 1) % args.print_sample_output_freq == 0:
                 try:
                     all_decode_validation_queries = tokenizer.batch_decode(sample_validation_queries, skip_special_tokens=True)
-                    all_sample_validation_responses = tokenizer.batch_decode(
-                        postprocessed_sample_validation_responses
-                    )
+                    all_sample_validation_responses = tokenizer.batch_decode(postprocessed_sample_validation_responses)
                     all_sample_validation_query_responses_postprocessed = tokenizer.batch_decode(
                         postprocessed_sample_validation_query_responses, skip_special_tokens=True
                     )
                     all_sample_validation_postprocessed_responses = [
-                        x[len(y) :] for x, y in zip(all_sample_validation_query_responses_postprocessed, all_decode_validation_queries)
+                        x[len(y) :]
+                        for x, y in zip(all_sample_validation_query_responses_postprocessed, all_decode_validation_queries)
                     ]
-                    all_sample_validation_reference_responses = tokenizer.batch_decode(
-                        sample_validation_reference_response
-                    )
+                    all_sample_validation_reference_responses = tokenizer.batch_decode(sample_validation_reference_response)
                     all_sample_validation_df = pd.DataFrame(
                         {
                             "query": all_decode_validation_queries,
@@ -734,7 +739,7 @@ if __name__ == "__main__":
                     if accelerator.is_main_process and args.track:
                         wandb.log({"samples/query_responses": wandb.Table(dataframe=all_sample_validation_df)}, step=update)
                     print_rich_table("stuff", all_sample_validation_df[:4], console)
-                    
+
                 except Exception as e:
                     print(e)
                 del (
@@ -781,9 +786,9 @@ if __name__ == "__main__":
                         mb_logprobs = logprobs[micro_batch_inds]
 
                         output, (vpred_temp, _) = forward(model, mb_query_responses, tokenizer)
-                        
+
                         logits = output.logits[:, context_length - 1 : -1]
-                        logits /= (args.task.temperature + 1e-7)
+                        logits /= args.task.temperature + 1e-7
                         new_all_logprobs = F.log_softmax(logits, dim=-1)
                         new_logprobs = torch.gather(new_all_logprobs, 2, mb_responses.unsqueeze(-1)).squeeze(-1)
                         # new_logprobs = torch.masked_fill(new_logprobs, padding_mask[micro_batch_inds], INVALID_LOGPROB)
@@ -893,5 +898,5 @@ if __name__ == "__main__":
             tokenizer.save_pretrained(repo_id, push_to_hub=True)
 
 # if __name__ == "__main__":
-#     args = tyro.cli(Args)   
+#     args = tyro.cli(Args)
 #     train(args)

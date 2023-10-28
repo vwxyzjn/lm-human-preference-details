@@ -1,17 +1,18 @@
-from datasets import load_dataset
 from dataclasses import dataclass
 from typing import Dict, Optional, Union
-from transformers import AutoTokenizer
-from rich.pretty import pprint
 
-import numpy as np
+from datasets import load_dataset
+from rich.pretty import pprint
+from transformers import AutoTokenizer
 
 
 @dataclass
 class TaskQueryHParams:
     length: int = 512
     dataset: str = "vwxyzjn/summarize_from_feedback_tldr_3_filtered"
-    format_str: Optional[str] = "SUBREDDIT: r/{subreddit}\n\nTITLE: {title}\n\nPOST: {post}\n\nTL;DR:"  # if underlying dataset yields dicts, can format arbitrarily
+    format_str: Optional[
+        str
+    ] = "SUBREDDIT: r/{subreddit}\n\nTITLE: {title}\n\nPOST: {post}\n\nTL;DR:"  # if underlying dataset yields dicts, can format arbitrarily
     truncate_field: Optional[str] = "post"
     truncate_text: Optional[str] = "\n"
     padding: Optional[Union[str, int]] = 50257
@@ -94,6 +95,7 @@ if __name__ == "__main__":
         oai_h.padding = [oai_h.padding]
     pprint(oai_h)
     dataset = load_dataset(oai_h.dataset)
+
     def process_query_data(x):
         # with an extra leading space to account for the space between the query and response
         reference_response = f" {x['summary']}<|endoftext|>"
@@ -101,18 +103,23 @@ if __name__ == "__main__":
             **process_query(x, encoder=tokenizer, hparams=oai_h),
             "reference_response": reference_response,
             "reference_response_token": tokenizer.encode(
-                reference_response, padding="max_length", max_length=max_response_length, truncation=True,
+                reference_response,
+                padding="max_length",
+                max_length=max_response_length,
+                truncation=True,
             ),
         }
+
     dataset = dataset.map(process_query_data, load_from_cache_file=False)
     push_result = dataset.push_to_hub("vwxyzjn/summarize_from_feedback_tldr_3_filtered_oai_preprocessing")
     print(push_result)
 
     label = load_dataset("openai/summarize_from_feedback", "comparisons")
+
     def process_response_data(x):
         # with an extra leading space to account for the space between the query and response
-        response0 = x['summaries'][0]['text']
-        response1 = x['summaries'][1]['text']
+        response0 = x["summaries"][0]["text"]
+        response1 = x["summaries"][1]["text"]
         return {
             **process_query(x["info"], encoder=tokenizer, hparams=oai_h),
             "response0": response0,
@@ -124,5 +131,6 @@ if __name__ == "__main__":
                 response1, padding="max_length", max_length=max_response_length, truncation=True
             ),
         }
+
     label = label.map(process_response_data, load_from_cache_file=False)
     push_result = label.push_to_hub("vwxyzjn/summarize_from_feedback_oai_preprocessing")

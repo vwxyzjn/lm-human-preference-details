@@ -32,6 +32,7 @@ from lm_human_preference_details.data import process_query
 
 INVALID_LOGPROB = 1.0
 
+
 @dataclass
 class AdaptiveKLParams:
     target: float = 6.0
@@ -378,10 +379,10 @@ class PolicyAndValueWrapper(nn.Module):
         super().__init__()
         self.policy = policy
         self.critic = critic
-    
+
     def forward(self, **kwargs):
         return self.policy(**kwargs), self.critic(**kwargs)
-    
+
 
 def right_padding_to_left_padding(tokens, pad_id):
     """Convert from right padding to left padding."""
@@ -523,9 +524,7 @@ if __name__ == "__main__":
     reward_model = AutoModelForCausalLMWithRewardHead(
         AutoModelForCausalLM.from_pretrained(args.base_model, trust_remote_code=True)
     )
-    critic = AutoModelForCausalLMWithRewardHead(
-        AutoModelForCausalLM.from_pretrained(args.base_model, trust_remote_code=True)
-    )
+    critic = AutoModelForCausalLMWithRewardHead(AutoModelForCausalLM.from_pretrained(args.base_model, trust_remote_code=True))
     if args.rewards.trained_model:
         reward_model.load_state_dict(torch.load(args.rewards.trained_model, map_location=device))
         critic.load_state_dict(torch.load(args.rewards.trained_model, map_location=device))
@@ -537,9 +536,7 @@ if __name__ == "__main__":
         policy.load_state_dict(torch.load(args.sft_model_path, map_location=device))
         ref_policy.load_state_dict(torch.load(args.sft_model_path, map_location=device))
         print(f"loaded pretrained policy from {args.sft_model_path}")
-    policy.generation_config.eos_token_id = (
-        None  # disable `pad_token_id` and `eos_token_id` because we just want to
-    )
+    policy.generation_config.eos_token_id = None  # disable `pad_token_id` and `eos_token_id` because we just want to
     policy.generation_config.pad_token_id = None  # generate tokens without truncation / padding
     model = PolicyAndValueWrapper(policy, critic)
     if args.use_tensorflow_adam:
@@ -553,7 +550,10 @@ if __name__ == "__main__":
         return {
             **process_query(x, encoder=tokenizer, hparams=patch_h),
             "reference_response": tokenizer.encode(
-                f" {x['summary']}<|endoftext|>", padding="max_length", max_length=args.task.response_length, truncation=True,
+                f" {x['summary']}<|endoftext|>",
+                padding="max_length",
+                max_length=args.task.response_length,
+                truncation=True,
                 # with an extra leading space to account for the space between the query and response
             ),
         }
@@ -608,8 +608,12 @@ if __name__ == "__main__":
         print(sample_validation_queries.shape)
         sample_validation_queries = right_padding_to_left_padding(sample_validation_queries, tokenizer.pad_token_id)
         sample_validation_reference_response = sample_validation["reference_response"]
-        sample_validation_query_reference_responses = torch.cat((sample_validation_queries, sample_validation_reference_response), dim=1)
-        sample_validation_reference_scores = get_reward_complete(reward_model, sample_validation_query_reference_responses, tokenizer)
+        sample_validation_query_reference_responses = torch.cat(
+            (sample_validation_queries, sample_validation_reference_response), dim=1
+        )
+        sample_validation_reference_scores = get_reward_complete(
+            reward_model, sample_validation_query_reference_responses, tokenizer
+        )
     # breakpoint()
 
     iter_dataloader = iter(repeat_generator())
@@ -677,7 +681,7 @@ if __name__ == "__main__":
             postprocessed_responses: `XXXXTXX` -> `XXXXTPP`
             postprocessed_query_responses: `PPXXX,XXXXTPP`
             scores:                                  ↑    # corresponding to this `X` token
-            
+
             """
             queries = data["query_token"].to(device)
             reference_responses = data["reference_response"].to(device)
@@ -714,17 +718,17 @@ if __name__ == "__main__":
                 torch.full_like(sample_validation_responses, tokenizer.pad_token_id),
                 sample_validation_responses,
             )
-            postprocessed_sample_validation_query_responses = torch.cat((sample_validation_queries, postprocessed_sample_validation_responses), 1)
+            postprocessed_sample_validation_query_responses = torch.cat(
+                (sample_validation_queries, postprocessed_sample_validation_responses), 1
+            )
             del truncate_token_mask, truncate_after_or_token_mask, truncate_mask
             torch.cuda.empty_cache()
-
-
 
             output = forward(accelerator.unwrap_model(model).policy, query_responses, tokenizer)
             full_values = get_reward(accelerator.unwrap_model(model).critic, query_responses, tokenizer)[1]
             values = full_values[:, context_length - 1 : -1].squeeze(-1)
             logits = output.logits[:, context_length - 1 : -1]
-            logits /= (args.task.temperature + 1e-7)
+            logits /= args.task.temperature + 1e-7
             all_logprobs = F.log_softmax(logits, dim=-1)
             logprobs = torch.gather(all_logprobs, 2, responses.unsqueeze(-1)).squeeze(-1)
             del output, logits, all_logprobs
@@ -732,7 +736,7 @@ if __name__ == "__main__":
 
             ref_output = forward(ref_policy, query_responses, tokenizer)
             ref_logits = ref_output.logits[:, context_length - 1 : -1]
-            ref_logits /= (args.task.temperature + 1e-7)
+            ref_logits /= args.task.temperature + 1e-7
             ref_all_logprobs = F.log_softmax(ref_logits, dim=-1)
             ref_logprobs = torch.gather(ref_all_logprobs, 2, responses.unsqueeze(-1)).squeeze(-1)
             del ref_output, ref_logits, ref_all_logprobs
@@ -778,20 +782,27 @@ if __name__ == "__main__":
             attention_mask = qr != tokenizer.pad_token_id
             position_ids = attention_mask.cumsum(1) - attention_mask.long()  # exclusive cumsum
             input_ids = torch.masked_fill(qr, ~attention_mask, 0)
-            output = reward_model.lm_backbone(input_ids=input_ids, attention_mask=attention_mask, position_ids=position_ids, return_dict=True, output_hidden_states=True)
-            last_reward_latents = output.hidden_states[-1] # TODO: investigate whether it should be output.hidden_states[0] or output.hidden_states[-1]
+            output = reward_model.lm_backbone(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                return_dict=True,
+                output_hidden_states=True,
+            )
+            last_reward_latents = output.hidden_states[
+                -1
+            ]  # TODO: investigate whether it should be output.hidden_states[0] or output.hidden_states[-1]
             reward = reward_model.scalar_head(last_reward_latents)
 
-            print(postprocessed_query_responses[0:5,537:])
-            print(rew.squeeze(-1)[0:5,537:])
+            print(postprocessed_query_responses[0:5, 537:])
+            print(rew.squeeze(-1)[0:5, 537:])
             print(scores)
             breakpoint()
-
 
             reference_scores = get_reward_complete(reward_model, query_reference_responses, tokenizer)
             # note that we do not truncate the validation responses
             validation_score = get_reward_complete(reward_model, postprocessed_sample_validation_query_responses, tokenizer)
-            
+
             # carperAI-style score normaliation
             accelerator.print("before score", scores, scores.mean())
             accelerator.print("reference_scores", reference_scores, reference_scores.mean())
@@ -818,9 +829,7 @@ if __name__ == "__main__":
             if args.print_sample_output_freq > 0 and (update - 1) % args.print_sample_output_freq == 0:
                 try:
                     all_decode_validation_queries = tokenizer.batch_decode(sample_validation_queries)
-                    all_sample_validation_query_responses = tokenizer.batch_decode(
-                        sample_validation_query_responses
-                    )
+                    all_sample_validation_query_responses = tokenizer.batch_decode(sample_validation_query_responses)
                     all_sample_validation_query_responses_postprocessed = tokenizer.batch_decode(
                         postprocessed_sample_validation_query_responses
                     )
@@ -828,11 +837,10 @@ if __name__ == "__main__":
                         x[len(y) :] for x, y in zip(all_sample_validation_query_responses, all_decode_validation_queries)
                     ]
                     all_sample_validation_postprocessed_responses = [
-                        x[len(y) :] for x, y in zip(all_sample_validation_query_responses_postprocessed, all_decode_validation_queries)
+                        x[len(y) :]
+                        for x, y in zip(all_sample_validation_query_responses_postprocessed, all_decode_validation_queries)
                     ]
-                    all_sample_validation_reference_responses = tokenizer.batch_decode(
-                        sample_validation_reference_response
-                    )
+                    all_sample_validation_reference_responses = tokenizer.batch_decode(sample_validation_reference_response)
                     all_sample_validation_df = pd.DataFrame(
                         {
                             "query": all_decode_validation_queries,
@@ -846,7 +854,7 @@ if __name__ == "__main__":
                     if accelerator.is_main_process and args.track:
                         wandb.log({"samples/query_responses": wandb.Table(dataframe=all_sample_validation_df)}, step=update)
                     print_rich_table("stuff", all_sample_validation_df[:4], console)
-                    
+
                 except Exception as e:
                     print(e)
                 del (
@@ -904,9 +912,9 @@ if __name__ == "__main__":
                         # TODO: value also use the EOS token index!!!!!!!!!!!!!!!!!!!
                         # TODO: value also use the EOS token index!!!!!!!!!!!!!!!!!!!
                         # TODO: value also use the EOS token index!!!!!!!!!!!!!!!!!!!
-                        
+
                         logits = output.logits[:, context_length - 1 : -1]
-                        logits /= (args.task.temperature + 1e-7)
+                        logits /= args.task.temperature + 1e-7
                         new_all_logprobs = F.log_softmax(logits, dim=-1)
                         new_logprobs = torch.gather(new_all_logprobs, 2, mb_responses.unsqueeze(-1)).squeeze(-1)
                         new_logprobs = torch.masked_fill(new_logprobs, padding_mask[micro_batch_inds], INVALID_LOGPROB)
@@ -1017,5 +1025,5 @@ if __name__ == "__main__":
             tokenizer.save_pretrained(repo_id, push_to_hub=True)
 
 # if __name__ == "__main__":
-#     args = tyro.cli(Args)   
+#     args = tyro.cli(Args)
 #     train(args)

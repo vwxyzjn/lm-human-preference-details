@@ -1,7 +1,8 @@
-import numpy as np
 import torch
 import torch.nn as nn
 from transformers import AutoModelForCausalLM, AutoTokenizer
+
+
 class AutoModelForCausalLMWithRewardHead(nn.Module):
     def __init__(self, lm_backbone):
         super().__init__()
@@ -14,6 +15,8 @@ class AutoModelForCausalLMWithRewardHead(nn.Module):
         # shape: [batch_size, hidden_size]
         reward = self.scalar_head(last_reward_latents)
         return output, reward
+
+
 base_model = "gpt2"
 tokenizer = AutoTokenizer.from_pretrained(base_model, padding_side="left")
 reward_model = AutoModelForCausalLMWithRewardHead(AutoModelForCausalLM.from_pretrained(base_model))
