@@ -397,7 +397,7 @@ if __name__ == "__main__":
     tokenizer.add_special_tokens({"pad_token": "[PAD]"})
     model_config = AutoConfig.from_pretrained(args.base_model)
     configure_dropout(model_config, 0.0)  # disable dropout
-    policy = AutoConfig, AutoModelForCausalLM.from_pretrained(args.base_model, trust_remote_code=True, config=model_config)
+    policy = AutoModelForCausalLM.from_pretrained(args.base_model, config=model_config, trust_remote_code=True)
     policy.generation_config.eos_token_id = None  # disable `pad_token_id` and `eos_token_id` because we just want to
     policy.generation_config.pad_token_id = None  # generate tokens without truncation / padding
     # IMPORTANT: Layer norm produces weird gradients, which affects Adam optimizer to impact all the parameters systematically
@@ -408,7 +408,6 @@ if __name__ == "__main__":
         optimizer = optim.Adam(policy.parameters(), lr=args.sft.lr, eps=args.sft.eps)
     elif args.optimizer == "adamw":
         optimizer = optim.AdamW(policy.parameters(), lr=args.sft.lr, eps=args.sft.eps)
-    # TODO: use AdamW
     scheduler = get_scheduler(
         args.scheduler,
         optimizer=optimizer,

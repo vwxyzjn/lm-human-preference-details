@@ -28,7 +28,7 @@ from torch.optim.optimizer import (
 )
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
-from transformers import AutoModelForCausalLM, AutoTokenizer, get_scheduler
+from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer, get_scheduler
 
 
 @dataclass
@@ -144,10 +144,17 @@ class Args:
     """Which scheduler to use"""
     warm_up_steps: int = 100
     """Number of warm up steps for the scheduler"""
-    model_dot_train: bool = False
-    """Whether to call `model.train()`"""
     task: TaskHParams = field(default_factory=TaskHParams)
     labels: LabelHParams = field(default_factory=LabelHParams)
+
+
+# taken from https://github.com/microsoft/DeepSpeedExamples/blob/737c6740bec38b77a24a59135b6481a53d566b38/applications/DeepSpeed-Chat/training/utils/model/model_utils.py#L20C1-L26C52
+def configure_dropout(model_config, dropout):
+    if dropout is not None:
+        for key in ("dropout", "attention_dropout", "hidden_dropout", "activation_dropout"):
+            if hasattr(model_config, key):
+                print(f"Setting model_config.{key} to {dropout}")
+                setattr(model_config, key, dropout)
 
 
 def print_rich_table(title: str, df: pd.DataFrame, console: Console) -> Table:
@@ -357,21 +364,6 @@ def exact_div(a, b):
     return q
 
 
-def generate(lm_backbone, queries, tokenizer, generation_config):
-    """generate in a way that does not affect padding tokens"""
-    context_length = queries.shape[1]
-    attention_mask = queries != tokenizer.pad_token_id
-    input_ids = torch.masked_fill(queries, ~attention_mask, 0)
-    output = lm_backbone.generate(
-        input_ids=input_ids,
-        attention_mask=attention_mask,
-        # position_ids=attention_mask.cumsum(1) - attention_mask.long(), # generation collapsed if this was turned on. TODO: why does generation collapse with this?
-        generation_config=generation_config,
-        return_dict_in_generate=True,
-    )
-    return torch.cat((queries, output.sequences[:, context_length:]), dim=1)
-
-
 def get_reward(reward_model, query_responses, tokenizer):
     attention_mask = query_responses != tokenizer.pad_token_id
     position_ids = attention_mask.cumsum(1) - attention_mask.long()  # exclusive cumsum
@@ -414,8 +406,7 @@ def evaluate(args, accelerator, tokenizer, device, reward_model, validation_labe
                 accuracy = (predicted_reward.argmax(1) == mb_best).float().mean()
                 test_accuracies.append(accuracy)
         test_accuracy = accelerator.gather(torch.stack(test_accuracies).mean()).mean().item()
-    if args.model_dot_train:
-        reward_model.train()
+    reward_model.train()
     return test_accuracy
 
 
@@ -471,8 +462,14 @@ def train(args: Args):
     )
     # we use the padding token manually but do not resize the token embedding of the model
     tokenizer.add_special_tokens({"pad_token": "[PAD]"})
+    model_config = AutoConfig.from_pretrained(args.base_model)
+    configure_dropout(model_config, 0.0)  # disable dropout
     reward_model = AutoModelForCausalLMWithRewardHead(
-        AutoModelForCausalLM.from_pretrained(args.base_model, trust_remote_code=True)
+        AutoModelForCausalLM.from_pretrained(
+            args.base_model,
+            config=model_config,
+            trust_remote_code=True,
+        )
     )
 
     # freeze the first 70% of layers
@@ -486,10 +483,6 @@ def train(args: Args):
     if args.sft_model_path:
         reward_model.lm_backbone.load_state_dict(torch.load(args.sft_model_path, map_location=device))
         print(f"loaded SFT model from {args.sft_model_path}")
-    reward_model.lm_backbone.generation_config.eos_token_id = (
-        None  # disable `pad_token_id` and `eos_token_id` because we just want to
-    )
-    reward_model.lm_backbone.generation_config.pad_token_id = None  # generate tokens without truncation / padding
     # make sure the `lm_head` or `embed_out` does not require gradients, otherwise
     # pytorch DDP complains; see https://gist.github.com/vwxyzjn/45fc8706dfb3cf33695f0f57cc44a533
     if isinstance(reward_model.lm_backbone, transformers.GPTNeoXForCausalLM):
@@ -500,7 +493,6 @@ def train(args: Args):
         optimizer = optim.Adam(reward_model.parameters(), lr=args.lr, eps=args.eps)
     elif args.optimizer == "adamw":
         optimizer = optim.AdamW(reward_model.parameters(), lr=args.lr, eps=args.eps)
-    # TODO: use AdamW
     scheduler = get_scheduler(
         args.scheduler,
         optimizer=optimizer,
@@ -509,8 +501,6 @@ def train(args: Args):
     )
 
     if args.deepspeed:
-        pass
-
         deepspeed_states = AcceleratorState().deepspeed_plugin
         deepspeed_states.deepspeed_config["train_micro_batch_size_per_gpu"] = args.local_micro_batch_size
 
@@ -525,8 +515,7 @@ def train(args: Args):
     accelerator.print("training on", args.labels.num_train, "in batches of", args.local_batch_size)
     accelerator.print("===training reward model===")
     num_train = (args.labels.num_train // args.batch_size) * args.batch_size
-    if args.model_dot_train:
-        reward_model.train()
+    reward_model.train()
     for epoch in range(args.num_epochs):
         all_inds = np.random.permutation(args.labels.num_train)
         # ensure that all processes have the same shuffled indices
@@ -618,8 +607,7 @@ def train(args: Args):
     # save model
     if args.save_path:
         os.makedirs(os.path.dirname(args.save_path), exist_ok=True)
-        # torch.save(accelerator.unwrap_model(reward_model).state_dict(), args.save_path)
-        accelerator.save_model(reward_model, args.save_path)
+        accelerator.save_model(reward_model, args.save_path, max_shard_size="1000GB")
 
     if accelerator.is_main_process and args.track:
         wandb.finish()

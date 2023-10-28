@@ -26,7 +26,12 @@ from torch.optim.optimizer import (
 )
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
-from transformers import AutoModelForCausalLM, AutoTokenizer, GenerationConfig
+from transformers import (
+    AutoConfig,
+    AutoModelForCausalLM,
+    AutoTokenizer,
+    GenerationConfig,
+)
 
 INVALID_LOGPROB = 1.0
 
@@ -150,16 +155,13 @@ class Args:
     ppo: PpoHParams = field(default_factory=PpoHParams)
 
 
-def first_true_indices(bools, dtype=torch.long):
-    """
-    Takes an N-dimensional bool tensor and returns an (N-1)-dimensional tensor of integers giving
-    the position of the first True in each "row".
-
-    Returns the length of the rows (bools.size(-1)) if no element is True in a given row.
-    """
-    row_len = bools.size(-1)
-    zero_or_index = row_len * (~bools).type(dtype) + torch.arange(row_len, dtype=dtype, device=bools.device)
-    return torch.min(zero_or_index, dim=-1).values
+# taken from https://github.com/microsoft/DeepSpeedExamples/blob/737c6740bec38b77a24a59135b6481a53d566b38/applications/DeepSpeed-Chat/training/utils/model/model_utils.py#L20C1-L26C52
+def configure_dropout(model_config, dropout):
+    if dropout is not None:
+        for key in ("dropout", "attention_dropout", "hidden_dropout", "activation_dropout"):
+            if hasattr(model_config, key):
+                print(f"Setting model_config.{key} to {dropout}")
+                setattr(model_config, key, dropout)
 
 
 def print_rich_table(title: str, df: pd.DataFrame, console: Console) -> Table:
@@ -378,15 +380,6 @@ class PolicyAndValueWrapper(nn.Module):
         return self.policy(**kwargs), self.critic(**kwargs)
 
 
-def shift_pad_id_left(tokens, pad_id):
-    """Convert from right padding to left padding."""
-    assert tokens.ndim == 2
-    return torch.tensor(
-        [[pad_id] * (row == pad_id).sum() + [x for x in row if x != pad_id] for row in tokens],
-        device=tokens.device,
-    )
-
-
 def shift_pad_id_left(data, pad_id):
     # Step 1: Create a boolean mask
     mask = (data == pad_id).long()
@@ -448,6 +441,18 @@ def forward(policy, query_responses, tokenizer):
         return_dict=True,
         output_hidden_states=True,
     )
+
+
+def first_true_indices(bools, dtype=torch.long):
+    """
+    Takes an N-dimensional bool tensor and returns an (N-1)-dimensional tensor of integers giving
+    the position of the first True in each "row".
+
+    Returns the length of the rows (bools.size(-1)) if no element is True in a given row.
+    """
+    row_len = bools.size(-1)
+    zero_or_index = row_len * (~bools).type(dtype) + torch.arange(row_len, dtype=dtype, device=bools.device)
+    return torch.min(zero_or_index, dim=-1).values
 
 
 def truncate_response(args, tokenizer, responses):
@@ -512,10 +517,22 @@ if __name__ == "__main__":
     )
     # we use the padding token manually but do not resize the token embedding of the model
     tokenizer.add_special_tokens({"pad_token": "[PAD]"})
+    model_config = AutoConfig.from_pretrained(args.base_model)
+    configure_dropout(model_config, 0.0)  # disable dropout
     reward_model = AutoModelForCausalLMWithRewardHead(
-        AutoModelForCausalLM.from_pretrained(args.base_model, trust_remote_code=True)
+        AutoModelForCausalLM.from_pretrained(
+            args.base_model,
+            config=model_config,
+            trust_remote_code=True,
+        )
     )
-    critic = AutoModelForCausalLMWithRewardHead(AutoModelForCausalLM.from_pretrained(args.base_model, trust_remote_code=True))
+    critic = AutoModelForCausalLMWithRewardHead(
+        AutoModelForCausalLM.from_pretrained(
+            args.base_model,
+            config=model_config,
+            trust_remote_code=True,
+        )
+    )
     if args.rewards.trained_model:
         reward_model.load_state_dict(torch.load(args.rewards.trained_model, map_location=device))
         critic.load_state_dict(torch.load(args.rewards.trained_model, map_location=device))
@@ -617,6 +634,7 @@ if __name__ == "__main__":
     vf_losses_stats = torch.zeros(stats_shape, device=device)
     vf_clipfrac_stats = torch.zeros(stats_shape, device=device)
     entropies_stats = torch.zeros(stats_shape, device=device)
+    model.train()
     for update in range(1, args.ppo.num_updates + 1):
         global_step += 1 * args.ppo.batch_size
         frac = 1.0 - (update - 1.0) / args.ppo.num_updates
@@ -692,10 +710,7 @@ if __name__ == "__main__":
             _, validation_score = get_reward(reward_model, postprocessed_sample_validation_query_responses, tokenizer)
 
             # carperAI-style score normaliation
-            # accelerator.print("before score", scores, scores.mean())
-            # accelerator.print("reference_scores", reference_scores, reference_scores.mean())
             scores = scores - reference_scores
-            # accelerator.print("after score", scores, scores.mean())
 
             # 3. filter response. Ensure that the sample contains truncate_token
             # responses not passing that filter will receive a low (fixed) score
@@ -887,11 +902,11 @@ if __name__ == "__main__":
             del kl, mean_kl, mean_entropy, mean_non_score_reward, scores
 
     # save model
-    if accelerator.is_main_process and args.save_path:
+    if args.save_path:
         os.makedirs(os.path.dirname(args.save_path), exist_ok=True)
-        torch.save(policy.state_dict(), args.save_path)
+        accelerator.save_model(policy, args.save_path, max_shard_size="1000GB")
 
-        if args.upload_model:
+        if args.upload_model and accelerator.is_main_process:
             repo_name = f"{args.exp_name}__{args.rewards.label_dataset}__seed{args.seed}__{int(time.time())}"
             repo_id = f"{args.hf_entity}/{repo_name}" if args.hf_entity else repo_name
             policy.save_pretrained(repo_id, safe_serialization=True, push_to_hub=True)
