@@ -34,6 +34,9 @@ from transformers import (
 )
 
 
+INVALID_LOGPROB = 1.0
+
+
 @dataclass
 class AdaptiveKLParams:
     target: float = 6.0
@@ -45,7 +48,7 @@ class RewardHParams:
     kl_coef: float = 0.15
     use_adaptive_kl: bool = True
     adaptive_kl: Optional[AdaptiveKLParams] = field(default_factory=AdaptiveKLParams)
-    trained_model: Optional[str] = "models/gpt2medium_last_index_reward/pytorch_model.bin"
+    trained_model: Optional[str] = ""
     label_dataset: tyro.conf.Suppress[Optional[str]] = None
 
 
@@ -138,6 +141,8 @@ class Args:
 
     base_model: str = "gpt2"
     """the name of the pretrained model to use"""
+    dropout_layer_keys: List[str] = field(default_factory=lambda: ["attn_pdrop", "embd_pdrop", "resid_pdrop", "summary_first_dropout"])
+    """Which layers to apply dropout to"""
     deepspeed: bool = False
     """Whether to use deepspeed to train the model"""
     print_sample_output_freq: int = 10
@@ -154,9 +159,9 @@ class Args:
 
 
 # taken from https://github.com/microsoft/DeepSpeedExamples/blob/737c6740bec38b77a24a59135b6481a53d566b38/applications/DeepSpeed-Chat/training/utils/model/model_utils.py#L20C1-L26C52
-def configure_dropout(model_config, dropout):
+def configure_dropout(model_config, dropout_layer_keys, dropout):
     if dropout is not None:
-        for key in ("dropout", "attention_dropout", "hidden_dropout", "activation_dropout"):
+        for key in dropout_layer_keys:
             if hasattr(model_config, key):
                 print(f"Setting model_config.{key} to {dropout}")
                 setattr(model_config, key, dropout)
@@ -516,7 +521,9 @@ if __name__ == "__main__":
     # we use the padding token manually but do not resize the token embedding of the model
     tokenizer.add_special_tokens({"pad_token": "[PAD]"})
     model_config = AutoConfig.from_pretrained(args.base_model)
-    configure_dropout(model_config, 0.0)  # disable dropout
+    configure_dropout(model_config, args.dropout_layer_keys, 0.0)  # disable dropout
+    if accelerator.is_main_process:
+        pprint(model_config)
     reward_model = AutoModelForCausalLMWithRewardHead(
         AutoModelForCausalLM.from_pretrained(
             args.base_model,
@@ -536,8 +543,8 @@ if __name__ == "__main__":
         critic.load_state_dict(torch.load(args.rewards.trained_model, map_location=device))
         print(f"loaded pretrained reward model from {args.rewards.trained_model}")
     # each class should have a separate pretrained model that do not share weights
-    ref_policy = AutoModelForCausalLM.from_pretrained(args.base_model, trust_remote_code=True)
-    policy = AutoModelForCausalLM.from_pretrained(args.base_model, trust_remote_code=True)
+    ref_policy = AutoModelForCausalLM.from_pretrained(args.base_model, config=model_config, trust_remote_code=True)
+    policy = AutoModelForCausalLM.from_pretrained(args.base_model, config=model_config, trust_remote_code=True)
     if args.sft_model_path:
         policy.load_state_dict(torch.load(args.sft_model_path, map_location=device))
         ref_policy.load_state_dict(torch.load(args.sft_model_path, map_location=device))
@@ -626,12 +633,13 @@ if __name__ == "__main__":
     print("===training policy===")
     global_step = 0
     stats_shape = (args.ppo.noptepochs, args.ppo.nminibatches, args.ppo.gradient_accumulation_steps)
-    approxkls_stats = torch.zeros(stats_shape, device=device)
-    clipfracs_stats = torch.zeros(stats_shape, device=device)
-    pg_losses_stats = torch.zeros(stats_shape, device=device)
-    vf_losses_stats = torch.zeros(stats_shape, device=device)
+    approxkl_stats = torch.zeros(stats_shape, device=device)
+    pg_clipfrac_stats = torch.zeros(stats_shape, device=device)
+    pg_loss_stats = torch.zeros(stats_shape, device=device)
+    vf_loss_stats = torch.zeros(stats_shape, device=device)
     vf_clipfrac_stats = torch.zeros(stats_shape, device=device)
-    entropies_stats = torch.zeros(stats_shape, device=device)
+    entropy_stats = torch.zeros(stats_shape, device=device)
+    ratio_stats = torch.zeros(stats_shape, device=device)
     model.train()
     for update in range(1, args.ppo.num_updates + 1):
         global_step += 1 * args.ppo.batch_size
@@ -698,6 +706,8 @@ if __name__ == "__main__":
             full_values, _ = get_reward(accelerator.unwrap_model(model).critic, postprocessed_query_responses, tokenizer)
             values = full_values[:, context_length - 1 : -1].squeeze(-1)
             padding_mask = postprocessed_responses == tokenizer.pad_token_id
+            # logprobs = torch.masked_fill(logprobs, padding_mask, INVALID_LOGPROB)
+            # ref_logprobs = torch.masked_fill(ref_logprobs, padding_mask, INVALID_LOGPROB)
             # values = torch.masked_fill(values, padding_mask, 0)
 
             rew, scores = get_reward(reward_model, postprocessed_query_responses, tokenizer)
@@ -797,10 +807,10 @@ if __name__ == "__main__":
                         mb_logprobs = logprobs[micro_batch_inds]
 
                         output, (vpred_temp, _) = forward(model, mb_query_responses, tokenizer)
-
                         logits = output.logits[:, context_length - 1 : -1]
                         logits /= args.task.temperature + 1e-7
                         new_all_logprobs = F.log_softmax(logits, dim=-1)
+                        # new_logprobs = torch.masked_fill(new_logprobs, padding_mask[micro_batch_inds], INVALID_LOGPROB)
                         new_logprobs = torch.gather(new_all_logprobs, 2, mb_responses.unsqueeze(-1)).squeeze(-1)
                         vpred = vpred_temp[:, context_length - 1 : -1]
                         # vpred = torch.masked_fill(vpred, padding_mask[micro_batch_inds], 0)
@@ -827,12 +837,13 @@ if __name__ == "__main__":
                         entropy = torch.logsumexp(logits, dim=-1) - torch.sum(prob_dist * logits, dim=-1)
                         approxkl = 0.5 * (logprobs_diff**2).mean()
                         with torch.no_grad():
-                            approxkls_stats[ppo_epoch_idx, minibatch_idx, gradient_accumulation_idx] = approxkl
-                            clipfracs_stats[ppo_epoch_idx, minibatch_idx, gradient_accumulation_idx] = pg_clipfrac
-                            pg_losses_stats[ppo_epoch_idx, minibatch_idx, gradient_accumulation_idx] = pg_loss
-                            vf_losses_stats[ppo_epoch_idx, minibatch_idx, gradient_accumulation_idx] = vf_loss
+                            approxkl_stats[ppo_epoch_idx, minibatch_idx, gradient_accumulation_idx] = approxkl
+                            pg_clipfrac_stats[ppo_epoch_idx, minibatch_idx, gradient_accumulation_idx] = pg_clipfrac
+                            pg_loss_stats[ppo_epoch_idx, minibatch_idx, gradient_accumulation_idx] = pg_loss
+                            vf_loss_stats[ppo_epoch_idx, minibatch_idx, gradient_accumulation_idx] = vf_loss
                             vf_clipfrac_stats[ppo_epoch_idx, minibatch_idx, gradient_accumulation_idx] = vf_clipfrac
-                            entropies_stats[ppo_epoch_idx, minibatch_idx, gradient_accumulation_idx] = entropy.mean()
+                            entropy_stats[ppo_epoch_idx, minibatch_idx, gradient_accumulation_idx] = entropy.mean()
+                            ratio_stats[ppo_epoch_idx, minibatch_idx, gradient_accumulation_idx] = ratio.mean()
                     gradient_accumulation_idx += 1
                 minibatch_idx += 1
                 if accelerator.is_main_process:
@@ -840,13 +851,13 @@ if __name__ == "__main__":
                         f"ppo_epoch_idx",
                         ppo_epoch_idx,
                         "approxkl",
-                        approxkl.item(),
+                        approxkl_stats[:ppo_epoch_idx+1].mean().item(),
                         "pg_loss",
-                        pg_loss.item(),
+                        pg_loss_stats[:ppo_epoch_idx+1].mean().item(),
                         "pg_clipfrac",
-                        pg_clipfrac.item(),
+                        pg_clipfrac_stats[:ppo_epoch_idx+1].mean().item(),
                         "ratio",
-                        ratio.mean().item(),
+                        ratio_stats[:ppo_epoch_idx+1].mean().item(),
                     )
 
         with torch.no_grad():
@@ -872,12 +883,12 @@ if __name__ == "__main__":
             writer.add_scalar("ppo/policy/entropy", accelerator.gather(entropy.mean()).mean().item(), update)
             writer.add_scalar("ppo/policy/approxkl", accelerator.gather(approxkl).mean().item(), update)
             writer.add_scalar("ppo/policy/clipfrac", accelerator.gather(pg_clipfrac).mean().item(), update)
-            writer.add_scalar("ppo/policy/approxkl_avg", accelerator.gather(approxkls_stats).mean().item(), update)
-            writer.add_scalar("ppo/policy/clipfrac_avg", accelerator.gather(clipfracs_stats).mean().item(), update)
-            writer.add_scalar("ppo/loss/policy_avg", accelerator.gather(pg_losses_stats).mean().item(), update)
-            writer.add_scalar("ppo/loss/value_avg", accelerator.gather(vf_losses_stats).mean().item(), update)
+            writer.add_scalar("ppo/policy/approxkl_avg", accelerator.gather(approxkl_stats).mean().item(), update)
+            writer.add_scalar("ppo/policy/clipfrac_avg", accelerator.gather(pg_clipfrac_stats).mean().item(), update)
+            writer.add_scalar("ppo/loss/policy_avg", accelerator.gather(pg_loss_stats).mean().item(), update)
+            writer.add_scalar("ppo/loss/value_avg", accelerator.gather(vf_loss_stats).mean().item(), update)
             writer.add_scalar("ppo/val/clipfrac_avg", accelerator.gather(vf_clipfrac_stats).mean().item(), update)
-            writer.add_scalar("ppo/policy/entropy_avg", accelerator.gather(entropies_stats).mean().item(), update)
+            writer.add_scalar("ppo/policy/entropy_avg", accelerator.gather(entropy_stats).mean().item(), update)
             writer.add_scalar("ppo/returns/mean", accelerator.gather(return_mean).mean().item(), update)
             writer.add_scalar("ppo/returns/var", accelerator.gather(return_var).mean().item(), update)
             writer.add_scalar("ppo/val/vpred", accelerator.gather(vpred.mean()).mean().item(), update)

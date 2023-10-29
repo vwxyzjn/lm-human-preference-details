@@ -92,6 +92,8 @@ class Args:
 
     base_model: str = "gpt2"
     """the name of the pretrained model to use"""
+    dropout_layer_keys: List[str] = field(default_factory=lambda: ["attn_pdrop", "embd_pdrop", "resid_pdrop", "summary_first_dropout"])
+    """Which layers to apply dropout to"""
     deepspeed: bool = False
     """Whether to use deepspeed to train the model"""
     label_dataset: str = "vwxyzjn/summarize_from_feedback_oai_preprocessing"
@@ -149,9 +151,9 @@ class Args:
 
 
 # taken from https://github.com/microsoft/DeepSpeedExamples/blob/737c6740bec38b77a24a59135b6481a53d566b38/applications/DeepSpeed-Chat/training/utils/model/model_utils.py#L20C1-L26C52
-def configure_dropout(model_config, dropout):
+def configure_dropout(model_config, dropout_layer_keys, dropout):
     if dropout is not None:
-        for key in ("dropout", "attention_dropout", "hidden_dropout", "activation_dropout"):
+        for key in dropout_layer_keys:
             if hasattr(model_config, key):
                 print(f"Setting model_config.{key} to {dropout}")
                 setattr(model_config, key, dropout)
@@ -463,7 +465,9 @@ def train(args: Args):
     # we use the padding token manually but do not resize the token embedding of the model
     tokenizer.add_special_tokens({"pad_token": "[PAD]"})
     model_config = AutoConfig.from_pretrained(args.base_model)
-    configure_dropout(model_config, 0.0)  # disable dropout
+    configure_dropout(model_config, args.dropout_layer_keys, 0.0)  # disable dropout
+    if accelerator.is_main_process:
+        pprint(model_config)
     reward_model = AutoModelForCausalLMWithRewardHead(
         AutoModelForCausalLM.from_pretrained(
             args.base_model,

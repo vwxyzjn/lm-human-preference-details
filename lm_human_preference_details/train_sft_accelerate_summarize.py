@@ -113,6 +113,8 @@ class Args:
 
     base_model: str = "gpt2"
     """the name of the pretrained model to use"""
+    dropout_layer_keys: List[str] = field(default_factory=lambda: ["attn_pdrop", "embd_pdrop", "resid_pdrop", "summary_first_dropout"])
+    """Which layers to apply dropout to"""
     deepspeed: bool = False
     """Whether to use deepspeed to train the model"""
     print_sample_output_freq: int = 220
@@ -130,9 +132,9 @@ class Args:
 
 
 # taken from https://github.com/microsoft/DeepSpeedExamples/blob/737c6740bec38b77a24a59135b6481a53d566b38/applications/DeepSpeed-Chat/training/utils/model/model_utils.py#L20C1-L26C52
-def configure_dropout(model_config, dropout):
+def configure_dropout(model_config, dropout_layer_keys, dropout):
     if dropout is not None:
-        for key in ("dropout", "attention_dropout", "hidden_dropout", "activation_dropout"):
+        for key in dropout_layer_keys:
             if hasattr(model_config, key):
                 print(f"Setting model_config.{key} to {dropout}")
                 setattr(model_config, key, dropout)
@@ -396,12 +398,12 @@ if __name__ == "__main__":
     # we use the padding token manually but do not resize the token embedding of the model
     tokenizer.add_special_tokens({"pad_token": "[PAD]"})
     model_config = AutoConfig.from_pretrained(args.base_model)
-    configure_dropout(model_config, 0.0)  # disable dropout
+    configure_dropout(model_config, args.dropout_layer_keys, 0.0)  # disable dropout
+    if accelerator.is_main_process:
+        pprint(model_config)
     policy = AutoModelForCausalLM.from_pretrained(args.base_model, config=model_config, trust_remote_code=True)
     policy.generation_config.eos_token_id = None  # disable `pad_token_id` and `eos_token_id` because we just want to
     policy.generation_config.pad_token_id = None  # generate tokens without truncation / padding
-    # IMPORTANT: Layer norm produces weird gradients, which affects Adam optimizer to impact all the parameters systematically
-    # see https://github.com/pytorch/pytorch/issues/104857 for more details
     if args.optimizer == "tf_adam":
         optimizer = AdamTensorFlowStyle(policy.parameters(), lr=args.sft.lr, eps=args.sft.eps)
     elif args.optimizer == "adam":
@@ -480,17 +482,15 @@ if __name__ == "__main__":
                 with torch.no_grad():
                     validation_reference_responses = validation_data["reference_response_token"].to(device, non_blocking=True)
                     validation_queries = validation_data["query_token"].to(device, non_blocking=True)
-                    validation_queries = shift_pad_id_left(validation_queries, tokenizer.pad_token_id)
                     validation_query_reference_responses = torch.cat(
                         (validation_queries, validation_reference_responses), dim=1
                     )
+                    validation_query_reference_responses = shift_pad_id_left(validation_query_reference_responses, tokenizer.pad_token_id)
 
                     validation_output = forward(policy, validation_query_reference_responses, tokenizer)
                     validation_labels = validation_query_reference_responses.masked_fill(
                         validation_query_reference_responses == tokenizer.pad_token_id, -1
                     )
-                    if args.sft.lm_loss_on_response_only:
-                        validation_labels[:, : queries.shape[1]] = -1
                     validation_lm_logits = validation_output.logits
                     # hand-rolled transformer loss: Shift so that tokens < n predict n
                     # but unlike `transformers` we mask the padding tokens via `ignore_index=-1`
@@ -523,14 +523,9 @@ if __name__ == "__main__":
                     rouge_scores["rougeL"].append(rouge_score["rougeL"])
 
                     all_decode_validation_queries.extend(decode_validation_queries)
-                    accelerator.print(
-                        "len(all_decode_validation_queries)", len(all_decode_validation_queries), decode_validation_responses
-                    )
                     all_decode_validation_query_responses.extend(decode_validation_query_responses)
                     all_decode_validation_responses.extend(decode_validation_responses)
                     all_decode_validation_reference_responses.extend(decode_validation_reference_responses)
-                if validation_idx == 10:
-                    break
 
             try:
                 all_df = pd.DataFrame(
