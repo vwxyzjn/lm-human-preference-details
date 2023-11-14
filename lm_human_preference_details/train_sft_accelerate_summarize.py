@@ -12,6 +12,7 @@ import pandas as pd
 import torch
 import torch.optim as optim
 import tyro
+from tqdm import tqdm
 from accelerate import Accelerator
 from datasets import load_dataset
 from rich.console import Console
@@ -73,18 +74,6 @@ class TaskHParams:
 
     # LM params
     temperature: float = 0.01
-
-
-# a patch
-@dataclass
-class TaskQueryHParams:
-    length: int = None
-    dataset: str = None
-    format_str: Optional[str] = None  # if underlying dataset yields dicts, can format arbitrarily
-    truncate_field: Optional[str] = None
-    truncate_text: Optional[str] = None
-    padding: Optional[str] = None  # defaults to repeated spaces
-    pad_side: Optional[str] = None
 
 
 @dataclass
@@ -478,7 +467,7 @@ if __name__ == "__main__":
             all_decode_validation_responses = []
             all_decode_validation_reference_responses = []
             all_validation_losses = []
-            for validation_idx, validation_data in enumerate(validation_dataloader):
+            for validation_idx, validation_data in tqdm(enumerate(validation_dataloader)):
                 with torch.no_grad():
                     validation_reference_responses = validation_data["reference_response_token"].to(device, non_blocking=True)
                     validation_queries = validation_data["query_token"].to(device, non_blocking=True)
@@ -526,7 +515,8 @@ if __name__ == "__main__":
                     all_decode_validation_query_responses.extend(decode_validation_query_responses)
                     all_decode_validation_responses.extend(decode_validation_responses)
                     all_decode_validation_reference_responses.extend(decode_validation_reference_responses)
-
+                    # if validation_idx == 10:
+                    #     break
             try:
                 all_df = pd.DataFrame(
                     {

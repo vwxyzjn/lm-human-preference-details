@@ -27,6 +27,7 @@ from torch.optim.optimizer import (
     _use_grad_for_differentiable,
 )
 from torch.utils.tensorboard import SummaryWriter
+from torch.utils.data import DataLoader
 from tqdm import tqdm
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer, get_scheduler
 
@@ -104,6 +105,8 @@ class Args:
     """gradient accumulation steps"""
     local_micro_batch_size: tyro.conf.Suppress[int] = None
     """per rank micro batch size"""
+    local_eval_batch_size: int = 8
+    """per rank eval batch size"""
     lr: float = 0.00005
     """the learning rate"""
     eps: float = 1e-5
@@ -142,9 +145,9 @@ class Args:
     """Where to save the model"""
     optimizer: Literal["tf_adam", "adam", "adamw"] = "adamw"
     """Which optimizer to use"""
-    scheduler: str = "constant_with_warmup"
+    scheduler: str = "cosine"
     """Which scheduler to use"""
-    warm_up_steps: int = 100
+    warm_up_steps: int = 0
     """Number of warm up steps for the scheduler"""
     task: TaskHParams = field(default_factory=TaskHParams)
     labels: LabelHParams = field(default_factory=LabelHParams)
@@ -379,40 +382,30 @@ def get_reward(reward_model, query_responses, tokenizer):
     )
 
 
-def evaluate(args, accelerator, tokenizer, device, reward_model, validation_label):
+def evaluate(args, accelerator, tokenizer, reward_model, dataloader):
     reward_model.eval()
     with torch.no_grad():
         # eval on validation_label, some duplicate code (I don't want to make the training loop into a function...)
-        test_accuracies = []
-        eval_len = len(validation_label)
-        len_labels = (eval_len // args.batch_size) * args.batch_size  # in case the last batch is not full
-        new_all_inds = np.arange(len_labels)
-        for start in tqdm(range(0, len_labels, args.batch_size)):
-            end = start + args.batch_size
-            b_inds_all = new_all_inds[start:end]
-            b_inds = b_inds_all[accelerator.process_index :: accelerator.num_processes]  #  multi-GPU slicing
-            for micro_batch_start in range(0, args.local_batch_size, args.local_micro_batch_size):
-                micro_batch_end = micro_batch_start + args.local_micro_batch_size
-                micro_batch_inds = b_inds[micro_batch_start:micro_batch_end]
-                mb_data = validation_label[micro_batch_inds]
-                mb_query = torch.from_numpy(np.stack(mb_data["query_token"])).to(device)
-                mb_best = torch.from_numpy(np.stack(mb_data["choice"])).to(device)
-                mb_responses = [
-                    torch.from_numpy(np.stack(mb_data[f"response{i}_token"])).to(device) for i in range(args.labels.num_labels)
-                ]
-                mb_query_tiled = mb_query.unsqueeze(1).repeat(1, len(mb_responses), 1)
-                query_responses = torch.cat([mb_query_tiled, torch.stack(mb_responses).transpose(0, 1)], dim=2).flatten(0, 1)
-                query_responses = shift_pad_id_left(query_responses, tokenizer.pad_token_id)
-                predicted_reward = get_reward(reward_model, query_responses, tokenizer)
-                predicted_reward = predicted_reward.view(-1, len(mb_responses))
-                accuracy = (predicted_reward.argmax(1) == mb_best).float().mean()
-                test_accuracies.append(accuracy)
-        test_accuracy = accelerator.gather(torch.stack(test_accuracies).mean()).mean().item()
+        accuracies = []
+        for data in tqdm(dataloader):
+            mb_query = data["query_token"]
+            mb_responses = torch.cat([data[f"response0_token"].unsqueeze(1), data[f"response1_token"].unsqueeze(1)], dim=1)
+            mb_best = data["choice"]
+            mb_query_tiled = mb_query.unsqueeze(1).repeat(1, args.labels.num_labels, 1)
+            query_responses = torch.cat([mb_query_tiled, mb_responses], dim=2).flatten(0, 1)
+            query_responses = shift_pad_id_left(query_responses, tokenizer.pad_token_id)
+            predicted_reward = get_reward(reward_model, query_responses, tokenizer)
+            predicted_reward = predicted_reward.view(-1, args.labels.num_labels)
+            accuracy = (predicted_reward.argmax(1) == mb_best).float().mean()
+            accuracies.append(accuracy)
+        accuracy = accelerator.gather(torch.stack(accuracies).mean()).mean().item()
     reward_model.train()
-    return test_accuracy
+    return accuracy
 
 
-def train(args: Args):
+# def train(args: Args):
+if __name__ == "__main__":
+    args = tyro.cli(Args)
     accelerator = Accelerator(
         kwargs_handlers=[
             DistributedDataParallelKwargs(
@@ -508,13 +501,29 @@ def train(args: Args):
         deepspeed_states = AcceleratorState().deepspeed_plugin
         deepspeed_states.deepspeed_config["train_micro_batch_size_per_gpu"] = args.local_micro_batch_size
 
-    reward_model, optimizer, scheduler = accelerator.prepare(reward_model, optimizer, scheduler)
-
-    # `label` has keys `['sample0', 'query', 'best', 'sample3', 'sample1', 'sample2']`
     label = load_dataset(args.label_dataset, "comparisons", split="train")
+    label = label.with_format("torch", columns=["query_token", "choice", "response0_token", "response1_token"])
+    label = label.shuffle(seed=local_seed)
+    dataloader = DataLoader(label, batch_size=args.local_micro_batch_size)
+    reward_model, optimizer, dataloader, scheduler = accelerator.prepare(reward_model, optimizer, dataloader, scheduler)
+    iter_dataloader = iter(dataloader)
     validation_label = load_dataset(args.label_dataset, "comparisons", split="validation")
-    dev_validation_label = validation_label.filter(lambda x: x["split"] == "valid1")
-    eval_validation_label = validation_label.filter(lambda x: x["split"] == "valid2")
+
+    batch_names = set()
+    for item in tqdm(validation_label):
+        batch_names.add(item["batch"])
+    batch_names = sorted(list(batch_names))
+    pprint(batch_names)
+    batches = [validation_label.filter(
+        lambda x: x["batch"] == batch_name
+        ).with_format(
+            "torch",
+            columns=["query_token", "choice", "response0_token", "response1_token"]
+        ) for batch_name in batch_names
+    ]
+    batch_dataloaders = [DataLoader(batch, batch_size=args.local_eval_batch_size) for batch in batches]
+    batch_dataloaders = [accelerator.prepare(dataloader) for dataloader in batch_dataloaders]
+
     accelerator.print("Num labels found in source:", len(label))
     accelerator.print("training on", args.labels.num_train, "in batches of", args.local_batch_size)
     accelerator.print("===training reward model===")
@@ -528,41 +537,22 @@ def train(args: Args):
         accelerator.print(f"epoch: {epoch}")
         for (epoch_global_step, start) in enumerate(range(0, num_train, args.batch_size)):
             global_step = epoch * args.num_updates + epoch_global_step
-            end = start + args.batch_size
-            b_inds_all = all_inds[start:end]
-            b_inds = b_inds_all[accelerator.process_index :: accelerator.num_processes]  #  multi-GPU slicing
-            if accelerator.is_main_process:
-                pprint(
-                    {
-                        "global_step": global_step,
-                        "start:end": f"{start}:{end}",
-                        "b_inds_all": b_inds_all,
-                        "b_inds": b_inds,
-                    }
-                )
             losses = torch.zeros((args.gradient_accumulation_steps,), device=device)
             accuracies = torch.zeros((args.gradient_accumulation_steps,), device=device)
             reward_preferreds = torch.zeros((args.gradient_accumulation_steps,), device=device)
             reward_rejecteds = torch.zeros((args.gradient_accumulation_steps,), device=device)
             gradient_accumulation_step = 0
-            for micro_batch_start in range(0, args.local_batch_size, args.local_micro_batch_size):
+            for gradient_accumulation_step in range(args.gradient_accumulation_steps):
                 with accelerator.accumulate(reward_model):
-                    micro_batch_end = micro_batch_start + args.local_micro_batch_size
-                    micro_batch_inds = b_inds[micro_batch_start:micro_batch_end]
-                    mb_data = label[micro_batch_inds]
-                    mb_query = torch.from_numpy(np.stack(mb_data["query_token"])).to(device)
-                    mb_best = torch.from_numpy(np.stack(mb_data["choice"])).to(device)
-                    mb_responses = [
-                        torch.from_numpy(np.stack(mb_data[f"response{i}_token"])).to(device)
-                        for i in range(args.labels.num_labels)
-                    ]
-                    mb_query_tiled = mb_query.unsqueeze(1).repeat(1, len(mb_responses), 1)
-                    query_responses = torch.cat([mb_query_tiled, torch.stack(mb_responses).transpose(0, 1)], dim=2).flatten(
-                        0, 1
-                    )
+                    data = next(iter_dataloader)
+                    mb_query = data["query_token"]
+                    mb_responses = torch.cat([data[f"response0_token"].unsqueeze(1), data[f"response1_token"].unsqueeze(1)], dim=1)
+                    mb_best = data["choice"]
+                    mb_query_tiled = mb_query.unsqueeze(1).repeat(1, args.labels.num_labels, 1)
+                    query_responses = torch.cat([mb_query_tiled, mb_responses], dim=2).flatten(0, 1)
                     query_responses = shift_pad_id_left(query_responses, tokenizer.pad_token_id)
                     predicted_reward = get_reward(reward_model, query_responses, tokenizer)
-                    predicted_reward = predicted_reward.view(-1, len(mb_responses))
+                    predicted_reward = predicted_reward.view(-1, args.labels.num_labels)
                     accuracy = (predicted_reward.argmax(1) == mb_best).float().mean()
                     reward_preferred = predicted_reward.gather(1, mb_best.view(-1, 1)).view(-1)
                     reward_rejected = predicted_reward.gather(1, (1 - mb_best).view(-1, 1)).view(-1)
@@ -582,8 +572,6 @@ def train(args: Args):
                     accuracies[gradient_accumulation_step] = accuracy
                     reward_preferreds[gradient_accumulation_step] = reward_preferred.mean()
                     reward_rejecteds[gradient_accumulation_step] = reward_rejected.mean()
-                gradient_accumulation_step += 1
-
             train_accuracy = accelerator.gather(accuracies).mean().item()
             writer.add_scalar("train/loss", accelerator.gather(losses).mean().item(), global_step)
             writer.add_scalar("train/accuracy", train_accuracy, global_step)
@@ -595,16 +583,10 @@ def train(args: Args):
 
             # if args.print_sample_output_freq > 0 and global_step % args.print_sample_output_freq == 0:
             if global_step == args.num_updates - 1:  # first and last update
-                # if global_step == 1:
-                dev_validation_accuracy = evaluate(args, accelerator, tokenizer, device, reward_model, dev_validation_label)
-                writer.add_scalar("dev_validation/accuracy", dev_validation_accuracy, global_step)
-                accelerator.print("dev_validation/accuracy", dev_validation_accuracy, global_step)
-                eval_validation_accuracy = evaluate(args, accelerator, tokenizer, device, reward_model, eval_validation_label)
-                writer.add_scalar("eval_validation/accuracy", eval_validation_accuracy, global_step)
-                accelerator.print("eval_validation/accuracy", eval_validation_accuracy, global_step)
-                eval_validation_accuracy = evaluate(args, accelerator, tokenizer, device, reward_model, label)
-                writer.add_scalar("train_full/accuracy", eval_validation_accuracy, global_step)
-                accelerator.print("train_full/accuracy", eval_validation_accuracy, global_step)
+                for batch_name, batch_dataloader in zip(batch_names, batch_dataloaders):
+                    batch_accuracy = evaluate(args, accelerator, tokenizer, reward_model, batch_dataloader)
+                    writer.add_scalar(f"eval/accuracy/{batch_name}", batch_accuracy, global_step)
+                    accelerator.print(f"eval/accuracy/{batch_name}", batch_accuracy, global_step)
 
     torch.cuda.empty_cache()
 

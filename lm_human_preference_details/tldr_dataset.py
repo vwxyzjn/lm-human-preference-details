@@ -118,8 +118,8 @@ if __name__ == "__main__":
 
     def process_response_data(x):
         # with an extra leading space to account for the space between the query and response
-        response0 = x["summaries"][0]["text"]
-        response1 = x["summaries"][1]["text"]
+        response0 = f" {x['summaries'][0]['text']}<|endoftext|>"
+        response1 = f" {x['summaries'][1]['text']}<|endoftext|>"
         return {
             **process_query(x["info"], encoder=tokenizer, hparams=oai_h),
             "response0": response0,
