@@ -85,7 +85,7 @@ class Args:
     """seed of the experiment"""
     track: bool = False
     """if toggled, this experiment will be tracked with Weights and Biases"""
-    wandb_project_name: str = "cleanrl"
+    wandb_project_name: str = "tldr_summarize"
     """the wandb's project name"""
     wandb_entity: Optional[str] = None
     """the entity (team) of wandb's project"""
@@ -298,6 +298,23 @@ def shift_pad_id_left(data, pad_id):
     return shifted_data
 
 
+def right_padding_to_left_padding(tokens, pad_id):
+    """Convert from right padding to left padding."""
+    assert tokens.ndim == 2
+    return torch.tensor(
+        [[pad_id] * (row == pad_id).sum() + [x for x in row if x != pad_id] for row in tokens],
+        device=tokens.device,
+    )
+
+def left_padding_to_right_padding(tokens, pad_id):
+    """Convert from left padding to right padding."""
+    assert tokens.ndim == 2
+    return torch.tensor(
+        [[x for x in row if x != pad_id] + [pad_id] * (row == pad_id).sum() for row in tokens],
+        device=tokens.device,
+    )
+
+
 def ceil_div(a, b):
     return (a - 1) // b + 1
 
@@ -326,12 +343,12 @@ def generate(lm_backbone, queries, tokenizer, generation_config):
 
 def forward(policy, query_responses, tokenizer):
     attention_mask = query_responses != tokenizer.pad_token_id
-    position_ids = attention_mask.cumsum(1) - attention_mask.long()  # exclusive cumsum
+    # position_ids = attention_mask.cumsum(1) - attention_mask.long()  # exclusive cumsum
     input_ids = torch.masked_fill(query_responses, ~attention_mask, 0)
     return policy(
         input_ids=input_ids,
         attention_mask=attention_mask,
-        position_ids=position_ids,
+        # position_ids=position_ids,
         return_dict=True,
     )
 
@@ -342,13 +359,14 @@ if __name__ == "__main__":
     accelerator = Accelerator(gradient_accumulation_steps=args.sft.gradient_accumulation_steps)
     args.sft.world_size = accelerator.num_processes
     args.sft.local_batch_size = args.sft.local_micro_batch_size * args.sft.gradient_accumulation_steps
+    args.sft.micro_batch_size = int(args.sft.local_micro_batch_size * args.sft.world_size)
     args.sft.batch_size = int(args.sft.local_batch_size * args.sft.world_size)
     dataset = load_dataset(args.task.query_dataset, split="train")
     validation_dataset = load_dataset(args.task.query_dataset, split="validation")
     accelerator.print("The number of samples in dataset", len(dataset))
     accelerator.print("The number of samples in validation_dataset", len(validation_dataset))
     args.sft.total_episodes = len(dataset)
-    args.sft.num_updates = args.sft.total_episodes // args.sft.batch_size
+    args.sft.num_updates = args.sft.total_episodes // args.sft.local_batch_size
 
     console = Console(force_terminal=True)
     run_name = f"{args.exp_name}__{args.seed}__{int(time.time())}"
@@ -403,7 +421,7 @@ if __name__ == "__main__":
         args.scheduler,
         optimizer=optimizer,
         num_warmup_steps=args.warm_up_steps,
-        num_training_steps=args.sft.num_updates // args.sft.gradient_accumulation_steps,
+        num_training_steps=args.sft.num_updates,
     )
 
     dataset = dataset.with_format("torch", columns=["query_token", "reference_response_token"])
@@ -411,10 +429,10 @@ if __name__ == "__main__":
     dataloader = DataLoader(dataset, batch_size=args.sft.local_micro_batch_size)
     validation_dataset = validation_dataset.with_format("torch", columns=["query_token", "reference_response_token"])
     validation_dataloader = DataLoader(validation_dataset, batch_size=args.sft.local_micro_batch_size)
-    policy, optimizer, dataloader, validation_dataloader, scheduler = accelerator.prepare(
-        policy, optimizer, dataloader, validation_dataloader, scheduler
+    policy, optimizer, dataloader, scheduler = accelerator.prepare(
+        policy, optimizer, dataloader, scheduler
     )
-    iter_dataloader = iter(dataloader)
+    validation_dataloader = accelerator.prepare(validation_dataloader)
     # WARNING: even with `max_new_tokens` and `min_new_tokens` set to the same value, the number of tokens generated
     # may not be the same. TODO: investigate further, we just want to generate a fixed number of tokens
     generation_config = GenerationConfig(
@@ -432,14 +450,15 @@ if __name__ == "__main__":
     loss_stats = torch.zeros(args.sft.gradient_accumulation_steps, device=device)
     gradient_accumulation_idx = 0
     policy.train()
-    for update in range(1, args.sft.num_updates + 1):
-        global_step += args.sft.batch_size
-        accelerator.print(f"update {update}, global_step {global_step}")
-        data = next(iter_dataloader)
+    # for update in range(1, args.sft.num_updates + 1):
+    update = 0
+    for data in dataloader:
+        update += 1
+        global_step += args.sft.micro_batch_size
         reference_responses = data["reference_response_token"].to(device, non_blocking=True)
         queries = data["query_token"].to(device, non_blocking=True)
         query_responses = torch.cat((queries, reference_responses), dim=1)
-        query_responses = shift_pad_id_left(query_responses, tokenizer.pad_token_id)
+        query_responses = left_padding_to_right_padding(query_responses, tokenizer.pad_token_id)
         with accelerator.accumulate(policy):
             output = forward(policy, query_responses, tokenizer)
             # mask out gradient effects on response padding tokens
@@ -458,87 +477,90 @@ if __name__ == "__main__":
         gradient_accumulation_idx = (gradient_accumulation_idx + 1) % args.sft.gradient_accumulation_steps
         if update > 1 and (update - 1) % args.sft.gradient_accumulation_steps == 0:
             writer.add_scalar("loss", accelerator.gather(loss_stats).mean().item(), update)
-            writer.add_scalar("lr", optimizer.param_groups[0]["lr"], update)
-        if update == 1 or update == args.sft.num_updates - 1:
-            policy.eval()
-            rouge_scores = collections.defaultdict(list)
-            all_decode_validation_queries = []
-            all_decode_validation_query_responses = []
-            all_decode_validation_responses = []
-            all_decode_validation_reference_responses = []
-            all_validation_losses = []
-            for validation_idx, validation_data in tqdm(enumerate(validation_dataloader)):
-                with torch.no_grad():
-                    validation_reference_responses = validation_data["reference_response_token"].to(device, non_blocking=True)
-                    validation_queries = validation_data["query_token"].to(device, non_blocking=True)
-                    validation_query_reference_responses = torch.cat(
-                        (validation_queries, validation_reference_responses), dim=1
-                    )
-                    validation_query_reference_responses = shift_pad_id_left(validation_query_reference_responses, tokenizer.pad_token_id)
+            writer.add_scalar("lr", scheduler.get_last_lr()[0], update)
+            accelerator.print(f"{loss.item()=}, {scheduler.get_last_lr()=}, {update=}")
+        # if update == args.sft.num_updates - 1: # update == 1 or 
+    policy.eval()
+    rouge_scores = collections.defaultdict(list)
+    all_decode_validation_queries = []
+    all_decode_validation_query_responses = []
+    all_decode_validation_responses = []
+    all_decode_validation_reference_responses = []
+    all_validation_losses = []
+    for validation_idx, validation_data in tqdm(enumerate(validation_dataloader)):
+        with torch.no_grad():
+            validation_reference_responses = validation_data["reference_response_token"].to(device, non_blocking=True)
+            validation_queries = validation_data["query_token"].to(device, non_blocking=True)
+            # validation_queries = right_padding_to_left_padding(validation_queries, tokenizer.pad_token_id) # not necessary
+            validation_query_reference_responses = torch.cat(
+                (validation_queries, validation_reference_responses), dim=1
+            )
+            validation_query_reference_responses = left_padding_to_right_padding(validation_query_reference_responses, tokenizer.pad_token_id)
 
-                    validation_output = forward(policy, validation_query_reference_responses, tokenizer)
-                    validation_labels = validation_query_reference_responses.masked_fill(
-                        validation_query_reference_responses == tokenizer.pad_token_id, -1
-                    )
-                    validation_lm_logits = validation_output.logits
-                    # hand-rolled transformer loss: Shift so that tokens < n predict n
-                    # but unlike `transformers` we mask the padding tokens via `ignore_index=-1`
-                    validation_shift_logits = validation_lm_logits[..., :-1, :].contiguous()
-                    validation_shift_labels = validation_labels[..., 1:].contiguous()
-                    validation_loss = F.cross_entropy(
-                        validation_shift_logits.view(-1, validation_shift_logits.size(-1)),
-                        validation_shift_labels.view(-1),
-                        ignore_index=-1,
-                    )
-                    validation_loss = accelerator.gather(validation_loss)
-                    all_validation_losses.append(validation_loss)
+            validation_output = forward(policy, validation_query_reference_responses, tokenizer)
+            validation_labels = validation_query_reference_responses.masked_fill(
+                validation_query_reference_responses == tokenizer.pad_token_id, -1
+            )
+            validation_lm_logits = validation_output.logits
+            # hand-rolled transformer loss: Shift so that tokens < n predict n
+            # but unlike `transformers` we mask the padding tokens via `ignore_index=-1`
+            validation_shift_logits = validation_lm_logits[..., :-1, :].contiguous()
+            validation_shift_labels = validation_labels[..., 1:].contiguous()
+            validation_loss = F.cross_entropy(
+                validation_shift_logits.view(-1, validation_shift_logits.size(-1)),
+                validation_shift_labels.view(-1),
+                ignore_index=-1,
+            )
+            validation_loss = accelerator.gather(validation_loss)
+            all_validation_losses.append(validation_loss)
 
-                    generated_responses = generate(
-                        accelerator.unwrap_model(policy), validation_queries, tokenizer, generation_config
-                    )
-                    decode_validation_queries = tokenizer.batch_decode(accelerator.gather(validation_queries))
-                    decode_validation_query_responses = tokenizer.batch_decode(accelerator.gather(generated_responses))
-                    decode_validation_reference_responses = tokenizer.batch_decode(
-                        accelerator.gather(validation_reference_responses)
-                    )
-                    decode_validation_responses = [
-                        x[len(y) :] for x, y in zip(decode_validation_query_responses, decode_validation_queries)
-                    ]
-                    rouge_score = rouge.compute(
-                        predictions=decode_validation_responses, references=decode_validation_reference_responses
-                    )
-                    rouge_scores["rouge1"].append(rouge_score["rouge1"])
-                    rouge_scores["rouge2"].append(rouge_score["rouge2"])
-                    rouge_scores["rougeL"].append(rouge_score["rougeL"])
+            generated_responses = generate(
+                accelerator.unwrap_model(policy),
+                validation_queries,
+                tokenizer,
+                generation_config,
+            )
+            decode_validation_queries = tokenizer.batch_decode(accelerator.gather(validation_queries))
+            decode_validation_query_responses = tokenizer.batch_decode(accelerator.gather(generated_responses))
+            decode_validation_reference_responses = tokenizer.batch_decode(
+                accelerator.gather(validation_reference_responses)
+            )
+            decode_validation_responses = tokenizer.batch_decode(accelerator.gather(generated_responses[:, -args.task.response_length:]))
+            rouge_score = rouge.compute(
+                predictions=decode_validation_responses, references=decode_validation_reference_responses
+            )
+            rouge_scores["rouge1"].append(rouge_score["rouge1"])
+            rouge_scores["rouge2"].append(rouge_score["rouge2"])
+            rouge_scores["rougeL"].append(rouge_score["rougeL"])
 
-                    all_decode_validation_queries.extend(decode_validation_queries)
-                    all_decode_validation_query_responses.extend(decode_validation_query_responses)
-                    all_decode_validation_responses.extend(decode_validation_responses)
-                    all_decode_validation_reference_responses.extend(decode_validation_reference_responses)
-                    # if validation_idx == 10:
-                    #     break
-            try:
-                all_df = pd.DataFrame(
-                    {
-                        "query": all_decode_validation_queries,
-                        "response": all_decode_validation_responses,
-                        "reference": all_decode_validation_reference_responses,
-                    }
-                )
-                accelerator.print(all_df)
-                if accelerator.is_main_process and args.track:
-                    wandb.log({"samples/query_responses": wandb.Table(dataframe=all_df)}, step=update)
-                    print_rich_table(f"Sample Output at Step {update}", all_df[:4], console)
-            except Exception as e:
-                print(e)
+            all_decode_validation_queries.extend(decode_validation_queries)
+            all_decode_validation_query_responses.extend(decode_validation_query_responses)
+            all_decode_validation_responses.extend(decode_validation_responses)
+            all_decode_validation_reference_responses.extend(decode_validation_reference_responses)
+            # if validation_idx == 10:
+            #     break
+    try:
+        all_df = pd.DataFrame(
+            {
+                "query": all_decode_validation_queries,
+                "response": all_decode_validation_responses,
+                "reference": all_decode_validation_reference_responses,
+            }
+        )
+        accelerator.print(all_df)
+        if accelerator.is_main_process and args.track:
+            wandb.log({"samples/query_responses": wandb.Table(dataframe=all_df)}, step=update)
+            print_rich_table(f"Sample Output at Step {update}", all_df[:4], console)
+    except Exception as e:
+        print(e)
 
-            for k, v in rouge_scores.items():
-                rouge_metric = torch.tensor(v, device=device)
-                rouge_metric = accelerator.gather(rouge_metric)
-                writer.add_scalar(f"rouge/{k}", rouge_metric.mean().item(), update)
-                accelerator.print(f"rouge/{k}: {rouge_metric.mean().item()} {rouge_metric.shape} {rouge_metric}")
-            writer.add_scalar("validation_loss", torch.stack(all_validation_losses).mean().item(), update)
-            policy.train()
+    for k, v in rouge_scores.items():
+        rouge_metric = torch.tensor(v, device=device)
+        rouge_metric = accelerator.gather(rouge_metric)
+        writer.add_scalar(f"rouge/{k}", rouge_metric.mean().item(), update)
+        accelerator.print(f"rouge/{k}: {rouge_metric.mean().item()} {rouge_metric.shape} {rouge_metric}")
+    writer.add_scalar("validation_loss", torch.stack(all_validation_losses).mean().item(), update)
+    policy.train()
 
     # save model
     if args.save_path:
