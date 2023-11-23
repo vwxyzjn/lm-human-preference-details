@@ -4,12 +4,18 @@ from typing import Dict, Optional, Union
 from datasets import load_dataset
 from rich.pretty import pprint
 from transformers import AutoTokenizer
+import tyro
+
+
+@dataclass
+class Args:
+    base_model: str = "gpt2" # EleutherAI/pythia-160m
+    max_response_length: int = 48
 
 
 @dataclass
 class TaskQueryHParams:
     length: int = 512
-    dataset: str = "vwxyzjn/summarize_from_feedback_tldr_3_filtered"
     format_str: Optional[
         str
     ] = "SUBREDDIT: r/{subreddit}\n\nTITLE: {title}\n\nPOST: {post}\n\nTL;DR:"  # if underlying dataset yields dicts, can format arbitrarily
@@ -85,16 +91,16 @@ def process_query(query_info: Dict[str, str], *, encoder, hparams: TaskQueryHPar
 
 
 if __name__ == "__main__":
-    tokenizer = AutoTokenizer.from_pretrained("gpt2")
+    args = tyro.cli(Args)
+    tokenizer = AutoTokenizer.from_pretrained(args.base_model)
     tokenizer.add_special_tokens({"pad_token": "[PAD]"})
-    max_response_length = 48
     oai_h = TaskQueryHParams()
     if isinstance(oai_h.padding, str):
         oai_h.padding = tokenizer.encode(oai_h.padding)
     else:
         oai_h.padding = [oai_h.padding]
     pprint(oai_h)
-    dataset = load_dataset(oai_h.dataset)
+    dataset = load_dataset("vwxyzjn/summarize_from_feedback_tldr_3_filtered")
 
     def process_query_data(x):
         # with an extra leading space to account for the space between the query and response
@@ -105,14 +111,13 @@ if __name__ == "__main__":
             "reference_response_token": tokenizer.encode(
                 reference_response,
                 padding="max_length",
-                max_length=max_response_length,
+                max_length=args.max_response_length,
                 truncation=True,
             ),
         }
 
     dataset = dataset.map(process_query_data, load_from_cache_file=False)
-    push_result = dataset.push_to_hub("vwxyzjn/summarize_from_feedback_tldr_3_filtered_oai_preprocessing")
-    print(push_result)
+    dataset.push_to_hub(f"vwxyzjn/summarize_from_feedback_tldr_3_filtered_oai_preprocessing_{args.base_model.split('/')[-1]}_{args.max_response_length}")
 
     label = load_dataset("openai/summarize_from_feedback", "comparisons")
 
@@ -120,17 +125,23 @@ if __name__ == "__main__":
         # with an extra leading space to account for the space between the query and response
         response0 = f" {x['summaries'][0]['text']}<|endoftext|>"
         response1 = f" {x['summaries'][1]['text']}<|endoftext|>"
+        response0_policy = x["summaries"][0]["policy"]
+        response1_policy = x["summaries"][1]["policy"]
+        policies = "--".join(sorted([response0_policy, response1_policy]))
         return {
             **process_query(x["info"], encoder=tokenizer, hparams=oai_h),
             "response0": response0,
             "response0_token": tokenizer.encode(
-                response0, padding="max_length", max_length=max_response_length, truncation=True
+                response0, padding="max_length", max_length=args.max_response_length, truncation=True
             ),
             "response1": response1,
             "response1_token": tokenizer.encode(
-                response1, padding="max_length", max_length=max_response_length, truncation=True
+                response1, padding="max_length", max_length=args.max_response_length, truncation=True
             ),
+            "response0_policy": response0_policy,
+            "response1_policy": response1_policy,
+            "policies": policies,
         }
 
     label = label.map(process_response_data, load_from_cache_file=False)
-    push_result = label.push_to_hub("vwxyzjn/summarize_from_feedback_oai_preprocessing")
+    label.push_to_hub(f"vwxyzjn/summarize_from_feedback_oai_preprocessing_{args.base_model.split('/')[-1]}_{args.max_response_length}")

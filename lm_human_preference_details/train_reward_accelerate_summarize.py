@@ -16,7 +16,7 @@ import transformers
 import tyro
 from accelerate import Accelerator
 from accelerate.state import AcceleratorState
-from accelerate.utils import DistributedDataParallelKwargs
+from accelerate.utils import DistributedDataParallelKwargs, gather_object
 from datasets import load_dataset
 from rich.console import Console
 from rich.pretty import pprint
@@ -384,11 +384,7 @@ def get_reward(reward_model, query_responses, tokenizer):
 def evaluate(args, accelerator, tokenizer, reward_model, dataloader):
     reward_model.eval()
     with torch.no_grad():
-        # eval on validation_label, some duplicate code (I don't want to make the training loop into a function...)
-        accuracies = []
-        accuracy_splits = defaultdict(list)
-        accuracy_batches = defaultdict(list)
-        accuracy_confidences = defaultdict(list)
+        items = defaultdict(list)
         for data in tqdm(dataloader):
             mb_query = data["query_token"]
             mb_responses = torch.cat([data[f"response0_token"].unsqueeze(1), data[f"response1_token"].unsqueeze(1)], dim=1)
@@ -399,15 +395,24 @@ def evaluate(args, accelerator, tokenizer, reward_model, dataloader):
             predicted_reward = get_reward(reward_model, query_responses, tokenizer)
             predicted_reward = predicted_reward.view(-1, args.labels.num_labels)
             accuracy = (predicted_reward.argmax(1) == mb_best).float()
-            accuracies.append(accuracy.mean())
-            for batch, split, confidence, acc in zip(data["batch"], data["split"], data["extra"]["confidence"], accuracy):
-                acc_item = acc.item()
-                accuracy_splits[split].append(acc_item)
-                accuracy_batches[batch].append(acc_item)
-                accuracy_confidences[int(confidence)].append(acc_item)
-        accuracies = accelerator.gather(torch.stack(accuracies).mean()).mean().item()
+
+            for k in data:
+                data[k] = gather_object(data[k])
+            for i in range(len(accuracy)):
+                items["query"].append(tokenizer.decode(data["query_token"][i], skip_special_tokens=True))
+                items["response0"].append(tokenizer.decode(data["response0_token"][i]))
+                items["response1"].append(tokenizer.decode(data["response1_token"][i]))
+                items["batch"].append(data["batch"][i])
+                items["split"].append(data["split"][i])
+                items["confidence"].append(data["extra.confidence"][i].item())
+                items["choice"].append(data["choice"][i].item())
+                items["policies"].append(data["policies"][i])
+                items["response0_policy"].append(data["response0_policy"][i])
+                items["response1_policy"].append(data["response1_policy"][i])
+                items["accuracy"].append(accuracy[i].item())
+            breakpoint()
     reward_model.train()
-    return accuracies, accuracy_batches, accuracy_splits, accuracy_confidences
+    return pd.DataFrame(items)
 
 
 # def train(args: Args):
@@ -514,8 +519,8 @@ if __name__ == "__main__":
     label = label.with_format("torch", columns=["query_token", "choice", "response0_token", "response1_token", "batch", "split"])
     dataloader = DataLoader(label, batch_size=args.local_micro_batch_size)
     reward_model, optimizer, dataloader, scheduler = accelerator.prepare(reward_model, optimizer, dataloader, scheduler)
-    validation_label = load_dataset(args.label_dataset, "comparisons", split="validation")
-    validation_label = validation_label.with_format("torch", columns=["query_token", "choice", "response0_token", "response1_token", "batch", "split", "extra"])
+    validation_label = load_dataset(args.label_dataset, "comparisons", split="validation").flatten()
+    validation_label = validation_label.with_format("torch", columns=["query_token", "choice", "response0_token", "response1_token", "batch", "split", "extra.confidence", "response0_policy", "response1_policy", "policies"])
     validation_dataloader = DataLoader(validation_label, batch_size=args.local_eval_batch_size)
     validation_dataloader = accelerator.prepare(validation_dataloader)
 
@@ -572,18 +577,23 @@ if __name__ == "__main__":
                 accelerator.print(f"{train_accuracy=}, {scheduler.get_last_lr()=}, {update=}")
         # if args.print_sample_output_freq > 0 and global_step % args.print_sample_output_freq == 0:
 
-        accuracies, accuracy_batches, accuracy_splits, accuracy_confidences = evaluate(args, accelerator, tokenizer, reward_model, validation_dataloader)
-        for split, accs in accuracy_splits.items():
-            writer.add_scalar(f"eval/accuracy/{split}", np.mean(accs), global_step)
-            accelerator.print(f"{split} accuracy: {np.mean(accs)}")
-        for batch, accs in accuracy_batches.items():
-            writer.add_scalar(f"eval/accuracy/{batch}", np.mean(accs), global_step)
-            accelerator.print(f"{batch} accuracy: {np.mean(accs)}")
-        for confs, accs in accuracy_confidences.items():
-            writer.add_scalar(f"eval/confidence/{confs}", np.mean(accs), global_step)
-            accelerator.print(f"{confs} confidence: {np.mean(accs)}")
-        writer.add_scalar("eval/accuracy", accuracies, global_step)
-        accelerator.print(f"eval accuracy: {accuracies}")
+        evaluate_df = evaluate(args, accelerator, tokenizer, reward_model, validation_dataloader)
+        for split, row in evaluate_df[["split", "accuracy"]].groupby(["split"]).mean().iterrows():
+            writer.add_scalar(f"eval/accuracy/{split}", row["accuracy"], global_step)
+            accelerator.print(f"{split} accuracy: {row['accuracy']}")
+        for batch, row in evaluate_df[["batch", "accuracy"]].groupby(["batch"]).mean().iterrows():
+            writer.add_scalar(f"eval/accuracy/{batch}", row["accuracy"], global_step)
+            accelerator.print(f"{batch} accuracy: {row['accuracy']}")
+        for confi, row in evaluate_df[["confidence", "accuracy"]].groupby(["confidence"]).mean().iterrows():
+            writer.add_scalar(f"eval/confidence/{confi}", row["accuracy"], global_step)
+            accelerator.print(f"{confi} confidence: {row['accuracy']}")
+        writer.add_scalar("eval/accuracy", evaluate_df["accuracy"].mean(), global_step)
+        accelerator.print(f"eval accuracy: {evaluate_df['accuracy'].mean()}")
+        if accelerator.is_main_process:
+            os.makedirs(f"eval_tables/{run_name}", exist_ok=True)
+            evaluate_df.to_csv(f"eval_tables/{run_name}/eval_{update}.csv")
+            if args.track:
+                wandb.log({"samples/query_responses": wandb.Table(dataframe=evaluate_df)}, step=update)
 
 
     torch.cuda.empty_cache()

@@ -44,11 +44,10 @@ class SFTHParams:
     lr: float = 6.35e-5
     eps: float = 1e-5
     total_episodes: tyro.conf.Suppress[int] = None
+    micro_batch_size: tyro.conf.Suppress[int] = None
     local_batch_size: tyro.conf.Suppress[int] = None
     batch_size: tyro.conf.Suppress[int] = None
-    mini_batch_size: tyro.conf.Suppress[int] = None
     world_size: tyro.conf.Suppress[int] = None
-    batch_size: tyro.conf.Suppress[int] = None
     num_updates: tyro.conf.Suppress[int] = None
 
 
@@ -287,17 +286,6 @@ class AdamTensorFlowStyle(optim.Adam):
         return loss
 
 
-def shift_pad_id_left(data, pad_id):
-    # Step 1: Create a boolean mask
-    mask = (data == pad_id).long()
-    # Step 3: Use argsort on the inverted boolean mask to get sorted indices
-    sorted_indices = torch.argsort(~mask, axis=1)
-    # Step 4: Use advanced indexing to rearrange the elements
-    rows_range = torch.arange(data.shape[0], device=data.device)
-    shifted_data = data[rows_range[:, None], sorted_indices]
-    return shifted_data
-
-
 def right_padding_to_left_padding(tokens, pad_id):
     """Convert from right padding to left padding."""
     assert tokens.ndim == 2
@@ -446,11 +434,10 @@ if __name__ == "__main__":
     rouge = evaluate.load("rouge")
 
     print("===training policy===")
-    global_step = 0
     loss_stats = torch.zeros(args.sft.gradient_accumulation_steps, device=device)
-    gradient_accumulation_idx = 0
     policy.train()
-    # for update in range(1, args.sft.num_updates + 1):
+    gradient_accumulation_idx = 0
+    global_step = 0
     update = 0
     for data in dataloader:
         update += 1
