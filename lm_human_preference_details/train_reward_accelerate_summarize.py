@@ -41,25 +41,6 @@ class LabelHParams:
     source: str = None
 
 
-@dataclass
-class TaskHParams:
-    # Query params
-    query_length: int = 512
-    query_dataset: str = "vwxyzjn/summarize_from_feedback_tldr_3_filtered_oai_preprocessing"
-
-    query_format_str: Optional[str] = "SUBREDDIT: r/{subreddit}\n\nTITLE: {title}\n\nPOST: {post}\n\nTL;DR:"
-    query_truncate_field: Optional[str] = "post"
-    query_truncate_text: Optional[str] = "\n"
-    query_padding: Optional[str] = None  # defaults to repeated spaces
-    query_pad_side: Optional[str] = "left"
-
-    # Response params
-    response_length: int = 48
-
-    # LM params
-    temperature: float = 0.7
-
-
 # a patch
 @dataclass
 class TaskQueryHParams:
@@ -92,13 +73,13 @@ class Args:
     load_from_cache_file: bool = False
     """Whether to load data from the local cache file in `dataset.map`"""
 
-    base_model: str = "gpt2"
+    base_model: str = "EleutherAI/pythia-160m"
     """the name of the pretrained model to use"""
     dropout_layer_keys: List[str] = field(default_factory=lambda: ["attn_pdrop", "embd_pdrop", "resid_pdrop", "summary_first_dropout"])
     """Which layers to apply dropout to"""
     deepspeed: bool = False
     """Whether to use deepspeed to train the model"""
-    label_dataset: str = "vwxyzjn/summarize_from_feedback_oai_preprocessing"
+    label_dataset: str = "vwxyzjn/summarize_from_feedback_oai_preprocessing_pythia-160m_169"
     """the name of the dataset to use for labels in `https://huggingface.co/datasets/vwxyzjn/lm-human-preferences`"""
     local_batch_size: int = 8
     """per rank batch size"""
@@ -150,7 +131,6 @@ class Args:
     """Which scheduler to use"""
     warm_up_steps: int = 0
     """Number of warm up steps for the scheduler"""
-    task: TaskHParams = field(default_factory=TaskHParams)
     labels: LabelHParams = field(default_factory=LabelHParams)
 
 
@@ -344,13 +324,13 @@ class AutoModelForCausalLMWithRewardHead(nn.Module):
         return reward
 
 
-def left_padding_to_right_padding(tokens, pad_id):
-    """Convert from left padding to right padding."""
-    assert tokens.ndim == 2
-    return torch.tensor(
-        [[x for x in row if x != pad_id] + [pad_id] * (row == pad_id).sum() for row in tokens],
-        device=tokens.device,
-    )
+# def left_padding_to_right_padding(tokens, pad_id):
+#     """Convert from left padding to right padding."""
+#     assert tokens.ndim == 2
+#     return torch.tensor(
+#         [[x for x in row if x != pad_id] + [pad_id] * (row == pad_id).sum() for row in tokens],
+#         device=tokens.device,
+#     )
 
 
 def ceil_div(a, b):
@@ -391,7 +371,7 @@ def evaluate(args, accelerator, tokenizer, reward_model, dataloader):
             mb_best = data["choice"]
             mb_query_tiled = mb_query.unsqueeze(1).repeat(1, args.labels.num_labels, 1)
             query_responses = torch.cat([mb_query_tiled, mb_responses], dim=2).flatten(0, 1)
-            query_responses = left_padding_to_right_padding(query_responses, tokenizer.pad_token_id)
+            # query_responses = left_padding_to_right_padding(query_responses, tokenizer.pad_token_id)
             predicted_reward = get_reward(reward_model, query_responses, tokenizer)
             predicted_reward = predicted_reward.view(-1, args.labels.num_labels)
             accuracy = (predicted_reward.argmax(1) == mb_best).float()
@@ -542,7 +522,7 @@ if __name__ == "__main__":
             mb_best = data["choice"]
             mb_query_tiled = mb_query.unsqueeze(1).repeat(1, args.labels.num_labels, 1)
             query_responses = torch.cat([mb_query_tiled, mb_responses], dim=2).flatten(0, 1)
-            query_responses = left_padding_to_right_padding(query_responses, tokenizer.pad_token_id)
+            # query_responses = left_padding_to_right_padding(query_responses, tokenizer.pad_token_id)
             with accelerator.accumulate(reward_model):
                 predicted_reward = get_reward(reward_model, query_responses, tokenizer)
                 predicted_reward = predicted_reward.view(-1, args.labels.num_labels)

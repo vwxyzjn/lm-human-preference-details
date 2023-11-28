@@ -6,6 +6,9 @@ fi
 if [ -z "$MODEL" ]; then
     MODEL=EleutherAI/pythia-1b-deduped
 fi
+if [ -z "$LR" ]; then
+    LR=1.5e-5
+fi
 # SEED=3131
 # MODEL=EleutherAI/pythia-1b-deduped
 REWARD_MODEL_PATH=models/$MODEL/reward_model_$SEED
@@ -13,18 +16,19 @@ SFT_MODEL_PATH=models/$MODEL/sft_model_$SEED
 POLICY_MODEL_PATH=models/$MODEL/policy_model_$SEED
 poetry run accelerate launch --config_file deepspeed.yaml \
     lm_human_preference_details/train_sft_accelerate_summarize.py \
-    --task.query_dataset=vwxyzjn/summarize_from_feedback_tldr_3_filtered_oai_preprocessing_pythia-160m_48 \
+    --task.query_dataset=vwxyzjn/summarize_from_feedback_tldr_3_filtered_oai_preprocessing_pythia-160m_53 \
     --base_model=$MODEL \
+    --sft.lr=$LR \
     --deepspeed \
     --track \
-    --upload_model \
     --save_path=$SFT_MODEL_PATH \
     --seed=$SEED \
 
 poetry run accelerate launch --config_file deepspeed.yaml \
     lm_human_preference_details/train_reward_accelerate_summarize.py \
-    --label_dataset=vwxyzjn/summarize_from_feedback_oai_preprocessing_pythia-160m_48 \
+    --label_dataset=vwxyzjn/summarize_from_feedback_oai_preprocessing_pythia-160m_169 \
     --base_model=$MODEL \
+    --lr=$LR \
     --no_normalize_before --no_normalize_after \
     --local_batch_size=8 \
     --gradient_accumulation_steps=8 \

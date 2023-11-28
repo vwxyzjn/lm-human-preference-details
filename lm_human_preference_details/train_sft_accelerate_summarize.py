@@ -55,7 +55,7 @@ class SFTHParams:
 class TaskHParams:
     # Query params
     query_length: int = 512
-    query_dataset: str = "vwxyzjn/summarize_from_feedback_tldr_3_filtered_oai_preprocessing"
+    query_dataset: str = "vwxyzjn/summarize_from_feedback_tldr_3_filtered_oai_preprocessing_pythia-160m_53"
 
     query_format_str: Optional[str] = "SUBREDDIT: r/{subreddit}\n\nTITLE: {title}\n\nPOST: {post}\n\nTL;DR:"
     query_truncate_field: Optional[str] = "post"
@@ -64,7 +64,7 @@ class TaskHParams:
     query_pad_side: Optional[str] = "left"
 
     # Response params
-    response_length: int = 48
+    response_length: int = 53
 
     # Truncate response after the first occurrence of this token at or after index after when sampling.
     truncate_token: int = 50256  # EOS token
@@ -99,7 +99,7 @@ class Args:
     hf_entity: str = ""
     "the user or org name of the model repository from the Hugging Face Hub"
 
-    base_model: str = "gpt2"
+    base_model: str = "EleutherAI/pythia-160m"
     """the name of the pretrained model to use"""
     dropout_layer_keys: List[str] = field(default_factory=lambda: ["attn_pdrop", "embd_pdrop", "resid_pdrop", "summary_first_dropout"])
     """Which layers to apply dropout to"""
@@ -286,23 +286,6 @@ class AdamTensorFlowStyle(optim.Adam):
         return loss
 
 
-def right_padding_to_left_padding(tokens, pad_id):
-    """Convert from right padding to left padding."""
-    assert tokens.ndim == 2
-    return torch.tensor(
-        [[pad_id] * (row == pad_id).sum() + [x for x in row if x != pad_id] for row in tokens],
-        device=tokens.device,
-    )
-
-def left_padding_to_right_padding(tokens, pad_id):
-    """Convert from left padding to right padding."""
-    assert tokens.ndim == 2
-    return torch.tensor(
-        [[x for x in row if x != pad_id] + [pad_id] * (row == pad_id).sum() for row in tokens],
-        device=tokens.device,
-    )
-
-
 def ceil_div(a, b):
     return (a - 1) // b + 1
 
@@ -445,7 +428,6 @@ if __name__ == "__main__":
         reference_responses = data["reference_response_token"].to(device, non_blocking=True)
         queries = data["query_token"].to(device, non_blocking=True)
         query_responses = torch.cat((queries, reference_responses), dim=1)
-        query_responses = left_padding_to_right_padding(query_responses, tokenizer.pad_token_id)
         with accelerator.accumulate(policy):
             output = forward(policy, query_responses, tokenizer)
             # mask out gradient effects on response padding tokens
@@ -478,11 +460,9 @@ if __name__ == "__main__":
         with torch.no_grad():
             validation_reference_responses = validation_data["reference_response_token"].to(device, non_blocking=True)
             validation_queries = validation_data["query_token"].to(device, non_blocking=True)
-            # validation_queries = right_padding_to_left_padding(validation_queries, tokenizer.pad_token_id) # not necessary
             validation_query_reference_responses = torch.cat(
                 (validation_queries, validation_reference_responses), dim=1
             )
-            validation_query_reference_responses = left_padding_to_right_padding(validation_query_reference_responses, tokenizer.pad_token_id)
 
             validation_output = forward(policy, validation_query_reference_responses, tokenizer)
             validation_labels = validation_query_reference_responses.masked_fill(
