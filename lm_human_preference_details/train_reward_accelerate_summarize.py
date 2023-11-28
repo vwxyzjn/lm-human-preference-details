@@ -81,7 +81,7 @@ class Args:
     """seed of the experiment"""
     track: bool = False
     """if toggled, this experiment will be tracked with Weights and Biases"""
-    wandb_project_name: str = "cleanrl"
+    wandb_project_name: str = "tldr_summarize"
     """the wandb's project name"""
     wandb_entity: Optional[str] = None
     """the entity (team) of wandb's project"""
@@ -410,7 +410,6 @@ def evaluate(args, accelerator, tokenizer, reward_model, dataloader):
                 items["response0_policy"].append(data["response0_policy"][i])
                 items["response1_policy"].append(data["response1_policy"][i])
                 items["accuracy"].append(accuracy[i].item())
-            breakpoint()
     reward_model.train()
     return pd.DataFrame(items)
 
