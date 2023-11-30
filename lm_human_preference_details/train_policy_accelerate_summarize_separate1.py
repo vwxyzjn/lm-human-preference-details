@@ -408,6 +408,38 @@ def generate(lm_backbone, queries, tokenizer, generation_config):
     return torch.cat((queries, output.sequences[:, context_length:]), dim=1)
 
 
+def get_reward(reward_model, query_responses, tokenizer):
+    attention_mask = query_responses != tokenizer.pad_token_id
+    # position_ids = attention_mask.cumsum(1) - attention_mask.long()  # exclusive cumsum
+    input_ids = torch.masked_fill(query_responses, ~attention_mask, 0)
+    reward_logits = reward_model(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        # position_ids=position_ids,
+        return_dict=True,
+        output_hidden_states=True,
+    )
+    sequence_lengths = (
+        torch.eq(query_responses, tokenizer.pad_token_id).long().argmax(-1) - 1).to(
+        query_responses.device
+    )
+    # https://github.com/huggingface/transformers/blob/dc68a39c8111217683bf49a4912d0c9018bab33d/src/transformers/models/gpt2/modeling_gpt2.py#L1454
+    return reward_logits, reward_logits[torch.arange(reward_logits.size(0), device=reward_logits.device), sequence_lengths].squeeze(-1), sequence_lengths
+
+
+def forward(policy, query_responses, tokenizer):
+    attention_mask = query_responses != tokenizer.pad_token_id
+    # position_ids = attention_mask.cumsum(1) - attention_mask.long()  # exclusive cumsum
+    input_ids = torch.masked_fill(query_responses, ~attention_mask, 0)
+    return policy(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        # position_ids=position_ids,
+        return_dict=True,
+        output_hidden_states=True,
+    )
+
+
 def first_true_indices(bools, dtype=torch.long):
     """
     Takes an N-dimensional bool tensor and returns an (N-1)-dimensional tensor of integers giving
@@ -430,41 +462,6 @@ def truncate_response(args, tokenizer, responses):
 
 def masked_mean(x, mask):
     return (x.sum(-1) / (~mask).sum(-1)).mean()
-
-
-def get_reward(reward_model, query_responses, tokenizer):
-    attention_mask = query_responses != tokenizer.pad_token_id
-    # position_ids = attention_mask.cumsum(1) - attention_mask.long()  # exclusive cumsum
-    input_ids = torch.masked_fill(query_responses, ~attention_mask, 0)
-    reward_logits = reward_model(
-        input_ids=input_ids,
-        attention_mask=attention_mask,
-        # position_ids=position_ids,
-        return_dict=True,
-        output_hidden_states=True,
-    )
-    sequence_lengths = first_true_indices(query_responses == tokenizer.pad_token_id) - 1
-    # sequence_lengths1 = (
-    #     torch.eq(query_responses, tokenizer.pad_token_id).long().argmax(-1) - 1).to(
-    #     query_responses.device
-    # )
-    # print(f"======={sequence_lengths1=} {sequence_lengths=}")
-    # https://github.com/huggingface/transformers/blob/dc68a39c8111217683bf49a4912d0c9018bab33d/src/transformers/models/gpt2/modeling_gpt2.py#L1454
-    return reward_logits, reward_logits[torch.arange(reward_logits.size(0), device=reward_logits.device), sequence_lengths].squeeze(-1), sequence_lengths
-
-
-def forward(policy, query_responses, tokenizer):
-    attention_mask = query_responses != tokenizer.pad_token_id
-    # position_ids = attention_mask.cumsum(1) - attention_mask.long()  # exclusive cumsum
-    input_ids = torch.masked_fill(query_responses, ~attention_mask, 0)
-    return policy(
-        input_ids=input_ids,
-        attention_mask=attention_mask,
-        # position_ids=position_ids,
-        return_dict=True,
-        output_hidden_states=True,
-    )
-
 
 # def train(args: Args):
 if __name__ == "__main__":
@@ -796,12 +793,7 @@ if __name__ == "__main__":
             kl = logprobs - ref_logprobs
             non_score_reward = -kl_ctl.value * kl
             rewards = non_score_reward.clone()
-            # print(f"{sequence_lengths=}")
-            # breakpoint()
-            # rewards[:, -1] += scores
-            actual_start = torch.arange(rewards.size(0), device=rewards.device)
-            actual_end = sequence_lengths - context_length
-            rewards[[actual_start, actual_end]] += scores
+            rewards[:, -1] += scores
 
             # 5. whiten rewards
             if args.ppo.whiten_rewards:
@@ -906,8 +898,8 @@ if __name__ == "__main__":
                         vf_loss_max = torch.max(vf_losses1, vf_losses2)
                         
                         
-                        # vf_loss = 0.5 * vf_loss_max.mean()
-                        vf_loss = 0.5 * masked_mean(vf_loss_max, padding_mask[micro_batch_inds])
+                        vf_loss = 0.5 * vf_loss_max.mean()
+                        # vf_loss = 0.5 * masked_mean(vf_loss_max, padding_mask[micro_batch_inds])
 
                         vf_clipfrac = masked_mean((vf_losses2 > vf_losses1).float(), padding_mask[micro_batch_inds])
                         logprobs_diff = new_logprobs - mb_logprobs
@@ -915,59 +907,59 @@ if __name__ == "__main__":
                         pg_losses = -mb_advantage * ratio
                         pg_losses2 = -mb_advantage * torch.clamp(ratio, 1.0 - args.ppo.cliprange, 1.0 + args.ppo.cliprange)
                         pg_loss_max = torch.max(pg_losses, pg_losses2)
-                        # pg_loss = pg_loss_max.mean()
-                        pg_loss = masked_mean(pg_loss_max, padding_mask[micro_batch_inds])
+                        pg_loss = pg_loss_max.mean()
+                        # pg_loss = masked_mean(pg_loss_max, padding_mask[micro_batch_inds])
                         pg_clipfrac = masked_mean((pg_losses2 > pg_losses).float(), padding_mask[micro_batch_inds])
                         loss = pg_loss + args.ppo.vf_coef * vf_loss
                         accelerator.backward(loss)
                         optimizer.step()
                         optimizer.zero_grad()
-                        # TODO: entropy does not handle padding tokens properly yet
                         prob_dist = torch.nn.functional.softmax(logits, dim=-1)
                         entropy = torch.logsumexp(logits, dim=-1) - torch.sum(prob_dist * logits, dim=-1)
-                        # approxkl = 0.5 * (logprobs_diff**2).mean()
-                        approxkl = 0.5 * masked_mean((logprobs_diff**2), padding_mask[micro_batch_inds])
+                        approxkl = 0.5 * (logprobs_diff**2).mean()
+                        # approxkl = 0.5 * masked_mean((logprobs_diff**2), padding_mask[micro_batch_inds])
                         # if ppo_epoch_idx == 0 and micro_batch_start == 0:
                         #     torch.testing.assert_close(ratio, torch.zeros_like(ratio) + 1, atol=1e-4, rtol=1e-4)
-                        # pprint({
-                        #     "responses": responses,
-                        #     "values": values,
-                        #     "rewards": rewards,
-                        #     "scores": scores,
-                        #     "advantages": advantages,
-                        #     "ratio": ratio,
-                        #     "pg_losses": pg_losses,
-                        #     "approxkl": approxkl,
-                        #     "pg_loss": pg_loss,
-                        #     "pg_clipfrac": pg_clipfrac,
-                        #     "ratio": ratio.mean(),
-                        #     "vf_loss": vf_loss,
-                        #     "vf_clipfrac": vf_clipfrac,
-                        #     "entropy": masked_mean(entropy, padding_mask[micro_batch_inds]),
-                        # })
+                        pprint({
+                            "responses": responses,
+                            "values": values,
+                            "rewards": rewards,
+                            "scores": scores,
+                            "advantages": advantages,
+                            "ratio": ratio,
+                            "pg_losses": pg_losses,
+                            "approxkl": approxkl,
+                            "pg_loss": pg_loss,
+                            "pg_clipfrac": pg_clipfrac,
+                            "ratio": ratio.mean(),
+                            "vf_loss": vf_loss,
+                            "vf_clipfrac": vf_clipfrac,
+                            "entropy": entropy.mean(),
+                        })
                         with torch.no_grad():
                             approxkl_stats[ppo_epoch_idx, minibatch_idx, gradient_accumulation_idx] = approxkl
                             pg_clipfrac_stats[ppo_epoch_idx, minibatch_idx, gradient_accumulation_idx] = pg_clipfrac
                             pg_loss_stats[ppo_epoch_idx, minibatch_idx, gradient_accumulation_idx] = pg_loss
                             vf_loss_stats[ppo_epoch_idx, minibatch_idx, gradient_accumulation_idx] = vf_loss
                             vf_clipfrac_stats[ppo_epoch_idx, minibatch_idx, gradient_accumulation_idx] = vf_clipfrac
-                            entropy_stats[ppo_epoch_idx, minibatch_idx, gradient_accumulation_idx] = masked_mean(entropy, padding_mask[micro_batch_inds])
+                            entropy_stats[ppo_epoch_idx, minibatch_idx, gradient_accumulation_idx] = entropy.mean()
                             ratio_stats[ppo_epoch_idx, minibatch_idx, gradient_accumulation_idx] = ratio.mean()
                     gradient_accumulation_idx += 1
-                minibatch_idx += 1
-                if accelerator.is_main_process:
-                    console.print(
-                        f"ppo_epoch_idx",
-                        ppo_epoch_idx,
-                        "approxkl",
-                        approxkl_stats[:ppo_epoch_idx+1].mean().item(),
-                        "pg_loss",
-                        pg_loss_stats[:ppo_epoch_idx+1].mean().item(),
-                        "pg_clipfrac",
-                        pg_clipfrac_stats[:ppo_epoch_idx+1].mean().item(),
-                        "ratio",
-                        ratio_stats[:ppo_epoch_idx+1].mean().item(),
-                    )
+        raise
+                # minibatch_idx += 1
+                # if accelerator.is_main_process:
+                #     console.print(
+                #         f"ppo_epoch_idx",
+                #         ppo_epoch_idx,
+                #         "approxkl",
+                #         approxkl_stats[:ppo_epoch_idx+1].mean().item(),
+                #         "pg_loss",
+                #         pg_loss_stats[:ppo_epoch_idx+1].mean().item(),
+                #         "pg_clipfrac",
+                #         pg_clipfrac_stats[:ppo_epoch_idx+1].mean().item(),
+                #         "ratio",
+                #         ratio_stats[:ppo_epoch_idx+1].mean().item(),
+                #     )
 
         with torch.no_grad():
             if not args.deepspeed:  # for some reason there is a OOM with the `writer.add_histogram`
