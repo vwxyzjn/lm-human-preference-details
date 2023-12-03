@@ -353,6 +353,57 @@ def whiten(values, shift_mean=True):
     return whitened
 
 
+def masked_mean(x, mask):
+    return (x.sum(-1) / (~mask).sum(-1)).mean()
+
+def masked_var(x, mask):
+    return (x**2).sum(-1) / (~mask).sum(-1) - masked_mean(x, mask)**2
+
+
+def masked_whiten(values, mask, shift_mean=True):
+    """Whiten values with masked values."""
+    mean, var = masked_mean(values, mask), masked_var(values, mask)
+    whitened = (values - mean) * torch.rsqrt(var + 1e-8)
+    if not shift_mean:
+        whitened += mean
+    return whitened
+    
+
+def masked_mean(values, mask, axis=None):
+    """Compute mean of tensor with a masked values."""
+    if axis is not None:
+        return (values * mask).sum(axis=axis) / mask.sum(axis=axis)
+    else:
+        return (values * mask).sum() / mask.sum()
+
+def masked_var(values, mask, unbiased=True):
+    """Compute variance of tensor with masked values."""
+    mean = masked_mean(values, mask)
+    centered_values = values - mean
+    variance = masked_mean(centered_values**2, mask)
+    if unbiased:
+        mask_sum = mask.sum()
+        if mask_sum == 0:
+            raise ValueError(
+                "The sum of the mask is zero, which can happen when `mini_batch_size=1`;"
+                "try increase the `mini_batch_size` or `gradient_accumulation_steps`"
+            )
+        # note that if mask_sum == 1, then there is a division by zero issue
+        # to avoid it you just need to use a larger minibatch_size
+        bessel_correction = mask_sum / (mask_sum - 1)
+        variance = variance * bessel_correction
+    return variance
+
+
+def masked_whiten(values, mask, shift_mean=True):
+    """Whiten values with masked values."""
+    mean, var = masked_mean(values, mask), masked_var(values, mask, False)
+    whitened = (values - mean) * torch.rsqrt(var + 1e-8)
+    if not shift_mean:
+        whitened += mean
+    return whitened
+
+
 class AutoModelForCausalLMWithRewardHead(nn.Module):
     def __init__(self, lm_backbone):
         super().__init__()
@@ -426,10 +477,6 @@ def truncate_response(args, tokenizer, responses):
     idxs = torch.arange(args.task.response_length, device=responses.device).view(*new_size)
     postprocessed_responses = torch.masked_fill(responses, idxs > trunc_idxs, tokenizer.pad_token_id)
     return postprocessed_responses
-
-
-def masked_mean(x, mask):
-    return (x.sum(-1) / (~mask).sum(-1)).mean()
 
 
 def get_reward(reward_model, query_responses, tokenizer):
@@ -643,8 +690,7 @@ if __name__ == "__main__":
     vf_clipfrac_stats = torch.zeros(stats_shape, device=device)
     entropy_stats = torch.zeros(stats_shape, device=device)
     ratio_stats = torch.zeros(stats_shape, device=device)
-    
-    model.train()
+    model.eval()
     for update in range(1, args.ppo.num_updates + 1):
         global_step += 1 * args.ppo.batch_size
         frac = 1.0 - (update - 1.0) / args.ppo.num_updates
@@ -663,61 +709,6 @@ if __name__ == "__main__":
                 tokenizer,
                 generation_config,
             )
-            if args.task.response_length != 53:
-                query_responses = torch.tensor([[  209,   209,   209,   209,   209,   209,   209,   209,   209,   209,
-                209,   209,   209,   209,   209,   209,   209,   209,   209,   209,
-                209,   209,   209,   209,   209,   209,   209,   209,   209,   209,
-                209,   209,   209,   209,   209,   209,   209,   209,   209,   209,
-                209,   209,   209,   209,   209,   209,   209,   209,   209,   209,
-                209,   209,   209,   209,   209,   209,   209,   209,   209,   209,
-                209,   209,   209,   209,   209,   209,   209,   209,   209,   209,
-                209,   209,   209,   209,   209,   209,   209,   209,   209,   209,
-                209,   209,   209,   209,   209,   209,   209,   209,   209,   209,
-                209,   209,   209,   209,   209,   209,   209,   209,   209,   209,
-                209,   209,   209,   209,   209,   209,   209,   209,   209,   209,
-                209,   209,   209,   209,   209,   209,   209,   209,   209,   209,
-                209,   209,   209,   209,   209,   209,   209,   209,   209,   209,
-                209,   209,   209,   209,   209,   209,   209,   209,   209,   209,
-                209,   209,   209,   209,   209,   209,  6971,  7941,  1703,    37,
-                1433,    27,   391,    16, 22842, 16458,   187,   187,    53, 43561,
-                    27,  3189,   544,  1348,   278,    62,  5816,   619,   806,   385,
-                544,  1797,   269,    62,   846,   608,  2607,   273,  2740,   598,
-                    15,   187,   187, 15743,    27, 24387, 39714,   187,  6300, 15950,
-                436,  1501,   562,   627,   816,   281,  1339,   352,   562,   273,
-                619,   985,    15,   187,  2598,   309,   452,   644, 13597,   436,
-                3226,   313,  2577,   806, 19609,    15,   309,   369,   617,   806,
-                    10,   323,   495,  1107,    15,   844,   574,   271, 13103,   673,
-                285,  4536,  7227, 35267,   285, 37616,    15,   496,   253,   990,
-                    13,   352,  1904,   626,   789,   562,    15,   187,    42,  3260,
-                309,  7636,   617,   285,   703,  7636,   479,   533,  1841,   816,
-                1904,   626,   789,   562,  1955,   281,  1097,  4858,  4606,    15,
-                187,   187,  2598,   352,   556,   644,  2761,   608,  2607,    15,
-                309,  1694,   689,   253, 31056,   673,   273,   619,  1495,   534,
-                369,  1501,  2740,   598,   273,   806,   374,  2607,    15,   209,
-                187,  4125,   846,   608,  2607,    13,   309,   816,  2985,   617,
-                    15,   187,    42,  5476,   627, 11210,   626,   644,   247,  2014,
-                835,   309,  6468,   626,  1869,   670,   617,  2568,    15, 23385,
-                50276,   187,    42,   871,   309, 10095,   626,  3057,   617,   285,
-                309,  1353,  3965,  2119,   703,  1912,   626,  3057,   479,  2057,
-                534,   310,   323,   253,  1805,    15,   187,  1231,  6468,   626,
-                13452,   323,  5046,   374,  2607,    32,  1633,   751,   326,    15,
-                187, 43688,    13,   309,   816,  4571,   626,  6016,   352, 10542,
-                285,  3261,   387,   776,  7963,   327,   619, 17899,  7963,   534,
-                309,  1620,   755,   327,    15,   187,  1147,   369,  5322,   281,
-                923,   617,  2454,   969,   285, 30774,   336,   253,  1711,  1897,
-                    15,   187,  1147,   369,  5322,   281,   923,   253,  9097,   359,
-                1097,  2389,  1024,  3811,   342,   617,  2021,    15,   187, 34937,
-                512,   608,  2607,    13,   619,  5249,  5055,   598,    15,   309,
-                1694,   247, 14892,   209,   187, 36421,   598,   247,  2257,   273,
-                2583,   285,   858,  1841,  1475,   253,  2419,   309,  6468,   626,
-                644,  2104,   281,  3966,  3966,    15,   187,  1989,   309,   816,
-                2985,   617,    15,   187,    42,   871,   703,   434,  2509,   973,
-                    13,  3164,  1805,   685,  1078,    15,   187,  2513,   352,   816,
-                479,    32,   209,   187, 25954,  6701,   323,   634,   673,  4361,
-                436,   285, 11435,   634,  5701,    15,   187,   187, 14135,    28,
-                4976,    27,  6365,   619,   806, 19609,    13,  9377,   598,    13,
-                309,  2985,   617,   533,  1053,   626,  3057,   617,   285, 12371,
-                604,   352,   434,   816,   479,    15,     0,]], device=device)
             context_length = queries.shape[1]
             responses = query_responses[:, context_length:]
 
@@ -781,31 +772,26 @@ if __name__ == "__main__":
             # responses not passing that filter will receive a low (fixed) score
             # only query humans on responses that pass that filter
             contain_pad_token = torch.any(postprocessed_responses == tokenizer.pad_token_id, dim=-1)
-            
-            
-            
-            # TODO: reverse it back
-            # scores = torch.where(contain_pad_token, scores, torch.full_like(scores, args.task.penalty_reward_value))
-            
-            
-            
-            
+            scores = torch.where(contain_pad_token, scores, torch.full_like(scores, args.task.penalty_reward_value))
+            accelerator.print(f"{scores=}, {(contain_pad_token.sum() / len(contain_pad_token))=}")
             torch.cuda.empty_cache()
 
             # 4. compute rewards
             kl = logprobs - ref_logprobs
+            kl = torch.masked_fill(kl, padding_mask, 0)
             non_score_reward = -kl_ctl.value * kl
             rewards = non_score_reward.clone()
-            # print(f"{sequence_lengths=}")
-            # breakpoint()
-            # rewards[:, -1] += scores
             actual_start = torch.arange(rewards.size(0), device=rewards.device)
             actual_end = sequence_lengths - context_length
             rewards[[actual_start, actual_end]] += scores
 
+            mean_kl = kl.sum(1).mean()
+            accelerator.print(f"{mean_kl=}, {(logprobs - ref_logprobs).sum(1).mean()}")
+            # if update == 2: raise
             # 5. whiten rewards
             if args.ppo.whiten_rewards:
-                rewards = whiten(rewards, shift_mean=False)
+                rewards = masked_whiten(rewards, mask=~padding_mask, shift_mean=False)
+                rewards = torch.masked_fill(rewards, padding_mask, 0)
 
             if args.print_sample_output_freq > 0 and (update - 1) % args.print_sample_output_freq == 0:
                 try:
@@ -829,9 +815,11 @@ if __name__ == "__main__":
                             "reference_scores": sample_validation_reference_scores.float().cpu().numpy(),
                         }
                     )
-                    if accelerator.is_main_process and args.track:
-                        wandb.log({"samples/query_responses": wandb.Table(dataframe=all_sample_validation_df)}, step=update)
-                    # print_rich_table("stuff", all_sample_validation_df[:4], console)
+                    if accelerator.is_main_process:
+                        all_sample_validation_df.to_json(f"runs/{run_name}/table.json")
+                        if args.track:
+                            wandb.log({"samples/query_responses": wandb.Table(dataframe=all_sample_validation_df)}, step=update)
+                    print_rich_table("stuff", all_sample_validation_df[:4], console)
 
                 except Exception as e:
                     print(e)
@@ -856,19 +844,22 @@ if __name__ == "__main__":
             advantages = torch.stack(advantages_reversed[::-1], axis=1)
             returns = advantages + values
 
-
-
-
-            # TODO: reverse it back
-            # advantages = whiten(advantages)
-
-
-
-
+            # TODO: reversed back 
+            advantages = masked_whiten(advantages, ~padding_mask)
+            advantages = torch.masked_fill(advantages, padding_mask, 0)
 
             return_mean, return_var = returns.mean(), returns.var()
             value_mean, value_var = values.mean(), values.var()
-
+            writer.add_histogram("rewards", rewards[0].float(), global_step)
+            writer.add_histogram("advantages", advantages[0].float(), global_step)
+            accelerator.print("rewards====", rewards[0])
+            accelerator.print("advantages====", advantages[0])
+            # pprint({
+            #     "rewards": rewards,
+            #     "returns": returns,
+            #     "advantages": advantages,
+            # })
+            # breakpoint()
         # Do multiple epochs of PPO training, with a fresh random shuffle in each epoch
         for ppo_epoch_idx in range(args.ppo.noptepochs):
             b_inds = np.random.permutation(args.ppo.local_batch_size)
@@ -893,8 +884,8 @@ if __name__ == "__main__":
                         logits /= args.task.temperature + 1e-7
                         new_all_logprobs = F.log_softmax(logits, dim=-1)
                         new_logprobs = torch.gather(new_all_logprobs, 2, mb_responses.unsqueeze(-1)).squeeze(-1)
-                        vpred = vpred_temp[:, context_length - 1 : -1].squeeze(-1)
                         new_logprobs = torch.masked_fill(new_logprobs, padding_mask[micro_batch_inds], INVALID_LOGPROB)
+                        vpred = vpred_temp[:, context_length - 1 : -1].squeeze(-1)
                         vpred = torch.masked_fill(vpred, padding_mask[micro_batch_inds], 0)
                         vpredclipped = torch.clamp(
                             vpred,
@@ -907,17 +898,16 @@ if __name__ == "__main__":
                         
                         
                         # vf_loss = 0.5 * vf_loss_max.mean()
-                        vf_loss = 0.5 * masked_mean(vf_loss_max, padding_mask[micro_batch_inds])
-
-                        vf_clipfrac = masked_mean((vf_losses2 > vf_losses1).float(), padding_mask[micro_batch_inds])
+                        vf_loss = 0.5 * masked_mean(vf_loss_max, ~padding_mask[micro_batch_inds])
+                        vf_clipfrac = masked_mean((vf_losses2 > vf_losses1).float(), ~padding_mask[micro_batch_inds])
                         logprobs_diff = new_logprobs - mb_logprobs
                         ratio = torch.exp(logprobs_diff)
                         pg_losses = -mb_advantage * ratio
                         pg_losses2 = -mb_advantage * torch.clamp(ratio, 1.0 - args.ppo.cliprange, 1.0 + args.ppo.cliprange)
                         pg_loss_max = torch.max(pg_losses, pg_losses2)
                         # pg_loss = pg_loss_max.mean()
-                        pg_loss = masked_mean(pg_loss_max, padding_mask[micro_batch_inds])
-                        pg_clipfrac = masked_mean((pg_losses2 > pg_losses).float(), padding_mask[micro_batch_inds])
+                        pg_loss = masked_mean(pg_loss_max, ~padding_mask[micro_batch_inds])
+                        pg_clipfrac = masked_mean((pg_losses2 > pg_losses).float(), ~padding_mask[micro_batch_inds])
                         loss = pg_loss + args.ppo.vf_coef * vf_loss
                         accelerator.backward(loss)
                         optimizer.step()
@@ -926,25 +916,27 @@ if __name__ == "__main__":
                         prob_dist = torch.nn.functional.softmax(logits, dim=-1)
                         entropy = torch.logsumexp(logits, dim=-1) - torch.sum(prob_dist * logits, dim=-1)
                         # approxkl = 0.5 * (logprobs_diff**2).mean()
-                        approxkl = 0.5 * masked_mean((logprobs_diff**2), padding_mask[micro_batch_inds])
+                        approxkl = 0.5 * masked_mean((logprobs_diff**2), ~padding_mask[micro_batch_inds])
                         # if ppo_epoch_idx == 0 and micro_batch_start == 0:
                         #     torch.testing.assert_close(ratio, torch.zeros_like(ratio) + 1, atol=1e-4, rtol=1e-4)
-                        # pprint({
-                        #     "responses": responses,
-                        #     "values": values,
-                        #     "rewards": rewards,
-                        #     "scores": scores,
-                        #     "advantages": advantages,
-                        #     "ratio": ratio,
-                        #     "pg_losses": pg_losses,
-                        #     "approxkl": approxkl,
-                        #     "pg_loss": pg_loss,
-                        #     "pg_clipfrac": pg_clipfrac,
-                        #     "ratio": ratio.mean(),
-                        #     "vf_loss": vf_loss,
-                        #     "vf_clipfrac": vf_clipfrac,
-                        #     "entropy": masked_mean(entropy, padding_mask[micro_batch_inds]),
-                        # })
+                        # if ppo_epoch_idx == 0: 
+                        #     pprint({
+                        #         # "responses": responses,
+                        #         # "values": values,
+                        #         "rewards": rewards,
+                        #         # "scores": scores,
+                        #         "advantages": advantages,
+                        #         # "ratio": ratio,
+                        #         # "pg_losses": pg_losses,
+                        #         # "approxkl": approxkl,
+                        #         # "pg_loss": pg_loss,
+                        #         # "pg_clipfrac": pg_clipfrac,
+                        #         # "ratio": ratio.mean(),
+                        #         # "vf_loss": vf_loss,
+                        #         # "vf_clipfrac": vf_clipfrac,
+                        #         # "entropy": masked_mean(entropy, ~padding_mask[micro_batch_inds]),
+                        #     })
+                        #     breakpoint()
                         with torch.no_grad():
                             approxkl_stats[ppo_epoch_idx, minibatch_idx, gradient_accumulation_idx] = approxkl
                             pg_clipfrac_stats[ppo_epoch_idx, minibatch_idx, gradient_accumulation_idx] = pg_clipfrac
@@ -954,6 +946,7 @@ if __name__ == "__main__":
                             entropy_stats[ppo_epoch_idx, minibatch_idx, gradient_accumulation_idx] = masked_mean(entropy, padding_mask[micro_batch_inds])
                             ratio_stats[ppo_epoch_idx, minibatch_idx, gradient_accumulation_idx] = ratio.mean()
                     gradient_accumulation_idx += 1
+
                 minibatch_idx += 1
                 if accelerator.is_main_process:
                     console.print(
@@ -968,11 +961,10 @@ if __name__ == "__main__":
                         "ratio",
                         ratio_stats[:ppo_epoch_idx+1].mean().item(),
                     )
-
+        # breakpoint()
         with torch.no_grad():
             if not args.deepspeed:  # for some reason there is a OOM with the `writer.add_histogram`
                 writer.add_histogram("ppo/val/ratio_hist", ratio, update)
-            kl = logprobs - ref_logprobs
             mean_kl = kl.sum(1).mean()
             mean_entropy = (-logprobs).sum(1).mean()
             mean_non_score_reward = non_score_reward.sum(1).mean()
