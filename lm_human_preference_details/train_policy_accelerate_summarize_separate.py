@@ -595,6 +595,10 @@ if __name__ == "__main__":
     # each class should have a separate pretrained model that do not share weights
     ref_policy = AutoModelForCausalLM.from_pretrained(args.base_model, config=model_config, trust_remote_code=True)
     policy = AutoModelForCausalLM.from_pretrained(args.base_model, config=model_config, trust_remote_code=True)
+    # policy.gradient_checkpointing_enable()
+    # accelerator.print(policy)
+    # critic.lm_backbone.gradient_checkpointing_enable()
+    # accelerator.print(critic)
     if args.sft_model_path:
         policy.load_state_dict(torch.load(args.sft_model_path, map_location=device))
         ref_policy.load_state_dict(torch.load(args.sft_model_path, map_location=device))
@@ -624,20 +628,23 @@ if __name__ == "__main__":
         deepspeed_states = AcceleratorState().deepspeed_plugin
         # deepspeed_states.deepspeed_config["train_micro_batch_size_per_gpu"] = args.ppo.local_micro_batch_size
         # deepspeed_states.deepspeed_config["checkpoint"] = {"use_node_local_storage": True}
+
+        offload = False
         eval_ds_config = {
             "train_micro_batch_size_per_gpu": deepspeed_states.deepspeed_config["train_micro_batch_size_per_gpu"],
-            # "steps_per_print": 10,
-            # "zero_optimization": {
-            #     "stage": stage,
-            #     "stage3_param_persistence_threshold": 1e4,
-            #     "offload_param": {
-            #         "device": off_load_device
-            #     }
-            # },
             "bf16": {"enabled": True},
             "prescale_gradients": False,
             "wall_clock_breakdown": False,
         }
+        if offload:
+            eval_ds_config["zero_optimization"] = {
+                "stage": 3,
+                "stage3_param_persistence_threshold": 1e4,
+                "offload_param": {
+                    "device": "cpu"
+                }
+            }
+        accelerator.print(f"{eval_ds_config=}")
         reward_model, *_ = deepspeed.initialize(model=reward_model, config=eval_ds_config)
         reward_model.eval()
         ref_policy, *_ = deepspeed.initialize(model=ref_policy, config=eval_ds_config)
@@ -754,7 +761,7 @@ if __name__ == "__main__":
             postprocessed_query_responses = torch.cat((queries, postprocessed_responses), 1)
             # postprocessed_query_responses = shift_pad_id_left(postprocessed_query_responses, tokenizer.pad_token_id)
             full_values, _, _ = get_reward(accelerator.unwrap_model(model).critic, postprocessed_query_responses, tokenizer)
-            values = full_values[:, context_length - 1 : -1].squeeze(-1)
+            values = full_values[:, context_length:].squeeze(-1)
             padding_mask = postprocessed_responses == tokenizer.pad_token_id
             logprobs = torch.masked_fill(logprobs, padding_mask, INVALID_LOGPROB)
             ref_logprobs = torch.masked_fill(ref_logprobs, padding_mask, INVALID_LOGPROB)
@@ -764,6 +771,7 @@ if __name__ == "__main__":
 
             _, reference_scores, _ = get_reward(reward_model, query_reference_responses, tokenizer)
             _, validation_score, _ = get_reward(reward_model, postprocessed_sample_validation_query_responses, tokenizer)
+            # raise
 
             # carperAI-style score normaliation
             scores = scores - reference_scores
@@ -854,6 +862,7 @@ if __name__ == "__main__":
             writer.add_histogram("advantages", advantages[0].float(), global_step)
             accelerator.print("rewards====", rewards[0])
             accelerator.print("advantages====", advantages[0])
+            # raise
             # pprint({
             #     "rewards": rewards,
             #     "returns": returns,
@@ -885,7 +894,7 @@ if __name__ == "__main__":
                         new_all_logprobs = F.log_softmax(logits, dim=-1)
                         new_logprobs = torch.gather(new_all_logprobs, 2, mb_responses.unsqueeze(-1)).squeeze(-1)
                         new_logprobs = torch.masked_fill(new_logprobs, padding_mask[micro_batch_inds], INVALID_LOGPROB)
-                        vpred = vpred_temp[:, context_length - 1 : -1].squeeze(-1)
+                        vpred = vpred_temp[:, context_length:].squeeze(-1)
                         vpred = torch.masked_fill(vpred, padding_mask[micro_batch_inds], 0)
                         vpredclipped = torch.clamp(
                             vpred,
