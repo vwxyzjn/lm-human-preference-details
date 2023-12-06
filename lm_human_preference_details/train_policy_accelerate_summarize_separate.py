@@ -574,13 +574,6 @@ if __name__ == "__main__":
     configure_dropout(model_config, args.dropout_layer_keys, 0.0)  # disable dropout
     if accelerator.is_main_process:
         pprint(model_config)
-    reward_model = AutoModelForCausalLMWithRewardHead(
-        AutoModelForCausalLM.from_pretrained(
-            args.base_model,
-            config=model_config,
-            trust_remote_code=True,
-        )
-    )
     critic = AutoModelForCausalLMWithRewardHead(
         AutoModelForCausalLM.from_pretrained(
             args.base_model,
@@ -588,9 +581,16 @@ if __name__ == "__main__":
             trust_remote_code=True,
         )
     )
+    reward_model = AutoModelForCausalLMWithRewardHead(
+        AutoModelForCausalLM.from_pretrained(
+            args.base_model,
+            config=model_config,
+            trust_remote_code=True,
+        )
+    )
     if args.rewards.trained_model:
-        reward_model.load_state_dict(torch.load(args.rewards.trained_model, map_location=device))
         critic.load_state_dict(torch.load(args.rewards.trained_model, map_location=device))
+        reward_model.load_state_dict(torch.load(args.rewards.trained_model, map_location=device))
         print(f"loaded pretrained reward model from {args.rewards.trained_model}")
     # each class should have a separate pretrained model that do not share weights
     ref_policy = AutoModelForCausalLM.from_pretrained(args.base_model, config=model_config, trust_remote_code=True)
@@ -852,7 +852,6 @@ if __name__ == "__main__":
             advantages = torch.stack(advantages_reversed[::-1], axis=1)
             returns = advantages + values
 
-            # TODO: reversed back 
             advantages = masked_whiten(advantages, ~padding_mask)
             advantages = torch.masked_fill(advantages, padding_mask, 0)
 
