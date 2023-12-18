@@ -73,44 +73,36 @@ class Args:
     cuda: bool = True
     """Whether to use cuda if available."""
     run_name: Optional[str] = None
-    """TO BE FILLED: a unique name of this run"""
+    """a unique name of this run"""
     load_from_cache_file: bool = False
     """Whether to load data from the local cache file in `dataset.map`"""
     push_to_hub: bool = False
     "whether to upload the saved model to huggingface"
     hf_entity: str = ""
     "the user or org name of the model repository from the Hugging Face Hub"
-
-    base_model: str = "EleutherAI/pythia-160m"
-    """the name of the pretrained model to use"""
-    dropout_layer_keys: List[str] = field(default_factory=lambda: ["attn_pdrop", "embd_pdrop", "resid_pdrop", "summary_first_dropout"])
-    """Which layers to apply dropout to"""
     deepspeed: bool = False
     """Whether to use deepspeed to train the model"""
     print_sample_output_freq: int = 220
     """How often to print sample output"""
-    output_dir: str = "models/sft_policy"
-    """Where to save the model"""
+    run_eval: bool = False
+    """Whether to run evaluation"""
+
+    # optimizer args
+    eps: float = 1e-5
+    """the epsilon value for the optimizer"""
+    lr: float = 6.35e-5
+    """the learning rate"""
     optimizer: Literal["adam", "adamw"] = "adamw"
     """Which optimizer to use"""
     scheduler: str = "cosine"
     """Which scheduler to use"""
     warm_up_steps: int = 0
     """Number of warm up steps for the scheduler"""
-    run_eval: bool = False
-    """Whether to run evaluation"""
 
-    local_micro_batch_size: int = 1
-    """The micro batch size per GPU (HF's `per_device_train_batch_size`)"""
     gradient_accumulation_steps: int = 16
     """The number of gradient accumulation steps"""
-    noptepochs: int = 1
-    """The number of epochs to train"""
-    lr: float = 6.35e-5
-    """The learning rate"""
-    eps: float = 1e-5
-    """The epsilon value for the optimizer"""
-
+    local_micro_batch_size: Optional[int] = 1
+    """The micro batch size per GPU (HF's `per_device_train_batch_size`)"""
     total_episodes: Optional[int] = None
     """The total number of episodes in the dataset"""
     micro_batch_size: Optional[int] = None
@@ -119,10 +111,22 @@ class Args:
     """The batch size per GPU (HF's `per_device_train_batch_size` * `gradient_accumulation_steps`)"""
     batch_size: Optional[int] = None
     """The batch size across devices (HF's `per_device_train_batch_size` * `world_size` * `gradient_accumulation_steps`)"""
+    local_eval_batch_size: int = 8
+    """per rank eval batch size"""
     world_size: Optional[int] = None
     """The number of processes (GPUs) to use"""
+    num_train_epochs: int = 1
+    """Number of epochs to train"""
     num_updates: Optional[int] = None
     """The number of updates to train"""
+
+    # other args
+    base_model: str = "EleutherAI/pythia-160m"
+    """the name of the pretrained model to use"""
+    dropout_layer_keys: List[str] = field(default_factory=lambda: ["attn_pdrop", "embd_pdrop", "resid_pdrop", "summary_first_dropout"])
+    """Which layers to apply dropout to"""
+    output_dir: str = "models/sft_model"
+    """Where to save the model"""
     task: TaskHParams = field(default_factory=TaskHParams)
 
 
@@ -160,11 +164,11 @@ def generate(lm_backbone, queries, tokenizer, generation_config):
     return torch.cat((queries, output.sequences[:, context_length:]), dim=1)
 
 
-def forward(policy, query_responses, tokenizer):
+def forward(model, query_responses, tokenizer):
     attention_mask = query_responses != tokenizer.pad_token_id
     # position_ids = attention_mask.cumsum(1) - attention_mask.long()  # exclusive cumsum
     input_ids = torch.masked_fill(query_responses, ~attention_mask, 0)
-    return policy(
+    return model(
         input_ids=input_ids,
         attention_mask=attention_mask,
         # position_ids=position_ids,
@@ -176,12 +180,20 @@ def forward(policy, query_responses, tokenizer):
 if __name__ == "__main__":
     args = tyro.cli(Args)
     accelerator = Accelerator(gradient_accumulation_steps=args.gradient_accumulation_steps)
+    local_seed = args.seed + accelerator.process_index * 100003  # Prime
     args.world_size = accelerator.num_processes
     args.local_batch_size = args.local_micro_batch_size * args.gradient_accumulation_steps
     args.micro_batch_size = int(args.local_micro_batch_size * args.world_size)
     args.batch_size = int(args.local_batch_size * args.world_size)
+
+    # load dataset
     dataset = load_dataset(args.task.query_dataset, split="train")
+    dataset = dataset.shuffle(seed=local_seed)
+    dataset = dataset.with_format("torch", columns=["query_token", "reference_response_token"])
+    dataloader = DataLoader(dataset, batch_size=args.local_micro_batch_size)
     validation_dataset = load_dataset(args.task.query_dataset, split="validation")
+    validation_dataset = validation_dataset.with_format("torch", columns=["query_token", "reference_response_token"])
+    validation_dataloader = DataLoader(validation_dataset, batch_size=args.local_eval_batch_size)
     accelerator.print("The number of samples in dataset", len(dataset))
     accelerator.print("The number of samples in validation_dataset", len(validation_dataset))
     args.total_episodes = len(dataset)
@@ -211,7 +223,6 @@ if __name__ == "__main__":
         )
         pprint(args)
     device = accelerator.device
-    local_seed = args.seed + accelerator.process_index * 100003  # Prime
     random.seed(local_seed)
     np.random.seed(local_seed)
     torch.manual_seed(local_seed)
@@ -227,13 +238,13 @@ if __name__ == "__main__":
     configure_dropout(model_config, args.dropout_layer_keys, 0.0)  # disable dropout
     if accelerator.is_main_process:
         pprint(model_config)
-    policy: PreTrainedModel = AutoModelForCausalLM.from_pretrained(args.base_model, config=model_config, trust_remote_code=True)
-    policy.generation_config.eos_token_id = None  # disable `pad_token_id` and `eos_token_id` because we just want to
-    policy.generation_config.pad_token_id = None  # generate tokens without truncation / padding
+    model: PreTrainedModel = AutoModelForCausalLM.from_pretrained(args.base_model, config=model_config, trust_remote_code=True)
+    model.generation_config.eos_token_id = None  # disable `pad_token_id` and `eos_token_id` because we just want to
+    model.generation_config.pad_token_id = None  # generate tokens without truncation / padding
     if args.optimizer == "adam":
-        optimizer = optim.Adam(policy.parameters(), lr=args.lr, eps=args.eps)
+        optimizer = optim.Adam(model.parameters(), lr=args.lr, eps=args.eps)
     elif args.optimizer == "adamw":
-        optimizer = optim.AdamW(policy.parameters(), lr=args.lr, eps=args.eps)
+        optimizer = optim.AdamW(model.parameters(), lr=args.lr, eps=args.eps)
     scheduler = get_scheduler(
         args.scheduler,
         optimizer=optimizer,
@@ -241,13 +252,8 @@ if __name__ == "__main__":
         num_training_steps=args.num_updates,
     )
 
-    dataset = dataset.with_format("torch", columns=["query_token", "reference_response_token"])
-    dataset = dataset.shuffle(seed=local_seed)
-    dataloader = DataLoader(dataset, batch_size=args.local_micro_batch_size)
-    validation_dataset = validation_dataset.with_format("torch", columns=["query_token", "reference_response_token"])
-    validation_dataloader = DataLoader(validation_dataset, batch_size=args.local_micro_batch_size)
-    policy, optimizer, dataloader, scheduler = accelerator.prepare(
-        policy, optimizer, dataloader, scheduler
+    model, optimizer, dataloader, scheduler = accelerator.prepare(
+        model, optimizer, dataloader, scheduler
     )
     validation_dataloader = accelerator.prepare(validation_dataloader)
     # WARNING: even with `max_new_tokens` and `min_new_tokens` set to the same value, the number of tokens generated
@@ -262,41 +268,43 @@ if __name__ == "__main__":
     )
     rouge = evaluate.load("rouge")
 
-    accelerator.print("===training policy===")
+    accelerator.print("===training model===")
     loss_stats = torch.zeros(args.gradient_accumulation_steps, device=device)
-    policy.train()
+    model.train()
     gradient_accumulation_idx = 0
     global_step = 0
     update = 0
-    for data in dataloader:
-        update += 1
-        global_step += args.micro_batch_size
-        reference_responses = data["reference_response_token"].to(device, non_blocking=True)
-        queries = data["query_token"].to(device, non_blocking=True)
-        query_responses = torch.cat((queries, reference_responses), dim=1)
-        with accelerator.accumulate(policy):
-            output = forward(policy, query_responses, tokenizer)
-            # mask out gradient effects on response padding tokens
-            labels = query_responses.masked_fill(query_responses == tokenizer.pad_token_id, -1)
-            lm_logits = output.logits
-            # hand-rolled transformer loss: Shift so that tokens < n predict n
-            # but unlike `transformers` we mask the padding tokens via `ignore_index=-1`
-            shift_logits = lm_logits[..., :-1, :].contiguous()
-            shift_labels = labels[..., 1:].contiguous()
-            loss = F.cross_entropy(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1), ignore_index=-1)
-            accelerator.backward(loss)
-            optimizer.step()
-            optimizer.zero_grad()
-            scheduler.step()
-        loss_stats[gradient_accumulation_idx] = loss
-        gradient_accumulation_idx = (gradient_accumulation_idx + 1) % args.gradient_accumulation_steps
-        if update > 1 and (update - 1) % args.gradient_accumulation_steps == 0:
-            writer.add_scalar("loss", accelerator.gather(loss_stats).mean().item(), update)
-            writer.add_scalar("lr", scheduler.get_last_lr()[0], update)
-            accelerator.print(f"{loss.item()=}, {scheduler.get_last_lr()=}, {update=}")
-        break
+    for epoch in range(args.num_train_epochs):
+        accelerator.print(f"epoch: {epoch}")
+        for data in dataloader:
+            update += 1
+            global_step += args.micro_batch_size
+            reference_responses = data["reference_response_token"].to(device, non_blocking=True)
+            queries = data["query_token"].to(device, non_blocking=True)
+            query_responses = torch.cat((queries, reference_responses), dim=1)
+            with accelerator.accumulate(model):
+                output = forward(model, query_responses, tokenizer)
+                # mask out gradient effects on response padding tokens
+                labels = query_responses.masked_fill(query_responses == tokenizer.pad_token_id, -1)
+                lm_logits = output.logits
+                # hand-rolled transformer loss: Shift so that tokens < n predict n
+                # but unlike `transformers` we mask the padding tokens via `ignore_index=-1`
+                shift_logits = lm_logits[..., :-1, :].contiguous()
+                shift_labels = labels[..., 1:].contiguous()
+                loss = F.cross_entropy(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1), ignore_index=-1)
+                accelerator.backward(loss)
+                optimizer.step()
+                optimizer.zero_grad()
+                scheduler.step()
+            loss_stats[gradient_accumulation_idx] = loss
+            gradient_accumulation_idx = (gradient_accumulation_idx + 1) % args.gradient_accumulation_steps
+            if update > 1 and (update - 1) % args.gradient_accumulation_steps == 0:
+                writer.add_scalar("loss", accelerator.gather(loss_stats).mean().item(), update)
+                writer.add_scalar("lr", scheduler.get_last_lr()[0], update)
+                accelerator.print(f"{loss.item()=}, {scheduler.get_last_lr()=}, {update=}")
+            break
     if args.run_eval:
-        policy.eval()
+        model.eval()
         rouge_scores = collections.defaultdict(list)
         all_decode_validation_queries = []
         all_decode_validation_query_responses = []
@@ -311,7 +319,7 @@ if __name__ == "__main__":
                     (validation_queries, validation_reference_responses), dim=1
                 )
 
-                validation_output = forward(policy, validation_query_reference_responses, tokenizer)
+                validation_output = forward(model, validation_query_reference_responses, tokenizer)
                 validation_labels = validation_query_reference_responses.masked_fill(
                     validation_query_reference_responses == tokenizer.pad_token_id, -1
                 )
@@ -329,7 +337,7 @@ if __name__ == "__main__":
                 all_validation_losses.append(validation_loss)
 
                 generated_responses = generate(
-                    accelerator.unwrap_model(policy),
+                    accelerator.unwrap_model(model),
                     validation_queries,
                     tokenizer,
                     generation_config,
@@ -386,14 +394,14 @@ if __name__ == "__main__":
             if args.push_to_hub:
                 tokenizer.push_to_hub(repo_id, revision=str(time_int))
 
-        unwrapped: PreTrainedModel = accelerator.unwrap_model(policy)
+        unwrapped: PreTrainedModel = accelerator.unwrap_model(model)
         accelerator.wait_for_everyone()
         if accelerator.is_main_process:
             unwrapped.save_pretrained(
                 args.output_dir,
                 is_main_process=accelerator.is_main_process,
                 save_function=accelerator.save,
-                state_dict=accelerator.get_state_dict(policy),
+                state_dict=accelerator.get_state_dict(model),
                 safe_serialization=False,
                 repo_id=repo_id,
             )
