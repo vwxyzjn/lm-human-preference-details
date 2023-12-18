@@ -1,4 +1,5 @@
 import collections
+import functools
 import os
 import random
 import time
@@ -18,13 +19,8 @@ from datasets import load_dataset
 from rich.console import Console
 from rich.pretty import pprint
 from rich.table import Table
-from torch import Tensor, optim
+from torch import optim
 from torch.nn import functional as F
-from torch.optim.optimizer import (
-    _dispatch_sqrt,
-    _get_value,
-    _use_grad_for_differentiable,
-)
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from transformers import (
@@ -32,23 +28,9 @@ from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
     GenerationConfig,
+    PreTrainedModel,
     get_scheduler,
 )
-
-
-@dataclass
-class SFTHParams:
-    gradient_accumulation_steps: int = 16
-    local_micro_batch_size: int = 1
-    noptepochs: int = 1
-    lr: float = 6.35e-5
-    eps: float = 1e-5
-    total_episodes: tyro.conf.Suppress[int] = None
-    micro_batch_size: tyro.conf.Suppress[int] = None
-    local_batch_size: tyro.conf.Suppress[int] = None
-    batch_size: tyro.conf.Suppress[int] = None
-    world_size: tyro.conf.Suppress[int] = None
-    num_updates: tyro.conf.Suppress[int] = None
 
 
 @dataclass
@@ -90,11 +72,11 @@ class Args:
     """the entity (team) of wandb's project"""
     cuda: bool = True
     """Whether to use cuda if available."""
-    run_name: tyro.conf.Suppress[str] = None
+    run_name: Optional[str] = None
     """TO BE FILLED: a unique name of this run"""
     load_from_cache_file: bool = False
     """Whether to load data from the local cache file in `dataset.map`"""
-    upload_model: bool = False
+    push_to_hub: bool = False
     "whether to upload the saved model to huggingface"
     hf_entity: str = ""
     "the user or org name of the model repository from the Hugging Face Hub"
@@ -107,16 +89,41 @@ class Args:
     """Whether to use deepspeed to train the model"""
     print_sample_output_freq: int = 220
     """How often to print sample output"""
-    save_path: str = "models/sft_policy"
+    output_dir: str = "models/sft_policy"
     """Where to save the model"""
-    optimizer: Literal["tf_adam", "adam", "adamw"] = "adamw"
+    optimizer: Literal["adam", "adamw"] = "adamw"
     """Which optimizer to use"""
     scheduler: str = "cosine"
     """Which scheduler to use"""
     warm_up_steps: int = 0
     """Number of warm up steps for the scheduler"""
+    run_eval: bool = False
+    """Whether to run evaluation"""
+
+    local_micro_batch_size: int = 1
+    """The micro batch size per GPU (HF's `per_device_train_batch_size`)"""
+    gradient_accumulation_steps: int = 16
+    """The number of gradient accumulation steps"""
+    noptepochs: int = 1
+    """The number of epochs to train"""
+    lr: float = 6.35e-5
+    """The learning rate"""
+    eps: float = 1e-5
+    """The epsilon value for the optimizer"""
+
+    total_episodes: Optional[int] = None
+    """The total number of episodes in the dataset"""
+    micro_batch_size: Optional[int] = None
+    """The micro batch size across devices (HF's `per_device_train_batch_size` * `world_size`)"""
+    local_batch_size: Optional[int] = None
+    """The batch size per GPU (HF's `per_device_train_batch_size` * `gradient_accumulation_steps`)"""
+    batch_size: Optional[int] = None
+    """The batch size across devices (HF's `per_device_train_batch_size` * `world_size` * `gradient_accumulation_steps`)"""
+    world_size: Optional[int] = None
+    """The number of processes (GPUs) to use"""
+    num_updates: Optional[int] = None
+    """The number of updates to train"""
     task: TaskHParams = field(default_factory=TaskHParams)
-    sft: SFTHParams = field(default_factory=SFTHParams)
 
 
 # taken from https://github.com/microsoft/DeepSpeedExamples/blob/737c6740bec38b77a24a59135b6481a53d566b38/applications/DeepSpeed-Chat/training/utils/model/model_utils.py#L20C1-L26C52
@@ -136,165 +143,6 @@ def print_rich_table(title: str, df: pd.DataFrame, console: Console) -> Table:
         table.add_row(*row.astype(str).tolist())
     console.rule(f"[bold red]{title}")
     console.print(table)
-
-
-def _single_tensor_adam(
-    params: List[Tensor],
-    grads: List[Tensor],
-    exp_avgs: List[Tensor],
-    exp_avg_sqs: List[Tensor],
-    max_exp_avg_sqs: List[Tensor],
-    state_steps: List[Tensor],
-    grad_scale: Optional[Tensor],
-    found_inf: Optional[Tensor],
-    *,
-    amsgrad: bool,
-    beta1: float,
-    beta2: float,
-    lr: float,
-    weight_decay: float,
-    eps: float,
-    maximize: bool,
-    capturable: bool,
-    differentiable: bool,
-):
-    assert grad_scale is None and found_inf is None
-
-    for i, param in enumerate(params):
-        grad = grads[i] if not maximize else -grads[i]
-        exp_avg = exp_avgs[i]
-        exp_avg_sq = exp_avg_sqs[i]
-        step_t = state_steps[i]
-        # update step
-        step_t += 1
-        # Decay the first and second moment running average coefficient
-        exp_avg.mul_(beta1).add_(grad, alpha=1 - beta1)
-        exp_avg_sq.mul_(beta2).addcmul_(grad, grad.conj(), value=1 - beta2)
-        step = _get_value(step_t)
-
-        ### pytorch adam implementation:
-        # bias_correction1 = 1 - beta1 ** step
-        # bias_correction2 = 1 - beta2 ** step
-        # step_size = lr / bias_correction1
-        # bias_correction2_sqrt = _dispatch_sqrt(bias_correction2)
-        # denom = (exp_avg_sq.sqrt() / bias_correction2_sqrt).add_(eps)
-        # param.addcdiv_(exp_avg, denom, value=-step_size)
-
-        ### tensorflow adam implementation:
-        lr_t = lr * _dispatch_sqrt(1 - beta2**step) / (1 - beta1**step)
-        denom = exp_avg_sq.sqrt().add_(eps)
-        param.addcdiv_(exp_avg, denom, value=-lr_t)
-
-
-def adam(
-    params: List[Tensor],
-    grads: List[Tensor],
-    exp_avgs: List[Tensor],
-    exp_avg_sqs: List[Tensor],
-    max_exp_avg_sqs: List[Tensor],
-    state_steps: List[Tensor],
-    # kwonly args with defaults are not supported by functions compiled with torchscript issue #70627
-    # setting this as kwarg for now as functional API is compiled by torch/distributed/optim
-    foreach: Optional[bool] = None,
-    capturable: bool = False,
-    differentiable: bool = False,
-    fused: Optional[bool] = None,
-    grad_scale: Optional[Tensor] = None,
-    found_inf: Optional[Tensor] = None,
-    *,
-    amsgrad: bool,
-    beta1: float,
-    beta2: float,
-    lr: float,
-    weight_decay: float,
-    eps: float,
-    maximize: bool,
-):
-    func = _single_tensor_adam
-
-    func(
-        params,
-        grads,
-        exp_avgs,
-        exp_avg_sqs,
-        max_exp_avg_sqs,
-        state_steps,
-        amsgrad=amsgrad,
-        beta1=beta1,
-        beta2=beta2,
-        lr=lr,
-        weight_decay=weight_decay,
-        eps=eps,
-        maximize=maximize,
-        capturable=capturable,
-        differentiable=differentiable,
-        grad_scale=grad_scale,
-        found_inf=found_inf,
-    )
-
-
-class AdamTensorFlowStyle(optim.Adam):
-    @_use_grad_for_differentiable
-    def step(self, closure=None):
-        self._cuda_graph_capture_health_check()
-        loss = None
-        if closure is not None:
-            with torch.enable_grad():
-                loss = closure()
-
-        for group in self.param_groups:
-            params_with_grad = []
-            grads = []
-            exp_avgs = []
-            exp_avg_sqs = []
-            max_exp_avg_sqs = []
-            state_steps = []
-            beta1, beta2 = group["betas"]
-
-            self._init_group(
-                group,
-                params_with_grad,
-                grads,
-                exp_avgs,
-                exp_avg_sqs,
-                max_exp_avg_sqs,
-                state_steps,
-            )
-
-            adam(
-                params_with_grad,
-                grads,
-                exp_avgs,
-                exp_avg_sqs,
-                max_exp_avg_sqs,
-                state_steps,
-                amsgrad=group["amsgrad"],
-                beta1=beta1,
-                beta2=beta2,
-                lr=group["lr"],
-                weight_decay=group["weight_decay"],
-                eps=group["eps"],
-                maximize=group["maximize"],
-                foreach=group["foreach"],
-                capturable=group["capturable"],
-                differentiable=group["differentiable"],
-                fused=group["fused"],
-                grad_scale=getattr(self, "grad_scale", None),
-                found_inf=getattr(self, "found_inf", None),
-            )
-
-        return loss
-
-
-def ceil_div(a, b):
-    return (a - 1) // b + 1
-
-
-def exact_div(a, b):
-    q = a // b
-    if a != q * b:
-        raise ValueError(f"Inexact division: {a} / {b} = {a / b}")
-    return q
 
 
 def generate(lm_backbone, queries, tokenizer, generation_config):
@@ -327,17 +175,17 @@ def forward(policy, query_responses, tokenizer):
 # def train(args: Args):
 if __name__ == "__main__":
     args = tyro.cli(Args)
-    accelerator = Accelerator(gradient_accumulation_steps=args.sft.gradient_accumulation_steps)
-    args.sft.world_size = accelerator.num_processes
-    args.sft.local_batch_size = args.sft.local_micro_batch_size * args.sft.gradient_accumulation_steps
-    args.sft.micro_batch_size = int(args.sft.local_micro_batch_size * args.sft.world_size)
-    args.sft.batch_size = int(args.sft.local_batch_size * args.sft.world_size)
+    accelerator = Accelerator(gradient_accumulation_steps=args.gradient_accumulation_steps)
+    args.world_size = accelerator.num_processes
+    args.local_batch_size = args.local_micro_batch_size * args.gradient_accumulation_steps
+    args.micro_batch_size = int(args.local_micro_batch_size * args.world_size)
+    args.batch_size = int(args.local_batch_size * args.world_size)
     dataset = load_dataset(args.task.query_dataset, split="train")
     validation_dataset = load_dataset(args.task.query_dataset, split="validation")
     accelerator.print("The number of samples in dataset", len(dataset))
     accelerator.print("The number of samples in validation_dataset", len(validation_dataset))
-    args.sft.total_episodes = len(dataset)
-    args.sft.num_updates = args.sft.total_episodes // args.sft.local_batch_size
+    args.total_episodes = len(dataset)
+    args.num_updates = args.total_episodes // args.local_batch_size
 
     console = Console(force_terminal=True)
     run_name = f"{args.exp_name}__{args.seed}__{int(time.time())}"
@@ -379,27 +227,25 @@ if __name__ == "__main__":
     configure_dropout(model_config, args.dropout_layer_keys, 0.0)  # disable dropout
     if accelerator.is_main_process:
         pprint(model_config)
-    policy = AutoModelForCausalLM.from_pretrained(args.base_model, config=model_config, trust_remote_code=True)
+    policy: PreTrainedModel = AutoModelForCausalLM.from_pretrained(args.base_model, config=model_config, trust_remote_code=True)
     policy.generation_config.eos_token_id = None  # disable `pad_token_id` and `eos_token_id` because we just want to
     policy.generation_config.pad_token_id = None  # generate tokens without truncation / padding
-    if args.optimizer == "tf_adam":
-        optimizer = AdamTensorFlowStyle(policy.parameters(), lr=args.sft.lr, eps=args.sft.eps)
-    elif args.optimizer == "adam":
-        optimizer = optim.Adam(policy.parameters(), lr=args.sft.lr, eps=args.sft.eps)
+    if args.optimizer == "adam":
+        optimizer = optim.Adam(policy.parameters(), lr=args.lr, eps=args.eps)
     elif args.optimizer == "adamw":
-        optimizer = optim.AdamW(policy.parameters(), lr=args.sft.lr, eps=args.sft.eps)
+        optimizer = optim.AdamW(policy.parameters(), lr=args.lr, eps=args.eps)
     scheduler = get_scheduler(
         args.scheduler,
         optimizer=optimizer,
         num_warmup_steps=args.warm_up_steps,
-        num_training_steps=args.sft.num_updates,
+        num_training_steps=args.num_updates,
     )
 
     dataset = dataset.with_format("torch", columns=["query_token", "reference_response_token"])
     dataset = dataset.shuffle(seed=local_seed)
-    dataloader = DataLoader(dataset, batch_size=args.sft.local_micro_batch_size)
+    dataloader = DataLoader(dataset, batch_size=args.local_micro_batch_size)
     validation_dataset = validation_dataset.with_format("torch", columns=["query_token", "reference_response_token"])
-    validation_dataloader = DataLoader(validation_dataset, batch_size=args.sft.local_micro_batch_size)
+    validation_dataloader = DataLoader(validation_dataset, batch_size=args.local_micro_batch_size)
     policy, optimizer, dataloader, scheduler = accelerator.prepare(
         policy, optimizer, dataloader, scheduler
     )
@@ -416,15 +262,15 @@ if __name__ == "__main__":
     )
     rouge = evaluate.load("rouge")
 
-    print("===training policy===")
-    loss_stats = torch.zeros(args.sft.gradient_accumulation_steps, device=device)
+    accelerator.print("===training policy===")
+    loss_stats = torch.zeros(args.gradient_accumulation_steps, device=device)
     policy.train()
     gradient_accumulation_idx = 0
     global_step = 0
     update = 0
     for data in dataloader:
         update += 1
-        global_step += args.sft.micro_batch_size
+        global_step += args.micro_batch_size
         reference_responses = data["reference_response_token"].to(device, non_blocking=True)
         queries = data["query_token"].to(device, non_blocking=True)
         query_responses = torch.cat((queries, reference_responses), dim=1)
@@ -443,102 +289,116 @@ if __name__ == "__main__":
             optimizer.zero_grad()
             scheduler.step()
         loss_stats[gradient_accumulation_idx] = loss
-        gradient_accumulation_idx = (gradient_accumulation_idx + 1) % args.sft.gradient_accumulation_steps
-        if update > 1 and (update - 1) % args.sft.gradient_accumulation_steps == 0:
+        gradient_accumulation_idx = (gradient_accumulation_idx + 1) % args.gradient_accumulation_steps
+        if update > 1 and (update - 1) % args.gradient_accumulation_steps == 0:
             writer.add_scalar("loss", accelerator.gather(loss_stats).mean().item(), update)
             writer.add_scalar("lr", scheduler.get_last_lr()[0], update)
             accelerator.print(f"{loss.item()=}, {scheduler.get_last_lr()=}, {update=}")
-        # if update == args.sft.num_updates - 1: # update == 1 or 
-    policy.eval()
-    rouge_scores = collections.defaultdict(list)
-    all_decode_validation_queries = []
-    all_decode_validation_query_responses = []
-    all_decode_validation_responses = []
-    all_decode_validation_reference_responses = []
-    all_validation_losses = []
-    for validation_idx, validation_data in tqdm(enumerate(validation_dataloader)):
-        with torch.no_grad():
-            validation_reference_responses = validation_data["reference_response_token"].to(device, non_blocking=True)
-            validation_queries = validation_data["query_token"].to(device, non_blocking=True)
-            validation_query_reference_responses = torch.cat(
-                (validation_queries, validation_reference_responses), dim=1
-            )
+        break
+    if args.run_eval:
+        policy.eval()
+        rouge_scores = collections.defaultdict(list)
+        all_decode_validation_queries = []
+        all_decode_validation_query_responses = []
+        all_decode_validation_responses = []
+        all_decode_validation_reference_responses = []
+        all_validation_losses = []
+        for validation_idx, validation_data in tqdm(enumerate(validation_dataloader)):
+            with torch.no_grad():
+                validation_reference_responses = validation_data["reference_response_token"].to(device, non_blocking=True)
+                validation_queries = validation_data["query_token"].to(device, non_blocking=True)
+                validation_query_reference_responses = torch.cat(
+                    (validation_queries, validation_reference_responses), dim=1
+                )
 
-            validation_output = forward(policy, validation_query_reference_responses, tokenizer)
-            validation_labels = validation_query_reference_responses.masked_fill(
-                validation_query_reference_responses == tokenizer.pad_token_id, -1
-            )
-            validation_lm_logits = validation_output.logits
-            # hand-rolled transformer loss: Shift so that tokens < n predict n
-            # but unlike `transformers` we mask the padding tokens via `ignore_index=-1`
-            validation_shift_logits = validation_lm_logits[..., :-1, :].contiguous()
-            validation_shift_labels = validation_labels[..., 1:].contiguous()
-            validation_loss = F.cross_entropy(
-                validation_shift_logits.view(-1, validation_shift_logits.size(-1)),
-                validation_shift_labels.view(-1),
-                ignore_index=-1,
-            )
-            validation_loss = accelerator.gather(validation_loss)
-            all_validation_losses.append(validation_loss)
+                validation_output = forward(policy, validation_query_reference_responses, tokenizer)
+                validation_labels = validation_query_reference_responses.masked_fill(
+                    validation_query_reference_responses == tokenizer.pad_token_id, -1
+                )
+                validation_lm_logits = validation_output.logits
+                # hand-rolled transformer loss: Shift so that tokens < n predict n
+                # but unlike `transformers` we mask the padding tokens via `ignore_index=-1`
+                validation_shift_logits = validation_lm_logits[..., :-1, :].contiguous()
+                validation_shift_labels = validation_labels[..., 1:].contiguous()
+                validation_loss = F.cross_entropy(
+                    validation_shift_logits.view(-1, validation_shift_logits.size(-1)),
+                    validation_shift_labels.view(-1),
+                    ignore_index=-1,
+                )
+                validation_loss = accelerator.gather(validation_loss)
+                all_validation_losses.append(validation_loss)
 
-            generated_responses = generate(
-                accelerator.unwrap_model(policy),
-                validation_queries,
-                tokenizer,
-                generation_config,
-            )
-            decode_validation_queries = tokenizer.batch_decode(accelerator.gather(validation_queries))
-            decode_validation_query_responses = tokenizer.batch_decode(accelerator.gather(generated_responses))
-            decode_validation_reference_responses = tokenizer.batch_decode(
-                accelerator.gather(validation_reference_responses)
-            )
-            decode_validation_responses = tokenizer.batch_decode(accelerator.gather(generated_responses[:, -args.task.response_length:]))
-            rouge_score = rouge.compute(
-                predictions=decode_validation_responses, references=decode_validation_reference_responses
-            )
-            rouge_scores["rouge1"].append(rouge_score["rouge1"])
-            rouge_scores["rouge2"].append(rouge_score["rouge2"])
-            rouge_scores["rougeL"].append(rouge_score["rougeL"])
+                generated_responses = generate(
+                    accelerator.unwrap_model(policy),
+                    validation_queries,
+                    tokenizer,
+                    generation_config,
+                )
+                decode_validation_queries = tokenizer.batch_decode(accelerator.gather(validation_queries))
+                decode_validation_query_responses = tokenizer.batch_decode(accelerator.gather(generated_responses))
+                decode_validation_reference_responses = tokenizer.batch_decode(
+                    accelerator.gather(validation_reference_responses)
+                )
+                decode_validation_responses = tokenizer.batch_decode(accelerator.gather(generated_responses[:, -args.task.response_length:]))
+                rouge_score = rouge.compute(
+                    predictions=decode_validation_responses, references=decode_validation_reference_responses
+                )
+                rouge_scores["rouge1"].append(rouge_score["rouge1"])
+                rouge_scores["rouge2"].append(rouge_score["rouge2"])
+                rouge_scores["rougeL"].append(rouge_score["rougeL"])
 
-            all_decode_validation_queries.extend(decode_validation_queries)
-            all_decode_validation_query_responses.extend(decode_validation_query_responses)
-            all_decode_validation_responses.extend(decode_validation_responses)
-            all_decode_validation_reference_responses.extend(decode_validation_reference_responses)
-            # if validation_idx == 10:
-            #     break
-    try:
-        all_df = pd.DataFrame(
-            {
-                "query": all_decode_validation_queries,
-                "response": all_decode_validation_responses,
-                "reference": all_decode_validation_reference_responses,
-            }
-        )
-        accelerator.print(all_df)
-        if accelerator.is_main_process and args.track:
-            wandb.log({"samples/query_responses": wandb.Table(dataframe=all_df)}, step=update)
-            print_rich_table(f"Sample Output at Step {update}", all_df[:4], console)
-    except Exception as e:
-        print(e)
+                all_decode_validation_queries.extend(decode_validation_queries)
+                all_decode_validation_query_responses.extend(decode_validation_query_responses)
+                all_decode_validation_responses.extend(decode_validation_responses)
+                all_decode_validation_reference_responses.extend(decode_validation_reference_responses)
+        try:
+            all_df = pd.DataFrame(
+                {
+                    "query": all_decode_validation_queries,
+                    "response": all_decode_validation_responses,
+                    "reference": all_decode_validation_reference_responses,
+                }
+            )
+            accelerator.print(all_df)
+            if accelerator.is_main_process and args.track:
+                wandb.log({"samples/query_responses": wandb.Table(dataframe=all_df)}, step=update)
+                print_rich_table(f"Sample Output at Step {update}", all_df[:4], console)
+        except Exception as e:
+            print(e)
 
-    for k, v in rouge_scores.items():
-        rouge_metric = torch.tensor(v, device=device)
-        rouge_metric = accelerator.gather(rouge_metric)
-        writer.add_scalar(f"rouge/{k}", rouge_metric.mean().item(), update)
-        accelerator.print(f"rouge/{k}: {rouge_metric.mean().item()} {rouge_metric.shape} {rouge_metric}")
-    writer.add_scalar("validation_loss", torch.stack(all_validation_losses).mean().item(), update)
-    policy.train()
+        for k, v in rouge_scores.items():
+            rouge_metric = torch.tensor(v, device=device)
+            rouge_metric = accelerator.gather(rouge_metric)
+            writer.add_scalar(f"rouge/{k}", rouge_metric.mean().item(), update)
+            accelerator.print(f"rouge/{k}: {rouge_metric.mean().item()} {rouge_metric.shape} {rouge_metric}")
+        writer.add_scalar("validation_loss", torch.stack(all_validation_losses).mean().item(), update)
 
     # save model
-    if args.save_path:
-        os.makedirs(os.path.dirname(args.save_path), exist_ok=True)
-        accelerator.save_model(policy, args.save_path, max_shard_size="1000GB")
+    if args.output_dir:
+        os.makedirs(os.path.dirname(args.output_dir), exist_ok=True)
+        time_tensor = torch.tensor(int(time.time()), device=device)
+        time_int = accelerator.gather(time_tensor)[0].item() # avoid different timestamps across processes
+        repo_name = f"{args.base_model.replace('/', '_')}__{args.exp_name}__tldr__seed{args.seed}"
+        repo_id = f"{args.hf_entity}/{repo_name}" if args.hf_entity else repo_name
 
-        if args.upload_model and accelerator.is_main_process:
-            repo_name = f"{args.exp_name}__tldr__seed{args.seed}__{int(time.time())}"
-            repo_id = f"{args.hf_entity}/{repo_name}" if args.hf_entity else repo_name
-            policy.save_pretrained(repo_id, safe_serialization=True, push_to_hub=True)
-            tokenizer.save_pretrained(repo_id, push_to_hub=True)
+        if accelerator.is_main_process:
+            tokenizer.save_pretrained(args.output_dir, repo_id=repo_id)
+            if args.push_to_hub:
+                tokenizer.push_to_hub(repo_id, revision=str(time_int))
+
+        unwrapped: PreTrainedModel = accelerator.unwrap_model(policy)
+        accelerator.wait_for_everyone()
+        if accelerator.is_main_process:
+            unwrapped.save_pretrained(
+                args.output_dir,
+                is_main_process=accelerator.is_main_process,
+                save_function=accelerator.save,
+                state_dict=accelerator.get_state_dict(policy),
+                safe_serialization=False,
+                repo_id=repo_id,
+            )
+            if args.push_to_hub:
+                unwrapped.push_to_hub(repo_id, revision=str(time_int), safe_serialization=False)
 
 # if __name__ == "__main__":
 #     args = tyro.cli(Args)
