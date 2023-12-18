@@ -1,11 +1,11 @@
 #!/bin/bash
-#SBATCH --partition=production-cluster
+#SBATCH --partition=hopper-prod
 #SBATCH --gpus-per-task={{gpus_per_task}}
 #SBATCH --cpus-per-gpu={{cpus_per_gpu}}
 #SBATCH --ntasks={{ntasks}}
 #SBATCH --output=slurm/logs/%x_%j.out
 #SBATCH --array={{array}}
-#SBATCH --exclude=ip-26-0-149-199
+##SBATCH --exclude=ip-26-0-149-199
 
 {{nodes}}
 
