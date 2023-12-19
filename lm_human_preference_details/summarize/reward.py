@@ -1,7 +1,7 @@
-from collections import defaultdict
 import os
 import random
 import time
+from collections import defaultdict
 from dataclasses import asdict, dataclass, field
 from types import SimpleNamespace
 from typing import List, Literal, Optional
@@ -15,16 +15,23 @@ import torch.optim as optim
 import tyro
 from accelerate import Accelerator
 from accelerate.state import AcceleratorState
-from accelerate.utils import DistributedDataParallelKwargs, gather_object
+from accelerate.utils import gather_object
 from datasets import load_dataset
 from rich.console import Console
 from rich.pretty import pprint
 from rich.table import Table
 from torch import optim
-from torch.utils.tensorboard import SummaryWriter
 from torch.utils.data import DataLoader
+from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
-from transformers import AutoConfig, AutoModel, AutoTokenizer, get_scheduler, PreTrainedModel, PretrainedConfig
+from transformers import (
+    AutoConfig,
+    AutoModel,
+    AutoTokenizer,
+    PretrainedConfig,
+    PreTrainedModel,
+    get_scheduler,
+)
 
 
 @dataclass
@@ -126,7 +133,9 @@ class Args:
     # other args
     base_model: str = "EleutherAI/pythia-160m"
     """the name of the pretrained model to use"""
-    dropout_layer_keys: List[str] = field(default_factory=lambda: ["attn_pdrop", "embd_pdrop", "resid_pdrop", "summary_first_dropout"])
+    dropout_layer_keys: List[str] = field(
+        default_factory=lambda: ["attn_pdrop", "embd_pdrop", "resid_pdrop", "summary_first_dropout"]
+    )
     """Which layers to apply dropout to"""
     output_dir: str = "models/reward_policy"
     """Where to save the model"""
@@ -164,13 +173,16 @@ def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
 
 
 class ScalarModelConfig(PretrainedConfig):
-    model_type = 'scalar_model'
+    model_type = "scalar_model"
+
     def __init__(self, base_model: str = "gpt2", **kwargs):
         super().__init__(**kwargs)
         self.base_model = base_model
 
+
 class ScalarModel(PreTrainedModel):
     config_class = ScalarModelConfig
+
     def __init__(self, config: ScalarModelConfig):
         super().__init__(config)
         self.config = config
@@ -203,10 +215,7 @@ def get_reward(model, query_responses, tokenizer):
         return_dict=True,
         output_hidden_states=True,
     )
-    sequence_lengths = (
-        torch.eq(query_responses, tokenizer.pad_token_id).long().argmax(-1) - 1).to(
-        query_responses.device
-    )
+    sequence_lengths = (torch.eq(query_responses, tokenizer.pad_token_id).long().argmax(-1) - 1).to(query_responses.device)
     # https://github.com/huggingface/transformers/blob/dc68a39c8111217683bf49a4912d0c9018bab33d/src/transformers/models/gpt2/modeling_gpt2.py#L1454
     return reward_logits[torch.arange(reward_logits.size(0), device=reward_logits.device), sequence_lengths]
 
@@ -258,10 +267,26 @@ if __name__ == "__main__":
     dataset = load_dataset(args.label_dataset, "comparisons", split="train")
     dataset = dataset.shuffle(seed=local_seed)
     dataset = dataset.select(range(args.labels.num_train))
-    dataset = dataset.with_format("torch", columns=["query_token", "choice", "response0_token", "response1_token", "batch", "split"])
+    dataset = dataset.with_format(
+        "torch", columns=["query_token", "choice", "response0_token", "response1_token", "batch", "split"]
+    )
     dataloader = DataLoader(dataset, batch_size=args.local_micro_batch_size)
     validation_dataset = load_dataset(args.label_dataset, "comparisons", split="validation").flatten()
-    validation_dataset = validation_dataset.with_format("torch", columns=["query_token", "choice", "response0_token", "response1_token", "batch", "split", "extra.confidence", "response0_policy", "response1_policy", "policies"])
+    validation_dataset = validation_dataset.with_format(
+        "torch",
+        columns=[
+            "query_token",
+            "choice",
+            "response0_token",
+            "response1_token",
+            "batch",
+            "split",
+            "extra.confidence",
+            "response0_policy",
+            "response1_policy",
+            "policies",
+        ],
+    )
     validation_dataloader = DataLoader(validation_dataset, batch_size=args.local_eval_batch_size)
     accelerator.print("The number of samples in dataset", len(dataset))
     accelerator.print("The number of samples in validation_dataset", len(validation_dataset))
@@ -426,7 +451,7 @@ if __name__ == "__main__":
             "mean": norm_df["predicted_reward"].mean(),
             "std": norm_df["predicted_reward"].std(),
             "max": norm_df["predicted_reward"].max(),
-            "min": norm_df["predicted_reward"].min()
+            "min": norm_df["predicted_reward"].min(),
         }
         for stat_name, stat_value in stats.items():
             writer.add_scalar(f"eval/normalized_{stat_name}", stat_value, global_step)
@@ -436,7 +461,7 @@ if __name__ == "__main__":
     if args.output_dir and args.num_train_epochs > 0:
         os.makedirs(os.path.dirname(args.output_dir), exist_ok=True)
         time_tensor = torch.tensor([int(time.time())], device=device)
-        time_int = accelerator.gather(time_tensor)[0].item() # avoid different timestamps across processes
+        time_int = accelerator.gather(time_tensor)[0].item()  # avoid different timestamps across processes
         repo_name = f"{args.base_model.replace('/', '_')}__{args.exp_name}__tldr"
         repo_id = f"{args.hf_entity}/{repo_name}" if args.hf_entity else repo_name
 

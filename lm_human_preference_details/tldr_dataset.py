@@ -1,15 +1,16 @@
-from dataclasses import dataclass
+import multiprocessing
 import os
+from dataclasses import dataclass
 from typing import Dict, Optional
 
-from datasets import load_dataset
-from rich.pretty import pprint
-from transformers import AutoTokenizer
-import tyro
-import multiprocessing
 import matplotlib.pyplot as plt
 import pandas as pd
+import tyro
+from datasets import load_dataset
 from huggingface_hub import HfApi
+from rich.pretty import pprint
+from transformers import AutoTokenizer
+
 api = HfApi()
 
 
@@ -20,11 +21,13 @@ poetry run python lm_human_preference_details/tldr_dataset.py \
     --max-sft-response-length=53 \
     --max-rm-response-length=169
 """
+
+
 @dataclass
 class Args:
-    base_model: str = "gpt2" # EleutherAI/pythia-160m
-    max_sft_response_length: int = 48 # 53
-    max_rm_response_length: int = 153 # 169
+    base_model: str = "gpt2"  # EleutherAI/pythia-160m
+    max_sft_response_length: int = 48  # 53
+    max_rm_response_length: int = 153  # 169
     hf_entity: str = None
 
 
@@ -36,7 +39,7 @@ class TaskQueryHParams:
     ] = "SUBREDDIT: r/{subreddit}\n\nTITLE: {title}\n\nPOST: {post}\n\nTL;DR:"  # if underlying dataset yields dicts, can format arbitrarily
     truncate_field: Optional[str] = "post"
     truncate_text: Optional[str] = "\n"
-    padding: Optional[str] = " " # empty spaces
+    padding: Optional[str] = " "  # empty spaces
     pad_side: Optional[str] = "left"
 
 
@@ -138,7 +141,9 @@ if __name__ == "__main__":
         }
 
     sft_ds = sft_ds.map(process_query_data, load_from_cache_file=False, num_proc=multiprocessing.cpu_count())
-    sft_ds.push_to_hub(f"{args.hf_entity}/summarize_from_feedback_tldr_3_filtered_oai_preprocessing_{args.base_model.split('/')[-1]}_{args.max_sft_response_length}")
+    sft_ds.push_to_hub(
+        f"{args.hf_entity}/summarize_from_feedback_tldr_3_filtered_oai_preprocessing_{args.base_model.split('/')[-1]}_{args.max_sft_response_length}"
+    )
 
     label_ds = load_dataset("openai/summarize_from_feedback", "comparisons")
 
@@ -168,7 +173,9 @@ if __name__ == "__main__":
         }
 
     label_ds = label_ds.map(process_response_data, load_from_cache_file=False, num_proc=multiprocessing.cpu_count())
-    label_ds.push_to_hub(f"{args.hf_entity}/summarize_from_feedback_oai_preprocessing_{args.base_model.split('/')[-1]}_{args.max_rm_response_length}")
+    label_ds.push_to_hub(
+        f"{args.hf_entity}/summarize_from_feedback_oai_preprocessing_{args.base_model.split('/')[-1]}_{args.max_rm_response_length}"
+    )
 
     os.makedirs("dataset_visuals", exist_ok=True)
     # visualize token length distribution
@@ -183,10 +190,10 @@ if __name__ == "__main__":
     offset = len(sft_ds)
     for i, key in enumerate(label_ds.keys()):
         df = label_ds[key].to_pandas()
-        axs[2*i + offset].hist(df["response0_token_len"], bins=100)
-        axs[2*i + offset].set_title(f"{key} split: response0 token length\nmax_length={max(df['response0_token_len'])}")
-        axs[2*i + offset + 1].hist(df["response1_token_len"], bins=100)
-        axs[2*i + offset + 1].set_title(f"{key} split: response1 token length\nmax_length={max(df['response1_token_len'])}")
+        axs[2 * i + offset].hist(df["response0_token_len"], bins=100)
+        axs[2 * i + offset].set_title(f"{key} split: response0 token length\nmax_length={max(df['response0_token_len'])}")
+        axs[2 * i + offset + 1].hist(df["response1_token_len"], bins=100)
+        axs[2 * i + offset + 1].set_title(f"{key} split: response1 token length\nmax_length={max(df['response1_token_len'])}")
     fig.suptitle(f"{args.base_model} Tokenizer: Token length distribution")
     fig.tight_layout()
     fig.savefig("dataset_visuals/token_len.png")
@@ -244,4 +251,3 @@ if __name__ == "__main__":
         repo_id=f"{args.hf_entity}/summarize_from_feedback_oai_preprocessing_{args.base_model.split('/')[-1]}_{args.max_rm_response_length}",
         repo_type="dataset",
     )
-

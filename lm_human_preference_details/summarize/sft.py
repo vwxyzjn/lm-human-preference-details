@@ -1,5 +1,4 @@
 import collections
-import functools
 import os
 import random
 import time
@@ -13,7 +12,6 @@ import pandas as pd
 import torch
 import torch.optim as optim
 import tyro
-from tqdm import tqdm
 from accelerate import Accelerator
 from datasets import load_dataset
 from rich.console import Console
@@ -23,6 +21,7 @@ from torch import optim
 from torch.nn import functional as F
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
+from tqdm import tqdm
 from transformers import (
     AutoConfig,
     AutoModelForCausalLM,
@@ -122,7 +121,9 @@ class Args:
     # other args
     base_model: str = "EleutherAI/pythia-160m"
     """the name of the pretrained model to use"""
-    dropout_layer_keys: List[str] = field(default_factory=lambda: ["attn_pdrop", "embd_pdrop", "resid_pdrop", "summary_first_dropout"])
+    dropout_layer_keys: List[str] = field(
+        default_factory=lambda: ["attn_pdrop", "embd_pdrop", "resid_pdrop", "summary_first_dropout"]
+    )
     """Which layers to apply dropout to"""
     output_dir: str = "models/sft_model"
     """Where to save the model"""
@@ -255,9 +256,7 @@ if __name__ == "__main__":
         num_training_steps=args.num_updates * args.num_train_epochs,
     )
 
-    model, optimizer, dataloader, scheduler = accelerator.prepare(
-        model, optimizer, dataloader, scheduler
-    )
+    model, optimizer, dataloader, scheduler = accelerator.prepare(model, optimizer, dataloader, scheduler)
     validation_dataloader = accelerator.prepare(validation_dataloader)
     # WARNING: even with `max_new_tokens` and `min_new_tokens` set to the same value, the number of tokens generated
     # may not be the same. TODO: investigate further, we just want to generate a fixed number of tokens
@@ -305,7 +304,6 @@ if __name__ == "__main__":
                 writer.add_scalar("loss", accelerator.gather(loss_stats).mean().item(), update)
                 writer.add_scalar("lr", scheduler.get_last_lr()[0], update)
                 accelerator.print(f"{loss.item()=}, {scheduler.get_last_lr()=}, {update=}")
-            break
 
     if args.run_eval:
         model.eval()
@@ -319,9 +317,7 @@ if __name__ == "__main__":
             with torch.no_grad():
                 validation_reference_responses = validation_data["reference_response_token"].to(device, non_blocking=True)
                 validation_queries = validation_data["query_token"].to(device, non_blocking=True)
-                validation_query_reference_responses = torch.cat(
-                    (validation_queries, validation_reference_responses), dim=1
-                )
+                validation_query_reference_responses = torch.cat((validation_queries, validation_reference_responses), dim=1)
 
                 validation_output = forward(model, validation_query_reference_responses, tokenizer)
                 validation_labels = validation_query_reference_responses.masked_fill(
@@ -353,7 +349,7 @@ if __name__ == "__main__":
                     skip_special_tokens=True,
                 )
                 decode_validation_responses = tokenizer.batch_decode(
-                    accelerator.gather(generated_responses[:, -args.task.response_length:]),
+                    accelerator.gather(generated_responses[:, -args.task.response_length :]),
                     skip_special_tokens=True,
                 )
                 rouge_score = rouge.compute(
@@ -393,7 +389,7 @@ if __name__ == "__main__":
     if args.output_dir:
         os.makedirs(os.path.dirname(args.output_dir), exist_ok=True)
         time_tensor = torch.tensor([int(time.time())], device=device)
-        time_int = accelerator.gather(time_tensor)[0].item() # avoid different timestamps across processes
+        time_int = accelerator.gather(time_tensor)[0].item()  # avoid different timestamps across processes
         repo_name = f"{args.base_model.replace('/', '_')}__{args.exp_name}__tldr"
         repo_id = f"{args.hf_entity}/{repo_name}" if args.hf_entity else repo_name
 

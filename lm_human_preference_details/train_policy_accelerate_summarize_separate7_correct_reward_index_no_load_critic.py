@@ -33,7 +33,6 @@ from transformers import (
     GenerationConfig,
 )
 
-
 INVALID_LOGPROB = 1.0
 
 
@@ -49,8 +48,8 @@ class RewardHParams:
     adaptive_kl: Optional[AdaptiveKLParams] = field(default_factory=AdaptiveKLParams)
     trained_model: Optional[str] = ""
     label_dataset: tyro.conf.Suppress[Optional[str]] = None
-    dataset_mean: float = 0.
-    dataset_std: float = 1.
+    dataset_mean: float = 0.0
+    dataset_std: float = 1.0
     kl_coef: float = 0.15
 
 
@@ -144,7 +143,9 @@ class Args:
 
     base_model: str = "EleutherAI/pythia-160m"
     """the name of the pretrained model to use"""
-    dropout_layer_keys: List[str] = field(default_factory=lambda: ["attn_pdrop", "embd_pdrop", "resid_pdrop", "summary_first_dropout"])
+    dropout_layer_keys: List[str] = field(
+        default_factory=lambda: ["attn_pdrop", "embd_pdrop", "resid_pdrop", "summary_first_dropout"]
+    )
     """Which layers to apply dropout to"""
     deepspeed: bool = False
     """Whether to use deepspeed to train the model"""
@@ -449,7 +450,11 @@ def get_reward(reward_model, query_responses, tokenizer):
     # )
     # print(f"======={sequence_lengths1=} {sequence_lengths=}")
     # https://github.com/huggingface/transformers/blob/dc68a39c8111217683bf49a4912d0c9018bab33d/src/transformers/models/gpt2/modeling_gpt2.py#L1454
-    return reward_logits, reward_logits[torch.arange(reward_logits.size(0), device=reward_logits.device), sequence_lengths].squeeze(-1), sequence_lengths
+    return (
+        reward_logits,
+        reward_logits[torch.arange(reward_logits.size(0), device=reward_logits.device), sequence_lengths].squeeze(-1),
+        sequence_lengths,
+    )
 
 
 def forward(policy, query_responses, tokenizer):
@@ -594,9 +599,7 @@ if __name__ == "__main__":
             eval_ds_config["zero_optimization"] = {
                 "stage": 3,
                 "stage3_param_persistence_threshold": 1e4,
-                "offload_param": {
-                    "device": "cpu"
-                }
+                "offload_param": {"device": "cpu"},
             }
         accelerator.print(f"{eval_ds_config=}")
         reward_model, *_ = deepspeed.initialize(model=reward_model, config=eval_ds_config)
@@ -641,7 +644,7 @@ if __name__ == "__main__":
         do_sample=True,
     )
     # use the same `0.01` temperature for validation response generation https://github.com/openai/summarize-from-feedback/blob/700967448d10004279f138666442bf1497d0e705/exps/sample.py#L27
-    validation_generation_config= GenerationConfig(
+    validation_generation_config = GenerationConfig(
         max_new_tokens=args.task.response_length,
         min_new_tokens=args.task.response_length,
         temperature=(0.01 + 1e-7),
@@ -695,7 +698,7 @@ if __name__ == "__main__":
             # TODO: do I do this with query response or post-processed query response?
             output = forward(accelerator.unwrap_model(model).policy, query_responses, tokenizer)
             logits = output.logits[:, context_length - 1 : -1]
-            logits /= (args.task.temperature + 1e-7)
+            logits /= args.task.temperature + 1e-7
             all_logprobs = F.log_softmax(logits, dim=-1)
             logprobs = torch.gather(all_logprobs, 2, responses.unsqueeze(-1)).squeeze(-1)
             del output, logits, all_logprobs
@@ -703,7 +706,7 @@ if __name__ == "__main__":
 
             ref_output = forward(ref_policy, query_responses, tokenizer)
             ref_logits = ref_output.logits[:, context_length - 1 : -1]
-            ref_logits /= (args.task.temperature + 1e-7)
+            ref_logits /= args.task.temperature + 1e-7
             ref_all_logprobs = F.log_softmax(ref_logits, dim=-1)
             ref_logprobs = torch.gather(ref_all_logprobs, 2, responses.unsqueeze(-1)).squeeze(-1)
             del ref_output, ref_logits, ref_all_logprobs
@@ -738,7 +741,7 @@ if __name__ == "__main__":
             # only query humans on responses that pass that filter
             contain_pad_token = torch.any(postprocessed_responses == tokenizer.pad_token_id, dim=-1)
             scores = torch.where(contain_pad_token, scores, torch.full_like(scores, args.task.penalty_reward_value))
-            
+
             # TODO: do we need to deal with penalty values?
             # penalty_values = torch.full_like(values, 0)
             # penalty_values[:,-1] += args.task.penalty_reward_value
@@ -784,7 +787,9 @@ if __name__ == "__main__":
                     if accelerator.is_main_process:
                         all_sample_validation_df.to_json(f"runs/{run_name}/table.json")
                         if args.track:
-                            wandb.log({"samples/query_responses": wandb.Table(dataframe=all_sample_validation_df)}, step=update)
+                            wandb.log(
+                                {"samples/query_responses": wandb.Table(dataframe=all_sample_validation_df)}, step=update
+                            )
                     print_rich_table("stuff", all_sample_validation_df[:4], console)
 
                 except Exception as e:
@@ -844,7 +849,7 @@ if __name__ == "__main__":
 
                         output, vpred_temp = forward(model, mb_query_responses, tokenizer)
                         logits = output.logits[:, context_length - 1 : -1]
-                        logits /= (args.task.temperature + 1e-7)
+                        logits /= args.task.temperature + 1e-7
                         new_all_logprobs = F.log_softmax(logits, dim=-1)
                         new_logprobs = torch.gather(new_all_logprobs, 2, mb_responses.unsqueeze(-1)).squeeze(-1)
                         # new_logprobs = torch.masked_fill(new_logprobs, padding_mask[micro_batch_inds], INVALID_LOGPROB)
@@ -875,7 +880,7 @@ if __name__ == "__main__":
                         approxkl = 0.5 * (logprobs_diff**2).mean()
                         # if ppo_epoch_idx == 0 and micro_batch_start == 0:
                         #     torch.testing.assert_close(ratio, torch.zeros_like(ratio) + 1, atol=1e-4, rtol=1e-4)
-                        # if ppo_epoch_idx == 0: 
+                        # if ppo_epoch_idx == 0:
                         #     pprint({
                         #         # "responses": responses,
                         #         # "values": values,
@@ -908,13 +913,13 @@ if __name__ == "__main__":
                         f"ppo_epoch_idx",
                         ppo_epoch_idx,
                         "approxkl",
-                        approxkl_stats[:ppo_epoch_idx+1].mean().item(),
+                        approxkl_stats[: ppo_epoch_idx + 1].mean().item(),
                         "pg_loss",
-                        pg_loss_stats[:ppo_epoch_idx+1].mean().item(),
+                        pg_loss_stats[: ppo_epoch_idx + 1].mean().item(),
                         "pg_clipfrac",
-                        pg_clipfrac_stats[:ppo_epoch_idx+1].mean().item(),
+                        pg_clipfrac_stats[: ppo_epoch_idx + 1].mean().item(),
                         "ratio",
-                        ratio_stats[:ppo_epoch_idx+1].mean().item(),
+                        ratio_stats[: ppo_epoch_idx + 1].mean().item(),
                     )
         # raise
         # breakpoint()

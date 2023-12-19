@@ -33,7 +33,6 @@ from transformers import (
     GenerationConfig,
 )
 
-
 INVALID_LOGPROB = 1.0
 
 
@@ -142,7 +141,9 @@ class Args:
 
     base_model: str = "EleutherAI/pythia-160m"
     """the name of the pretrained model to use"""
-    dropout_layer_keys: List[str] = field(default_factory=lambda: ["attn_pdrop", "embd_pdrop", "resid_pdrop", "summary_first_dropout"])
+    dropout_layer_keys: List[str] = field(
+        default_factory=lambda: ["attn_pdrop", "embd_pdrop", "resid_pdrop", "summary_first_dropout"]
+    )
     """Which layers to apply dropout to"""
     deepspeed: bool = False
     """Whether to use deepspeed to train the model"""
@@ -356,8 +357,9 @@ def whiten(values, shift_mean=True):
 def masked_mean(x, mask):
     return (x.sum(-1) / (~mask).sum(-1)).mean()
 
+
 def masked_var(x, mask):
-    return (x**2).sum(-1) / (~mask).sum(-1) - masked_mean(x, mask)**2
+    return (x**2).sum(-1) / (~mask).sum(-1) - masked_mean(x, mask) ** 2
 
 
 def masked_whiten(values, mask, shift_mean=True):
@@ -367,7 +369,7 @@ def masked_whiten(values, mask, shift_mean=True):
     if not shift_mean:
         whitened += mean
     return whitened
-    
+
 
 def masked_mean(values, mask, axis=None):
     """Compute mean of tensor with a masked values."""
@@ -375,6 +377,7 @@ def masked_mean(values, mask, axis=None):
         return (values * mask).sum(axis=axis) / mask.sum(axis=axis)
     else:
         return (values * mask).sum() / mask.sum()
+
 
 def masked_var(values, mask, unbiased=True):
     """Compute variance of tensor with masked values."""
@@ -497,7 +500,11 @@ def get_reward(reward_model, query_responses, tokenizer):
     # )
     # print(f"======={sequence_lengths1=} {sequence_lengths=}")
     # https://github.com/huggingface/transformers/blob/dc68a39c8111217683bf49a4912d0c9018bab33d/src/transformers/models/gpt2/modeling_gpt2.py#L1454
-    return reward_logits, reward_logits[torch.arange(reward_logits.size(0), device=reward_logits.device), sequence_lengths].squeeze(-1), sequence_lengths
+    return (
+        reward_logits,
+        reward_logits[torch.arange(reward_logits.size(0), device=reward_logits.device), sequence_lengths].squeeze(-1),
+        sequence_lengths,
+    )
 
 
 def forward(policy, query_responses, tokenizer):
@@ -640,9 +647,7 @@ if __name__ == "__main__":
             eval_ds_config["zero_optimization"] = {
                 "stage": 3,
                 "stage3_param_persistence_threshold": 1e4,
-                "offload_param": {
-                    "device": "cpu"
-                }
+                "offload_param": {"device": "cpu"},
             }
         accelerator.print(f"{eval_ds_config=}")
         reward_model, *_ = deepspeed.initialize(model=reward_model, config=eval_ds_config)
@@ -826,7 +831,9 @@ if __name__ == "__main__":
                     if accelerator.is_main_process:
                         all_sample_validation_df.to_json(f"runs/{run_name}/table.json")
                         if args.track:
-                            wandb.log({"samples/query_responses": wandb.Table(dataframe=all_sample_validation_df)}, step=update)
+                            wandb.log(
+                                {"samples/query_responses": wandb.Table(dataframe=all_sample_validation_df)}, step=update
+                            )
                     print_rich_table("stuff", all_sample_validation_df[:4], console)
 
                 except Exception as e:
@@ -903,8 +910,7 @@ if __name__ == "__main__":
                         vf_losses1 = torch.square(vpred - mb_return)
                         vf_losses2 = torch.square(vpredclipped - mb_return)
                         vf_loss_max = torch.max(vf_losses1, vf_losses2)
-                        
-                        
+
                         # vf_loss = 0.5 * vf_loss_max.mean()
                         vf_loss = 0.5 * masked_mean(vf_loss_max, ~padding_mask[micro_batch_inds])
                         vf_clipfrac = masked_mean((vf_losses2 > vf_losses1).float(), ~padding_mask[micro_batch_inds])
@@ -927,7 +933,7 @@ if __name__ == "__main__":
                         approxkl = 0.5 * masked_mean((logprobs_diff**2), ~padding_mask[micro_batch_inds])
                         # if ppo_epoch_idx == 0 and micro_batch_start == 0:
                         #     torch.testing.assert_close(ratio, torch.zeros_like(ratio) + 1, atol=1e-4, rtol=1e-4)
-                        # if ppo_epoch_idx == 0: 
+                        # if ppo_epoch_idx == 0:
                         #     pprint({
                         #         # "responses": responses,
                         #         # "values": values,
@@ -951,7 +957,9 @@ if __name__ == "__main__":
                             pg_loss_stats[ppo_epoch_idx, minibatch_idx, gradient_accumulation_idx] = pg_loss
                             vf_loss_stats[ppo_epoch_idx, minibatch_idx, gradient_accumulation_idx] = vf_loss
                             vf_clipfrac_stats[ppo_epoch_idx, minibatch_idx, gradient_accumulation_idx] = vf_clipfrac
-                            entropy_stats[ppo_epoch_idx, minibatch_idx, gradient_accumulation_idx] = masked_mean(entropy, padding_mask[micro_batch_inds])
+                            entropy_stats[ppo_epoch_idx, minibatch_idx, gradient_accumulation_idx] = masked_mean(
+                                entropy, padding_mask[micro_batch_inds]
+                            )
                             ratio_stats[ppo_epoch_idx, minibatch_idx, gradient_accumulation_idx] = ratio.mean()
                     gradient_accumulation_idx += 1
 
@@ -961,13 +969,13 @@ if __name__ == "__main__":
                         f"ppo_epoch_idx",
                         ppo_epoch_idx,
                         "approxkl",
-                        approxkl_stats[:ppo_epoch_idx+1].mean().item(),
+                        approxkl_stats[: ppo_epoch_idx + 1].mean().item(),
                         "pg_loss",
-                        pg_loss_stats[:ppo_epoch_idx+1].mean().item(),
+                        pg_loss_stats[: ppo_epoch_idx + 1].mean().item(),
                         "pg_clipfrac",
-                        pg_clipfrac_stats[:ppo_epoch_idx+1].mean().item(),
+                        pg_clipfrac_stats[: ppo_epoch_idx + 1].mean().item(),
                         "ratio",
-                        ratio_stats[:ppo_epoch_idx+1].mean().item(),
+                        ratio_stats[: ppo_epoch_idx + 1].mean().item(),
                     )
         # breakpoint()
         with torch.no_grad():
