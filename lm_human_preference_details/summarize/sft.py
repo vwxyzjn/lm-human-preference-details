@@ -111,7 +111,7 @@ class Args:
     """The batch size per GPU (HF's `per_device_train_batch_size` * `gradient_accumulation_steps`)"""
     batch_size: Optional[int] = None
     """The batch size across devices (HF's `per_device_train_batch_size` * `world_size` * `gradient_accumulation_steps`)"""
-    local_eval_batch_size: int = 8
+    local_eval_batch_size: int = 4
     """per rank eval batch size"""
     world_size: Optional[int] = None
     """The number of processes (GPUs) to use"""
@@ -119,7 +119,6 @@ class Args:
     """Number of epochs to train"""
     num_updates: Optional[int] = None
     """The number of updates to train"""
-
     # other args
     base_model: str = "EleutherAI/pythia-160m"
     """the name of the pretrained model to use"""
@@ -238,7 +237,11 @@ if __name__ == "__main__":
     configure_dropout(model_config, args.dropout_layer_keys, 0.0)  # disable dropout
     if accelerator.is_main_process:
         pprint(model_config)
-    model: PreTrainedModel = AutoModelForCausalLM.from_pretrained(args.base_model, config=model_config, trust_remote_code=True)
+    model: PreTrainedModel = AutoModelForCausalLM.from_pretrained(
+        args.base_model,
+        config=model_config,
+        trust_remote_code=True,
+    )
     model.generation_config.eos_token_id = None  # disable `pad_token_id` and `eos_token_id` because we just want to
     model.generation_config.pad_token_id = None  # generate tokens without truncation / padding
     if args.optimizer == "adam":
@@ -249,7 +252,7 @@ if __name__ == "__main__":
         args.scheduler,
         optimizer=optimizer,
         num_warmup_steps=args.warm_up_steps,
-        num_training_steps=args.num_updates,
+        num_training_steps=args.num_updates * args.num_train_epochs,
     )
 
     model, optimizer, dataloader, scheduler = accelerator.prepare(
@@ -303,6 +306,7 @@ if __name__ == "__main__":
                 writer.add_scalar("lr", scheduler.get_last_lr()[0], update)
                 accelerator.print(f"{loss.item()=}, {scheduler.get_last_lr()=}, {update=}")
             break
+
     if args.run_eval:
         model.eval()
         rouge_scores = collections.defaultdict(list)
@@ -345,9 +349,13 @@ if __name__ == "__main__":
                 decode_validation_queries = tokenizer.batch_decode(accelerator.gather(validation_queries))
                 decode_validation_query_responses = tokenizer.batch_decode(accelerator.gather(generated_responses))
                 decode_validation_reference_responses = tokenizer.batch_decode(
-                    accelerator.gather(validation_reference_responses)
+                    accelerator.gather(validation_reference_responses),
+                    skip_special_tokens=True,
                 )
-                decode_validation_responses = tokenizer.batch_decode(accelerator.gather(generated_responses[:, -args.task.response_length:]))
+                decode_validation_responses = tokenizer.batch_decode(
+                    accelerator.gather(generated_responses[:, -args.task.response_length:]),
+                    skip_special_tokens=True,
+                )
                 rouge_score = rouge.compute(
                     predictions=decode_validation_responses, references=decode_validation_reference_responses
                 )
@@ -384,15 +392,15 @@ if __name__ == "__main__":
     # save model
     if args.output_dir:
         os.makedirs(os.path.dirname(args.output_dir), exist_ok=True)
-        time_tensor = torch.tensor(int(time.time()), device=device)
+        time_tensor = torch.tensor([int(time.time())], device=device)
         time_int = accelerator.gather(time_tensor)[0].item() # avoid different timestamps across processes
-        repo_name = f"{args.base_model.replace('/', '_')}__{args.exp_name}__tldr__seed{args.seed}"
+        repo_name = f"{args.base_model.replace('/', '_')}__{args.exp_name}__tldr"
         repo_id = f"{args.hf_entity}/{repo_name}" if args.hf_entity else repo_name
 
         if accelerator.is_main_process:
             tokenizer.save_pretrained(args.output_dir, repo_id=repo_id)
             if args.push_to_hub:
-                tokenizer.push_to_hub(repo_id, revision=str(time_int))
+                tokenizer.push_to_hub(repo_id, revision=f"seed{args.seed}_{str(time_int)}")
 
         unwrapped: PreTrainedModel = accelerator.unwrap_model(model)
         accelerator.wait_for_everyone()
@@ -406,7 +414,7 @@ if __name__ == "__main__":
                 repo_id=repo_id,
             )
             if args.push_to_hub:
-                unwrapped.push_to_hub(repo_id, revision=str(time_int), safe_serialization=False)
+                unwrapped.push_to_hub(repo_id, revision=f"seed{args.seed}_{str(time_int)}", safe_serialization=False)
 
 # if __name__ == "__main__":
 #     args = tyro.cli(Args)
