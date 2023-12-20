@@ -6,7 +6,7 @@ from dataclasses import asdict, dataclass, field
 from types import SimpleNamespace
 from typing import List, Literal, Optional
 
-import evaluate
+import evaluate as hf_evaluate
 import numpy as np
 import pandas as pd
 import torch
@@ -30,6 +30,8 @@ from transformers import (
     PreTrainedModel,
     get_scheduler,
 )
+
+rouge = hf_evaluate.load("rouge")
 
 
 @dataclass
@@ -98,6 +100,12 @@ class Args:
     warm_up_steps: int = 0
     """Number of warm up steps for the scheduler"""
 
+    world_size: Optional[int] = None
+    """The number of processes (GPUs) to use"""
+    num_train_epochs: int = 1
+    """Number of epochs to train"""
+    num_updates: Optional[int] = None
+    """The number of updates to train"""
     gradient_accumulation_steps: int = 16
     """The number of gradient accumulation steps"""
     local_micro_batch_size: Optional[int] = 1
@@ -112,12 +120,7 @@ class Args:
     """The batch size across devices (HF's `per_device_train_batch_size` * `world_size` * `gradient_accumulation_steps`)"""
     local_eval_batch_size: int = 4
     """per rank eval batch size"""
-    world_size: Optional[int] = None
-    """The number of processes (GPUs) to use"""
-    num_train_epochs: int = 1
-    """Number of epochs to train"""
-    num_updates: Optional[int] = None
-    """The number of updates to train"""
+
     # other args
     base_model: str = "EleutherAI/pythia-160m"
     """the name of the pretrained model to use"""
@@ -166,13 +169,77 @@ def generate(lm_backbone, queries, tokenizer, generation_config):
 
 def forward(model, query_responses, tokenizer):
     attention_mask = query_responses != tokenizer.pad_token_id
-    # position_ids = attention_mask.cumsum(1) - attention_mask.long()  # exclusive cumsum
     input_ids = torch.masked_fill(query_responses, ~attention_mask, 0)
     return model(
         input_ids=input_ids,
         attention_mask=attention_mask,
-        # position_ids=position_ids,
         return_dict=True,
+    )
+
+
+def evaluate(args: Args, accelerator, tokenizer, model, dataloader, generation_config):
+    model.eval()
+    rouge_scores = collections.defaultdict(list)
+    all_decode_queries = []
+    all_decode_query_responses = []
+    all_decode_responses = []
+    all_decode_reference_responses = []
+    all_losses = []
+    for _, data in tqdm(enumerate(dataloader)):
+        with torch.no_grad():
+            reference_responses = data["reference_response_token"]
+            queries = data["query_token"]
+            query_reference_responses = torch.cat((queries, reference_responses), dim=1)
+            output = forward(model, query_reference_responses, tokenizer)
+            labels = query_reference_responses.masked_fill(query_reference_responses == tokenizer.pad_token_id, -1)
+            lm_logits = output.logits
+            # hand-rolled transformer loss: Shift so that tokens < n predict n
+            # but unlike `transformers` we mask the padding tokens via `ignore_index=-1`
+            shift_logits = lm_logits[..., :-1, :].contiguous()
+            shift_labels = labels[..., 1:].contiguous()
+            loss = F.cross_entropy(
+                shift_logits.view(-1, shift_logits.size(-1)),
+                shift_labels.view(-1),
+                ignore_index=-1,
+            )
+            loss = accelerator.gather(loss)
+            all_losses.append(loss)
+
+            generated_responses = generate(
+                accelerator.unwrap_model(model),
+                queries,
+                tokenizer,
+                generation_config,
+            )
+            decode_queries = tokenizer.batch_decode(accelerator.gather(queries))
+            decode_query_responses = tokenizer.batch_decode(accelerator.gather(generated_responses))
+            decode_reference_responses = tokenizer.batch_decode(
+                accelerator.gather(reference_responses),
+                skip_special_tokens=True,
+            )
+            decode_responses = tokenizer.batch_decode(
+                accelerator.gather(generated_responses[:, -args.task.response_length :]),
+                skip_special_tokens=True,
+            )
+            rouge_score = rouge.compute(predictions=decode_responses, references=decode_reference_responses)
+            rouge_scores["rouge1"].append(rouge_score["rouge1"])
+            rouge_scores["rouge2"].append(rouge_score["rouge2"])
+            rouge_scores["rougeL"].append(rouge_score["rougeL"])
+
+            all_decode_queries.extend(decode_queries)
+            all_decode_query_responses.extend(decode_query_responses)
+            all_decode_responses.extend(decode_responses)
+            all_decode_reference_responses.extend(decode_reference_responses)
+    return (
+        pd.DataFrame(
+            {
+                "query": all_decode_queries,
+                "response": all_decode_responses,
+                "reference": all_decode_reference_responses,
+            }
+        ),
+        rouge_scores,
+        all_losses,
     )
 
 
@@ -256,7 +323,8 @@ if __name__ == "__main__":
         num_training_steps=args.num_updates * args.num_train_epochs,
     )
 
-    model, optimizer, dataloader, scheduler = accelerator.prepare(model, optimizer, dataloader, scheduler)
+    model, optimizer, dataloader = accelerator.prepare(model, optimizer, dataloader)
+    # scheduler = accelerator.prepare(scheduler) # breaks with accelerate@0.25.0
     validation_dataloader = accelerator.prepare(validation_dataloader)
     # WARNING: even with `max_new_tokens` and `min_new_tokens` set to the same value, the number of tokens generated
     # may not be the same. TODO: investigate further, we just want to generate a fixed number of tokens
@@ -268,7 +336,6 @@ if __name__ == "__main__":
         top_p=1.0,
         do_sample=True,
     )
-    rouge = evaluate.load("rouge")
 
     accelerator.print("===training model===")
     loss_stats = torch.zeros(args.gradient_accumulation_steps, device=device)
@@ -301,83 +368,21 @@ if __name__ == "__main__":
             loss_stats[gradient_accumulation_idx] = loss
             gradient_accumulation_idx = (gradient_accumulation_idx + 1) % args.gradient_accumulation_steps
             if update > 1 and (update - 1) % args.gradient_accumulation_steps == 0:
-                writer.add_scalar("loss", accelerator.gather(loss_stats).mean().item(), update)
-                writer.add_scalar("lr", scheduler.get_last_lr()[0], update)
+                writer.add_scalar("train/sft/loss", accelerator.gather(loss_stats).mean().item(), update)
+                writer.add_scalar("train/sft/lr", scheduler.get_last_lr()[0], update)
                 accelerator.print(f"{loss.item()=}, {scheduler.get_last_lr()=}, {update=}")
 
     if args.run_eval:
-        model.eval()
-        rouge_scores = collections.defaultdict(list)
-        all_decode_validation_queries = []
-        all_decode_validation_query_responses = []
-        all_decode_validation_responses = []
-        all_decode_validation_reference_responses = []
-        all_validation_losses = []
-        for validation_idx, validation_data in tqdm(enumerate(validation_dataloader)):
-            with torch.no_grad():
-                validation_reference_responses = validation_data["reference_response_token"].to(device, non_blocking=True)
-                validation_queries = validation_data["query_token"].to(device, non_blocking=True)
-                validation_query_reference_responses = torch.cat((validation_queries, validation_reference_responses), dim=1)
-
-                validation_output = forward(model, validation_query_reference_responses, tokenizer)
-                validation_labels = validation_query_reference_responses.masked_fill(
-                    validation_query_reference_responses == tokenizer.pad_token_id, -1
-                )
-                validation_lm_logits = validation_output.logits
-                # hand-rolled transformer loss: Shift so that tokens < n predict n
-                # but unlike `transformers` we mask the padding tokens via `ignore_index=-1`
-                validation_shift_logits = validation_lm_logits[..., :-1, :].contiguous()
-                validation_shift_labels = validation_labels[..., 1:].contiguous()
-                validation_loss = F.cross_entropy(
-                    validation_shift_logits.view(-1, validation_shift_logits.size(-1)),
-                    validation_shift_labels.view(-1),
-                    ignore_index=-1,
-                )
-                validation_loss = accelerator.gather(validation_loss)
-                all_validation_losses.append(validation_loss)
-
-                generated_responses = generate(
-                    accelerator.unwrap_model(model),
-                    validation_queries,
-                    tokenizer,
-                    generation_config,
-                )
-                decode_validation_queries = tokenizer.batch_decode(accelerator.gather(validation_queries))
-                decode_validation_query_responses = tokenizer.batch_decode(accelerator.gather(generated_responses))
-                decode_validation_reference_responses = tokenizer.batch_decode(
-                    accelerator.gather(validation_reference_responses),
-                    skip_special_tokens=True,
-                )
-                decode_validation_responses = tokenizer.batch_decode(
-                    accelerator.gather(generated_responses[:, -args.task.response_length :]),
-                    skip_special_tokens=True,
-                )
-                rouge_score = rouge.compute(
-                    predictions=decode_validation_responses, references=decode_validation_reference_responses
-                )
-                rouge_scores["rouge1"].append(rouge_score["rouge1"])
-                rouge_scores["rouge2"].append(rouge_score["rouge2"])
-                rouge_scores["rougeL"].append(rouge_score["rougeL"])
-
-                all_decode_validation_queries.extend(decode_validation_queries)
-                all_decode_validation_query_responses.extend(decode_validation_query_responses)
-                all_decode_validation_responses.extend(decode_validation_responses)
-                all_decode_validation_reference_responses.extend(decode_validation_reference_responses)
+        evaluate_df, rouge_scores, all_validation_losses = evaluate(
+            args, accelerator, tokenizer, model, dataloader, generation_config
+        )
+        if accelerator.is_main_process and args.track:
+            wandb.log({"samples/query_responses": wandb.Table(dataframe=evaluate_df)}, step=update)
         try:
-            all_df = pd.DataFrame(
-                {
-                    "query": all_decode_validation_queries,
-                    "response": all_decode_validation_responses,
-                    "reference": all_decode_validation_reference_responses,
-                }
-            )
-            accelerator.print(all_df)
-            if accelerator.is_main_process and args.track:
-                wandb.log({"samples/query_responses": wandb.Table(dataframe=all_df)}, step=update)
-                print_rich_table(f"Sample Output at Step {update}", all_df[:4], console)
+            if accelerator.is_main_process:
+                print_rich_table(f"Sample Output at Step {update}", evaluate_df[:4], console)
         except Exception as e:
             print(e)
-
         for k, v in rouge_scores.items():
             rouge_metric = torch.tensor(v, device=device)
             rouge_metric = accelerator.gather(rouge_metric)
@@ -386,7 +391,7 @@ if __name__ == "__main__":
         writer.add_scalar("validation_loss", torch.stack(all_validation_losses).mean().item(), update)
 
     # save model
-    if args.output_dir:
+    if args.output_dir and args.num_train_epochs > 0:
         os.makedirs(os.path.dirname(args.output_dir), exist_ok=True)
         time_tensor = torch.tensor([int(time.time())], device=device)
         time_int = accelerator.gather(time_tensor)[0].item()  # avoid different timestamps across processes

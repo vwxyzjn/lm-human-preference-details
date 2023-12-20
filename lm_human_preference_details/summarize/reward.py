@@ -109,6 +109,12 @@ class Args:
     warm_up_steps: int = 0
     """Number of warm up steps for the scheduler"""
 
+    world_size: Optional[int] = None
+    """The number of processes (GPUs) to use"""
+    num_train_epochs: int = 1
+    """Number of epochs to train"""
+    num_updates: Optional[int] = None
+    """The number of updates to train"""
     gradient_accumulation_steps: int = 8
     """The number of gradient accumulation steps"""
     local_micro_batch_size: Optional[int] = 1
@@ -123,12 +129,6 @@ class Args:
     """The batch size across devices (HF's `per_device_train_batch_size` * `world_size` * `gradient_accumulation_steps`)"""
     local_eval_batch_size: int = 8
     """per rank eval batch size"""
-    world_size: Optional[int] = None
-    """The number of processes (GPUs) to use"""
-    num_train_epochs: int = 1
-    """Number of epochs to train"""
-    num_updates: Optional[int] = None
-    """The number of updates to train"""
 
     # other args
     base_model: str = "EleutherAI/pythia-160m"
@@ -137,14 +137,14 @@ class Args:
         default_factory=lambda: ["attn_pdrop", "embd_pdrop", "resid_pdrop", "summary_first_dropout"]
     )
     """Which layers to apply dropout to"""
-    output_dir: str = "models/reward_policy"
+    output_dir: str = "models/reward_model"
     """Where to save the model"""
     label_dataset: str = "vwxyzjn/summarize_from_feedback_oai_preprocessing_pythia-160m_169"
     """the name of the dataset to use for labels in `https://huggingface.co/datasets/vwxyzjn/lm-human-preferences`"""
     logsigmoid: bool = True
     """Whether to use log-sigmoid loss instead of cross-entropy loss"""
     task: TaskHParams = field(default_factory=TaskHParams)
-    labels: LabelHParams = field(default_factory=LabelHParams)
+    label: LabelHParams = field(default_factory=LabelHParams)
 
 
 # taken from https://github.com/microsoft/DeepSpeedExamples/blob/737c6740bec38b77a24a59135b6481a53d566b38/applications/DeepSpeed-Chat/training/utils/model/model_utils.py#L20C1-L26C52
@@ -173,11 +173,19 @@ def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
 
 
 class ScalarModelConfig(PretrainedConfig):
-    model_type = "scalar_model"
-
-    def __init__(self, base_model: str = "gpt2", **kwargs):
+    def __init__(
+        self,
+        base_model: str = "EleutherAI/pythia-160m",
+        base_config: PretrainedConfig = AutoConfig.from_pretrained("EleutherAI/pythia-160m"),
+        hidden_size: int = 768,
+        bias: float = 0.0,
+        **kwargs,
+    ):
         super().__init__(**kwargs)
         self.base_model = base_model
+        self.base_config = base_config
+        self.hidden_size = hidden_size
+        self.bias = bias
 
 
 class ScalarModel(PreTrainedModel):
@@ -186,23 +194,19 @@ class ScalarModel(PreTrainedModel):
     def __init__(self, config: ScalarModelConfig):
         super().__init__(config)
         self.config = config
-        self.model_config = AutoConfig.from_pretrained(
-            config.base_model,
-            trust_remote_code=True,
-        )
         self.lm_backbone = AutoModel.from_pretrained(
             config.base_model,
-            config=self.model_config,
+            config=self.config.base_config,
             trust_remote_code=True,
         )
         self.scalar_head = layer_init(
-            nn.Linear(self.model_config.hidden_size, 1),
-            std=1 / np.sqrt(self.model_config.hidden_size + 1),
+            nn.Linear(self.config.hidden_size, 1),
+            std=1 / np.sqrt(self.config.hidden_size + 1),
         )
 
     def forward(self, **kwargs):
         output = self.lm_backbone(**kwargs)
-        reward = self.scalar_head(output.hidden_states[-1])
+        reward = self.scalar_head(output.hidden_states[-1]) - self.config.bias
         return reward
 
 
@@ -220,7 +224,7 @@ def get_reward(model, query_responses, tokenizer):
     return reward_logits[torch.arange(reward_logits.size(0), device=reward_logits.device), sequence_lengths]
 
 
-def evaluate(args, accelerator, tokenizer, model, dataloader):
+def evaluate(args: Args, accelerator, tokenizer, model, dataloader):
     model.eval()
     with torch.no_grad():
         items = defaultdict(list)
@@ -228,11 +232,11 @@ def evaluate(args, accelerator, tokenizer, model, dataloader):
             mb_query = data["query_token"]
             mb_responses = torch.cat([data[f"response0_token"].unsqueeze(1), data[f"response1_token"].unsqueeze(1)], dim=1)
             mb_best = data["choice"]
-            mb_query_tiled = mb_query.unsqueeze(1).repeat(1, args.labels.num_labels, 1)
+            mb_query_tiled = mb_query.unsqueeze(1).repeat(1, args.label.num_labels, 1)
             query_responses = torch.cat([mb_query_tiled, mb_responses], dim=2).flatten(0, 1)
             # query_responses = left_padding_to_right_padding(query_responses, tokenizer.pad_token_id)
             predicted_reward = get_reward(model, query_responses, tokenizer)
-            predicted_reward = predicted_reward.view(-1, args.labels.num_labels)
+            predicted_reward = predicted_reward.view(-1, args.label.num_labels)
             accuracy = (predicted_reward.argmax(1) == mb_best).float()
 
             for k in data:
@@ -266,7 +270,7 @@ if __name__ == "__main__":
     # load dataset
     dataset = load_dataset(args.label_dataset, "comparisons", split="train")
     dataset = dataset.shuffle(seed=local_seed)
-    dataset = dataset.select(range(args.labels.num_train))
+    dataset = dataset.select(range(args.label.num_train))
     dataset = dataset.with_format(
         "torch", columns=["query_token", "choice", "response0_token", "response1_token", "batch", "split"]
     )
@@ -328,11 +332,16 @@ if __name__ == "__main__":
     )
     # we use the padding token manually but do not resize the token embedding of the model
     tokenizer.add_special_tokens({"pad_token": "[PAD]"})
-    # model_config = AutoConfig.from_pretrained(args.base_model)
-    # configure_dropout(model_config, args.dropout_layer_keys, 0.0)  # disable dropout
-    # if accelerator.is_main_process:
-    #     pprint(model_config)
-    model: PreTrainedModel = ScalarModel(ScalarModelConfig(base_model=args.base_model))
+    model_config = AutoConfig.from_pretrained(args.base_model)
+    configure_dropout(model_config, args.dropout_layer_keys, 0.0)  # disable dropout
+    scalar_model_config = ScalarModelConfig(
+        base_model=args.base_model,
+        base_config=model_config,
+        hidden_size=model_config.hidden_size,
+    )
+    model: PreTrainedModel = ScalarModel(scalar_model_config)
+    if accelerator.is_main_process:
+        pprint(model_config)
     if args.optimizer == "adam":
         optimizer = optim.Adam(model.parameters(), lr=args.lr, eps=args.eps)
     elif args.optimizer == "adamw":
@@ -348,10 +357,11 @@ if __name__ == "__main__":
         deepspeed_states = AcceleratorState().deepspeed_plugin
         deepspeed_states.deepspeed_config["train_micro_batch_size_per_gpu"] = args.local_micro_batch_size
 
-    model, optimizer, dataloader, scheduler = accelerator.prepare(model, optimizer, dataloader, scheduler)
+    model, optimizer, dataloader = accelerator.prepare(model, optimizer, dataloader)
+    # scheduler = accelerator.prepare(scheduler) # breaks with accelerate@0.25.0
     validation_dataloader = accelerator.prepare(validation_dataloader)
 
-    accelerator.print("===training reward model===")
+    accelerator.print("===training model===")
     losses = torch.zeros((args.gradient_accumulation_steps,), device=device)
     accuracies = torch.zeros((args.gradient_accumulation_steps,), device=device)
     reward_preferreds = torch.zeros((args.gradient_accumulation_steps,), device=device)
@@ -368,11 +378,11 @@ if __name__ == "__main__":
             mb_query = data["query_token"]
             mb_responses = torch.cat([data[f"response0_token"].unsqueeze(1), data[f"response1_token"].unsqueeze(1)], dim=1)
             mb_best = data["choice"]
-            mb_query_tiled = mb_query.unsqueeze(1).repeat(1, args.labels.num_labels, 1)
+            mb_query_tiled = mb_query.unsqueeze(1).repeat(1, args.label.num_labels, 1)
             query_responses = torch.cat([mb_query_tiled, mb_responses], dim=2).flatten(0, 1)
             with accelerator.accumulate(model):
                 predicted_reward = get_reward(model, query_responses, tokenizer)
-                predicted_reward = predicted_reward.view(-1, args.labels.num_labels)
+                predicted_reward = predicted_reward.view(-1, args.label.num_labels)
                 accuracy = (predicted_reward.argmax(1) == mb_best).float().mean()
                 reward_preferred = predicted_reward.gather(1, mb_best.view(-1, 1)).view(-1)
                 reward_rejected = predicted_reward.gather(1, (1 - mb_best).view(-1, 1)).view(-1)
@@ -389,30 +399,30 @@ if __name__ == "__main__":
             reward_preferreds[gradient_accumulation_idx] = reward_preferred.mean()
             reward_rejecteds[gradient_accumulation_idx] = reward_rejected.mean()
             gradient_accumulation_idx = (gradient_accumulation_idx + 1) % args.gradient_accumulation_steps
-            break
             if update > 1 and (update - 1) % args.gradient_accumulation_steps == 0:
                 train_accuracy = accelerator.gather(accuracies).mean().item()
-                writer.add_scalar("train/loss", accelerator.gather(losses).mean().item(), global_step)
-                writer.add_scalar("train/accuracy", train_accuracy, global_step)
-                writer.add_scalar("train/reward_preferred", accelerator.gather(reward_preferreds).mean().item(), global_step)
-                writer.add_scalar("train/reward_rejected", accelerator.gather(reward_rejecteds).mean().item(), global_step)
-                writer.add_scalar("train/lr", scheduler.get_last_lr()[0], global_step)
+                writer.add_scalar("train/rm/loss", accelerator.gather(losses).mean().item(), global_step)
+                writer.add_scalar("train/rm/accuracy", train_accuracy, global_step)
+                writer.add_scalar(
+                    "train/rm/reward_preferred", accelerator.gather(reward_preferreds).mean().item(), global_step
+                )
+                writer.add_scalar("train/rm/reward_rejected", accelerator.gather(reward_rejecteds).mean().item(), global_step)
+                writer.add_scalar("train/rm/lr", scheduler.get_last_lr()[0], global_step)
                 accelerator.print(f"{train_accuracy=}, {scheduler.get_last_lr()=}, {update=}")
-        # if args.print_sample_output_freq > 0 and global_step % args.print_sample_output_freq == 0:
 
         if args.run_eval:
             evaluate_df = evaluate(args, accelerator, tokenizer, model, validation_dataloader)
             for split, row in evaluate_df[["split", "accuracy"]].groupby(["split"]).mean().iterrows():
-                writer.add_scalar(f"eval/accuracy/{split}", row["accuracy"], global_step)
-                accelerator.print(f"{split} accuracy: {row['accuracy']}")
+                writer.add_scalar(f"eval/rm/accuracy/split/{split}", row["accuracy"], global_step)
+                accelerator.print(f"eval/rm/accuracy/split/{split}: {row['accuracy']}")
             for batch, row in evaluate_df[["batch", "accuracy"]].groupby(["batch"]).mean().iterrows():
-                writer.add_scalar(f"eval/accuracy/{batch}", row["accuracy"], global_step)
-                accelerator.print(f"{batch} accuracy: {row['accuracy']}")
+                writer.add_scalar(f"eval/rm/accuracy/batch/{batch}", row["accuracy"], global_step)
+                accelerator.print(f"eval/rm/accuracy/batch/{batch}: {row['accuracy']}")
             for confi, row in evaluate_df[["confidence", "accuracy"]].groupby(["confidence"]).mean().iterrows():
-                writer.add_scalar(f"eval/confidence/{confi}", row["accuracy"], global_step)
-                accelerator.print(f"{confi} confidence: {row['accuracy']}")
-            writer.add_scalar("eval/accuracy", evaluate_df["accuracy"].mean(), global_step)
-            accelerator.print(f"eval accuracy: {evaluate_df['accuracy'].mean()}")
+                writer.add_scalar(f"eval/rm/accuracy/confidence/{confi}", row["accuracy"], global_step)
+                accelerator.print(f"eval/rm/accuracy/confidence/{confi}: {row['accuracy']}")
+            writer.add_scalar("eval/rm/accuracy", evaluate_df["accuracy"].mean(), global_step)
+            accelerator.print(f"eval/rm/accuracy: {evaluate_df['accuracy'].mean()}")
             if accelerator.is_main_process:
                 os.makedirs(f"eval_tables/{run_name}", exist_ok=True)
                 evaluate_df.to_csv(f"eval_tables/{run_name}/eval_{update}.csv")
@@ -454,7 +464,7 @@ if __name__ == "__main__":
             "min": norm_df["predicted_reward"].min(),
         }
         for stat_name, stat_value in stats.items():
-            writer.add_scalar(f"eval/normalized_{stat_name}", stat_value, global_step)
+            writer.add_scalar(f"eval/rm/normalized_{stat_name}", stat_value, global_step)
             accelerator.print(f"Normalized Reward {stat_name.capitalize()}: {stat_value}")
 
     # save model
@@ -473,6 +483,7 @@ if __name__ == "__main__":
         unwrapped: PreTrainedModel = accelerator.unwrap_model(model)
         accelerator.wait_for_everyone()
         if accelerator.is_main_process:
+            unwrapped.config.bias = norm_df["predicted_reward"].mean()
             unwrapped.save_pretrained(
                 args.output_dir,
                 is_main_process=accelerator.is_main_process,

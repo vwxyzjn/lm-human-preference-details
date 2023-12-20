@@ -18,19 +18,17 @@ from datasets import load_dataset
 from rich.console import Console
 from rich.pretty import pprint
 from rich.table import Table
-from torch import Tensor, optim
-from torch.optim.optimizer import (
-    _dispatch_sqrt,
-    _get_value,
-    _use_grad_for_differentiable,
-)
+from torch import optim
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from transformers import (
     AutoConfig,
+    AutoModel,
     AutoModelForCausalLM,
     AutoTokenizer,
     GenerationConfig,
+    PretrainedConfig,
+    PreTrainedModel,
 )
 
 INVALID_LOGPROB = 1.0
@@ -44,34 +42,18 @@ class AdaptiveKLParams:
 
 @dataclass
 class RewardHParams:
-    use_adaptive_kl: bool = True
+    use_adaptive_kl: bool = False
     adaptive_kl: Optional[AdaptiveKLParams] = field(default_factory=AdaptiveKLParams)
-    trained_model: Optional[str] = ""
-    label_dataset: tyro.conf.Suppress[Optional[str]] = None
     dataset_mean: float = 0.0
     dataset_std: float = 1.0
-    kl_coef: float = 0.15
+    kl_coef: float = 0.05
 
 
 @dataclass
 class PpoHParams:
-    total_episodes: int = 1000000
-    local_batch_size: int = 64
-    local_mini_batch_size: tyro.conf.Suppress[int] = None
-    batch_size: tyro.conf.Suppress[int] = None
-    mini_batch_size: tyro.conf.Suppress[int] = None
-    gradient_accumulation_steps: int = 64
-    """gradient accumulation steps"""
-    local_micro_batch_size: tyro.conf.Suppress[int] = None
-    """per rank micro batch size"""
-    world_size: tyro.conf.Suppress[int] = None
-    batch_size: tyro.conf.Suppress[int] = None
-    minibatch_size: tyro.conf.Suppress[int] = None
     num_updates: tyro.conf.Suppress[int] = None
     nminibatches: int = 1
     noptepochs: int = 4
-    lr: float = 0.00001
-    eps: float = 1e-5
     vf_coef: float = 0.1
     cliprange: float = 0.2
     cliprange_value: float = 0.2
@@ -132,33 +114,75 @@ class Args:
     """the entity (team) of wandb's project"""
     cuda: bool = True
     """Whether to use cuda if available."""
-    run_name: tyro.conf.Suppress[str] = None
-    """TO BE FILLED: a unique name of this run"""
+    run_name: Optional[str] = None
+    """a unique name of this run"""
     load_from_cache_file: bool = False
     """Whether to load data from the local cache file in `dataset.map`"""
-    upload_model: bool = False
+    push_to_hub: bool = False
     "whether to upload the saved model to huggingface"
     hf_entity: str = ""
     "the user or org name of the model repository from the Hugging Face Hub"
+    deepspeed: bool = False
+    """Whether to use deepspeed to train the model"""
+    print_sample_output_freq: int = 220
+    """How often to print sample output"""
+    # run_eval: bool = False
+    # """Whether to run evaluation"""
 
+    # optimizer args
+    eps: float = 1e-5
+    """the epsilon value for the optimizer"""
+    lr: float = 0.00001
+    """the learning rate"""
+    optimizer: Literal["adam", "adamw"] = "adamw"
+    """Which optimizer to use"""
+    scheduler: str = "cosine"
+    """Which scheduler to use"""
+    warm_up_steps: int = 0
+    """Number of warm up steps for the scheduler"""
+
+    world_size: Optional[int] = None
+    """The number of processes (GPUs) to use"""
+    num_train_epochs: int = 1
+    """Number of epochs to train"""
+    num_updates: Optional[int] = None
+    """The number of updates to train"""
+    gradient_accumulation_steps: int = 64
+    """The number of gradient accumulation steps"""
+    local_micro_batch_size: Optional[int] = 1
+    """The micro batch size per GPU (HF's `per_device_train_batch_size`)"""
+    total_episodes: Optional[int] = 1000000
+    """The total number of episodes in the dataset"""
+    micro_batch_size: Optional[int] = None
+    """The micro batch size across devices (HF's `per_device_train_batch_size` * `world_size`)"""
+    local_batch_size: Optional[int] = None
+    """The batch size per GPU (HF's `per_device_train_batch_size` * `gradient_accumulation_steps`)"""
+    batch_size: Optional[int] = None
+    """The batch size across devices (HF's `per_device_train_batch_size` * `world_size` * `gradient_accumulation_steps`)"""
+    nminibatches: int = 1
+    """Number of minibatches to split a batch into"""
+    local_mini_batch_size: Optional[int] = None
+    """the mini batch size per GPU"""
+    mini_batch_size: Optional[int] = None
+    """the mini batch size across GPUs"""
+    local_eval_batch_size: int = 8
+    """per rank eval batch size"""
+
+    # other args
     base_model: str = "EleutherAI/pythia-160m"
+    """the name of the pretrained model to use"""
+    reward_model_path: str = ""
+    """the name of the pretrained model to use"""
+    sft_model_path: str = "EleutherAI/pythia-160m"
     """the name of the pretrained model to use"""
     dropout_layer_keys: List[str] = field(
         default_factory=lambda: ["attn_pdrop", "embd_pdrop", "resid_pdrop", "summary_first_dropout"]
     )
     """Which layers to apply dropout to"""
-    deepspeed: bool = False
-    """Whether to use deepspeed to train the model"""
-    print_sample_output_freq: int = 10
-    """How often to print sample output"""
-    save_path: str = "models/ppo_policy"
+    output_dir: str = "models/ppo_model"
     """Where to save the model"""
-    optimizer: Literal["tf_adam", "adam", "adamw"] = "adamw"
-    """Which optimizer to use"""
-    sft_model_path: str = ""
-    """Where to load the SFT model"""
     task: TaskHParams = field(default_factory=TaskHParams)
-    rewards: RewardHParams = field(default_factory=RewardHParams)
+    reward: RewardHParams = field(default_factory=RewardHParams)
     ppo: PpoHParams = field(default_factory=PpoHParams)
 
 
@@ -181,152 +205,10 @@ def print_rich_table(title: str, df: pd.DataFrame, console: Console) -> Table:
     console.print(table)
 
 
-def _single_tensor_adam(
-    params: List[Tensor],
-    grads: List[Tensor],
-    exp_avgs: List[Tensor],
-    exp_avg_sqs: List[Tensor],
-    max_exp_avg_sqs: List[Tensor],
-    state_steps: List[Tensor],
-    grad_scale: Optional[Tensor],
-    found_inf: Optional[Tensor],
-    *,
-    amsgrad: bool,
-    beta1: float,
-    beta2: float,
-    lr: float,
-    weight_decay: float,
-    eps: float,
-    maximize: bool,
-    capturable: bool,
-    differentiable: bool,
-):
-    assert grad_scale is None and found_inf is None
-
-    for i, param in enumerate(params):
-        grad = grads[i] if not maximize else -grads[i]
-        exp_avg = exp_avgs[i]
-        exp_avg_sq = exp_avg_sqs[i]
-        step_t = state_steps[i]
-        # update step
-        step_t += 1
-        # Decay the first and second moment running average coefficient
-        exp_avg.mul_(beta1).add_(grad, alpha=1 - beta1)
-        exp_avg_sq.mul_(beta2).addcmul_(grad, grad.conj(), value=1 - beta2)
-        step = _get_value(step_t)
-
-        ### pytorch adam implementation:
-        # bias_correction1 = 1 - beta1 ** step
-        # bias_correction2 = 1 - beta2 ** step
-        # step_size = lr / bias_correction1
-        # bias_correction2_sqrt = _dispatch_sqrt(bias_correction2)
-        # denom = (exp_avg_sq.sqrt() / bias_correction2_sqrt).add_(eps)
-        # param.addcdiv_(exp_avg, denom, value=-step_size)
-
-        ### tensorflow adam implementation:
-        lr_t = lr * _dispatch_sqrt(1 - beta2**step) / (1 - beta1**step)
-        denom = exp_avg_sq.sqrt().add_(eps)
-        param.addcdiv_(exp_avg, denom, value=-lr_t)
-
-
-def adam(
-    params: List[Tensor],
-    grads: List[Tensor],
-    exp_avgs: List[Tensor],
-    exp_avg_sqs: List[Tensor],
-    max_exp_avg_sqs: List[Tensor],
-    state_steps: List[Tensor],
-    # kwonly args with defaults are not supported by functions compiled with torchscript issue #70627
-    # setting this as kwarg for now as functional API is compiled by torch/distributed/optim
-    foreach: Optional[bool] = None,
-    capturable: bool = False,
-    differentiable: bool = False,
-    fused: Optional[bool] = None,
-    grad_scale: Optional[Tensor] = None,
-    found_inf: Optional[Tensor] = None,
-    *,
-    amsgrad: bool,
-    beta1: float,
-    beta2: float,
-    lr: float,
-    weight_decay: float,
-    eps: float,
-    maximize: bool,
-):
-    func = _single_tensor_adam
-
-    func(
-        params,
-        grads,
-        exp_avgs,
-        exp_avg_sqs,
-        max_exp_avg_sqs,
-        state_steps,
-        amsgrad=amsgrad,
-        beta1=beta1,
-        beta2=beta2,
-        lr=lr,
-        weight_decay=weight_decay,
-        eps=eps,
-        maximize=maximize,
-        capturable=capturable,
-        differentiable=differentiable,
-        grad_scale=grad_scale,
-        found_inf=found_inf,
-    )
-
-
-class AdamTensorFlowStyle(optim.Adam):
-    @_use_grad_for_differentiable
-    def step(self, closure=None):
-        self._cuda_graph_capture_health_check()
-        loss = None
-        if closure is not None:
-            with torch.enable_grad():
-                loss = closure()
-
-        for group in self.param_groups:
-            params_with_grad = []
-            grads = []
-            exp_avgs = []
-            exp_avg_sqs = []
-            max_exp_avg_sqs = []
-            state_steps = []
-            beta1, beta2 = group["betas"]
-
-            self._init_group(
-                group,
-                params_with_grad,
-                grads,
-                exp_avgs,
-                exp_avg_sqs,
-                max_exp_avg_sqs,
-                state_steps,
-            )
-
-            adam(
-                params_with_grad,
-                grads,
-                exp_avgs,
-                exp_avg_sqs,
-                max_exp_avg_sqs,
-                state_steps,
-                amsgrad=group["amsgrad"],
-                beta1=beta1,
-                beta2=beta2,
-                lr=group["lr"],
-                weight_decay=group["weight_decay"],
-                eps=group["eps"],
-                maximize=group["maximize"],
-                foreach=group["foreach"],
-                capturable=group["capturable"],
-                differentiable=group["differentiable"],
-                fused=group["fused"],
-                grad_scale=getattr(self, "grad_scale", None),
-                found_inf=getattr(self, "found_inf", None),
-            )
-
-        return loss
+def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
+    torch.nn.init.normal_(layer.weight, std=std)
+    torch.nn.init.constant_(layer.bias, val=bias_const)
+    return layer
 
 
 class AdaptiveKLController:
@@ -341,12 +223,6 @@ class AdaptiveKLController:
         self.value *= mult
 
 
-def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
-    torch.nn.init.normal_(layer.weight, std=std)
-    torch.nn.init.constant_(layer.bias, val=bias_const)
-    return layer
-
-
 def whiten(values, shift_mean=True):
     # `unbiased=False` matches TF `tf.nn.moments`'s setting
     mean, var = torch.mean(values), torch.var(values, unbiased=False)
@@ -356,22 +232,60 @@ def whiten(values, shift_mean=True):
     return whitened
 
 
-class AutoModelForCausalLMWithRewardHead(nn.Module):
-    def __init__(self, lm_backbone):
-        super().__init__()
-        self.lm_backbone = lm_backbone
-        # self.scalar_head = layer_init(
-        #     nn.Linear(lm_backbone.config.hidden_size, 1),
-        #     std=1 / np.sqrt(lm_backbone.config.hidden_size + 1),
-        # )
-        self.scalar_head = layer_init(nn.Linear(lm_backbone.config.hidden_size, 1), std=0)
-        # self.reward_gain = torch.nn.Parameter(torch.tensor(1.0), requires_grad=False)
-        self.reward_bias = torch.nn.Parameter(torch.tensor(0.0), requires_grad=False)
+class ScalarModelConfig(PretrainedConfig):
+    def __init__(
+        self,
+        base_model: str = "EleutherAI/pythia-160m",
+        base_config: PretrainedConfig = AutoConfig.from_pretrained("EleutherAI/pythia-160m"),
+        hidden_size: int = 768,
+        bias: float = 0.0,
+        **kwargs,
+    ):
+        super().__init__(**kwargs)
+        self.base_model = base_model
+        self.base_config = base_config
+        self.hidden_size = hidden_size
+        self.bias = bias
+
+
+class ScalarModel(PreTrainedModel):
+    config_class = ScalarModelConfig
+
+    def __init__(self, config: ScalarModelConfig):
+        super().__init__(config)
+        self.config = config
+        self.lm_backbone = AutoModel.from_pretrained(
+            config.base_model,
+            config=self.config.base_config,
+            trust_remote_code=True,
+        )
+        self.scalar_head = layer_init(
+            nn.Linear(self.config.hidden_size, 1),
+            std=1 / np.sqrt(self.config.hidden_size + 1),
+        )
 
     def forward(self, **kwargs):
         output = self.lm_backbone(**kwargs)
-        reward = self.scalar_head(output.hidden_states[-1]) - self.reward_bias
+        reward = self.scalar_head(output.hidden_states[-1]) - self.config.bias
         return reward
+
+
+def get_reward(model, query_responses, tokenizer):
+    attention_mask = query_responses != tokenizer.pad_token_id
+    input_ids = torch.masked_fill(query_responses, ~attention_mask, 0)
+    reward_logits = model(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        return_dict=True,
+        output_hidden_states=True,
+    )
+    sequence_lengths = first_true_indices(query_responses == tokenizer.pad_token_id) - 1
+    # https://github.com/huggingface/transformers/blob/dc68a39c8111217683bf49a4912d0c9018bab33d/src/transformers/models/gpt2/modeling_gpt2.py#L1454
+    return (
+        reward_logits,
+        reward_logits[torch.arange(reward_logits.size(0), device=reward_logits.device), sequence_lengths].squeeze(-1),
+        sequence_lengths,
+    )
 
 
 # taken from https://github.com/OpenLMLab/MOSS-RLHF/blob/40b91eb2f2b71b16919addede0341d2bef70825d/ppo/ppo_trainer.py#L29
@@ -384,10 +298,6 @@ class PolicyAndValueWrapper(nn.Module):
 
     def forward(self, **kwargs):
         return self.policy(**kwargs), self.critic(**kwargs)
-
-
-def ceil_div(a, b):
-    return (a - 1) // b + 1
 
 
 def exact_div(a, b):
@@ -432,39 +342,12 @@ def truncate_response(args, tokenizer, responses):
     return postprocessed_responses
 
 
-def get_reward(reward_model, query_responses, tokenizer):
+def forward(model, query_responses, tokenizer):
     attention_mask = query_responses != tokenizer.pad_token_id
-    # position_ids = attention_mask.cumsum(1) - attention_mask.long()  # exclusive cumsum
     input_ids = torch.masked_fill(query_responses, ~attention_mask, 0)
-    reward_logits = reward_model(
+    return model(
         input_ids=input_ids,
         attention_mask=attention_mask,
-        # position_ids=position_ids,
-        return_dict=True,
-        output_hidden_states=True,
-    )
-    sequence_lengths = first_true_indices(query_responses == tokenizer.pad_token_id) - 1
-    # sequence_lengths1 = (
-    #     torch.eq(query_responses, tokenizer.pad_token_id).long().argmax(-1) - 1).to(
-    #     query_responses.device
-    # )
-    # print(f"======={sequence_lengths1=} {sequence_lengths=}")
-    # https://github.com/huggingface/transformers/blob/dc68a39c8111217683bf49a4912d0c9018bab33d/src/transformers/models/gpt2/modeling_gpt2.py#L1454
-    return (
-        reward_logits,
-        reward_logits[torch.arange(reward_logits.size(0), device=reward_logits.device), sequence_lengths].squeeze(-1),
-        sequence_lengths,
-    )
-
-
-def forward(policy, query_responses, tokenizer):
-    attention_mask = query_responses != tokenizer.pad_token_id
-    # position_ids = attention_mask.cumsum(1) - attention_mask.long()  # exclusive cumsum
-    input_ids = torch.masked_fill(query_responses, ~attention_mask, 0)
-    return policy(
-        input_ids=input_ids,
-        attention_mask=attention_mask,
-        # position_ids=position_ids,
         return_dict=True,
         output_hidden_states=True,
     )
@@ -473,19 +356,21 @@ def forward(policy, query_responses, tokenizer):
 # def train(args: Args):
 if __name__ == "__main__":
     args = tyro.cli(Args)
-    accelerator = Accelerator(gradient_accumulation_steps=args.ppo.gradient_accumulation_steps)
-    args.ppo.world_size = accelerator.num_processes
-    args.ppo.batch_size = int(args.ppo.local_batch_size * args.ppo.world_size)
-    args.ppo.minibatch_size = exact_div(args.ppo.batch_size, args.ppo.nminibatches)
-    args.ppo.local_mini_batch_size = exact_div(args.ppo.local_batch_size, args.ppo.nminibatches)
-    args.ppo.local_micro_batch_size = exact_div(args.ppo.local_mini_batch_size, args.ppo.gradient_accumulation_steps)
+    accelerator = Accelerator(gradient_accumulation_steps=args.gradient_accumulation_steps)
+    local_seed = args.seed + accelerator.process_index * 100003  # Prime
+    args.world_size = accelerator.num_processes
+    args.local_batch_size = args.local_micro_batch_size * args.gradient_accumulation_steps
+    args.micro_batch_size = int(args.local_micro_batch_size * args.world_size)
+    args.batch_size = int(args.local_batch_size * args.world_size)
+    args.mini_batch_size = exact_div(args.batch_size, args.nminibatches)
+    args.local_mini_batch_size = exact_div(args.local_batch_size, args.nminibatches)
     if args.ppo.whiten_rewards:
         assert (
-            args.ppo.local_mini_batch_size >= 8
-        ), f"Per-rank minibatch size {args.ppo.local_mini_batch_size} is insufficient for whitening"
-    # `per_rank_rollout_batch_size` is our `args.ppo.local_batch_size`
-    # `per_rank_minibatch_size` is our `args.ppo.local_mini_batch_size`
-    args.ppo.num_updates = args.ppo.total_episodes // args.ppo.batch_size
+            args.local_mini_batch_size >= 8
+        ), f"Per-rank minibatch size {args.local_mini_batch_size} is insufficient for whitening"
+    # `per_rank_rollout_batch_size` is our `args.local_batch_size`
+    # `per_rank_minibatch_size` is our `args.local_mini_batch_size`
+    args.ppo.num_updates = args.total_episodes // args.batch_size
     tokenizer = AutoTokenizer.from_pretrained(
         args.base_model,
         padding_side="right",
@@ -521,7 +406,6 @@ if __name__ == "__main__":
         )
         pprint(args)
     device = accelerator.device
-    local_seed = args.seed + accelerator.process_index * 100003  # Prime
     random.seed(local_seed)
     np.random.seed(local_seed)
     torch.manual_seed(local_seed)
@@ -529,63 +413,55 @@ if __name__ == "__main__":
 
     model_config = AutoConfig.from_pretrained(args.base_model)
     configure_dropout(model_config, args.dropout_layer_keys, 0.0)  # disable dropout
+    scalar_model_config = ScalarModelConfig(
+        base_model=args.base_model,
+        base_config=model_config,
+        hidden_size=model_config.hidden_size,
+    )
+    if not args.reward_model_path:
+        critic: PreTrainedModel = ScalarModel(scalar_model_config)
+        reward_model: PreTrainedModel = ScalarModel(scalar_model_config)
+    else:
+        critic: PreTrainedModel = ScalarModel.from_pretrained(
+            args.reward_model_path,
+            trust_remote_code=True,
+        )
+        reward_model: PreTrainedModel = ScalarModel.from_pretrained(
+            args.reward_model_path,
+            trust_remote_code=True,
+        )
     if accelerator.is_main_process:
         pprint(model_config)
-    critic = AutoModelForCausalLMWithRewardHead(
-        AutoModelForCausalLM.from_pretrained(
-            args.base_model,
-            config=model_config,
-            trust_remote_code=True,
-        )
-    )
-    reward_model = AutoModelForCausalLMWithRewardHead(
-        AutoModelForCausalLM.from_pretrained(
-            args.base_model,
-            config=model_config,
-            trust_remote_code=True,
-        )
-    )
-    if args.rewards.trained_model:
-        critic.load_state_dict(torch.load(args.rewards.trained_model, map_location=device), strict=False)
-        critic.reward_bias.data = torch.tensor(args.rewards.dataset_mean)
-        reward_model.load_state_dict(torch.load(args.rewards.trained_model, map_location=device), strict=False)
-        reward_model.reward_bias.data = torch.tensor(args.rewards.dataset_mean)
-        print(f"loaded pretrained reward model from {args.rewards.trained_model}")
+        pprint(reward_model.config)
     # each class should have a separate pretrained model that do not share weights
-    ref_policy = AutoModelForCausalLM.from_pretrained(args.base_model, config=model_config, trust_remote_code=True)
-    policy = AutoModelForCausalLM.from_pretrained(args.base_model, config=model_config, trust_remote_code=True)
-    policy.gradient_checkpointing_enable()
+    ref_policy = AutoModelForCausalLM.from_pretrained(args.sft_model_path, config=model_config, trust_remote_code=True)
+    policy = AutoModelForCausalLM.from_pretrained(args.sft_model_path, config=model_config, trust_remote_code=True)
+    # critic.lm_backbone.gradient_checkpointing_enable()
+    # policy.gradient_checkpointing_enable()
     accelerator.print(policy)
-    critic.lm_backbone.gradient_checkpointing_enable()
     accelerator.print(critic)
-    if args.sft_model_path:
-        policy.load_state_dict(torch.load(args.sft_model_path, map_location=device))
-        ref_policy.load_state_dict(torch.load(args.sft_model_path, map_location=device))
-        print(f"loaded pretrained policy from {args.sft_model_path}")
     policy.generation_config.eos_token_id = None  # disable `pad_token_id` and `eos_token_id` because we just want to
     policy.generation_config.pad_token_id = None  # generate tokens without truncation / padding
     model = PolicyAndValueWrapper(policy, critic)
-    if args.optimizer == "tf_adam":
-        optimizer = AdamTensorFlowStyle(model.parameters(), lr=args.ppo.lr, eps=args.ppo.eps)
-    elif args.optimizer == "adam":
-        optimizer = optim.Adam(model.parameters(), lr=args.ppo.lr, eps=args.ppo.eps)
+    if args.optimizer == "adam":
+        optimizer = optim.Adam(model.parameters(), lr=args.lr, eps=args.eps)
     elif args.optimizer == "adamw":
-        optimizer = optim.AdamW(model.parameters(), lr=args.ppo.lr, eps=args.ppo.eps)
+        optimizer = optim.AdamW(model.parameters(), lr=args.lr, eps=args.eps)
 
     dataset = load_dataset(args.task.query_dataset, split="train")
     validation_dataset = load_dataset(args.task.query_dataset, split="validation")
     dataset = dataset.with_format("torch", columns=["query_token", "reference_response_token"])
     dataset = dataset.shuffle(seed=local_seed)
-    dataloader = DataLoader(dataset, batch_size=args.ppo.local_batch_size)
+    dataloader = DataLoader(dataset, batch_size=args.local_batch_size)
     validation_dataset = validation_dataset.with_format("torch", columns=["query_token", "reference_response_token"])
-    validation_dataloader = DataLoader(validation_dataset, batch_size=args.ppo.local_batch_size)
+    validation_dataloader = DataLoader(validation_dataset, batch_size=args.local_batch_size)
     model, optimizer, dataloader = accelerator.prepare(model, optimizer, dataloader)
     validation_dataloader = accelerator.prepare(validation_dataloader)
     if args.deepspeed:
         import deepspeed
 
         deepspeed_states = AcceleratorState().deepspeed_plugin
-        # deepspeed_states.deepspeed_config["train_micro_batch_size_per_gpu"] = args.ppo.local_micro_batch_size
+        # deepspeed_states.deepspeed_config["train_micro_batch_size_per_gpu"] = args.local_micro_batch_size
         # deepspeed_states.deepspeed_config["checkpoint"] = {"use_node_local_storage": True}
 
         offload = False
@@ -614,25 +490,21 @@ if __name__ == "__main__":
         while True:
             yield from dataloader
 
-    sample_validation_inds = np.arange(args.ppo.batch_size)
+    sample_validation_inds = np.arange(args.batch_size)
     local_sample_validation_inds = sample_validation_inds[accelerator.process_index :: accelerator.num_processes]
     sample_validation = validation_dataset[local_sample_validation_inds]
     sample_validation_queries = torch.Tensor(sample_validation["query_token"]).to(device)
     with torch.no_grad():
-        # sample_validation_queries = shift_pad_id_left(sample_validation_queries, tokenizer.pad_token_id)
         sample_validation_reference_response = torch.Tensor(sample_validation["reference_response_token"]).to(device)
         sample_validation_query_reference_responses = torch.cat(
             (sample_validation_queries, sample_validation_reference_response), dim=1
         )
-        # sample_validation_query_reference_responses = shift_pad_id_left(
-        #     sample_validation_query_reference_responses, tokenizer.pad_token_id
-        # )
         _, sample_validation_reference_scores, _ = get_reward(
             reward_model, sample_validation_query_reference_responses, tokenizer
         )
 
     iter_dataloader = iter(repeat_generator())
-    kl_ctl = AdaptiveKLController(args.rewards.kl_coef, hparams=args.rewards.adaptive_kl)
+    kl_ctl = AdaptiveKLController(args.reward.kl_coef, hparams=args.reward.adaptive_kl)
     # WARNING: even with `max_new_tokens` and `min_new_tokens` set to the same value, the number of tokens generated
     # may not be the same. TODO: investigate further, we just want to generate a fixed number of tokens
     generation_config = GenerationConfig(
@@ -653,9 +525,9 @@ if __name__ == "__main__":
         do_sample=True,
     )
 
-    print("===training policy===")
+    accelerator.print("===training policy===")
     global_step = 0
-    stats_shape = (args.ppo.noptepochs, args.ppo.nminibatches, args.ppo.gradient_accumulation_steps)
+    stats_shape = (args.ppo.noptepochs, args.nminibatches, args.gradient_accumulation_steps)
     approxkl_stats = torch.zeros(stats_shape, device=device)
     pg_clipfrac_stats = torch.zeros(stats_shape, device=device)
     pg_loss_stats = torch.zeros(stats_shape, device=device)
@@ -665,9 +537,9 @@ if __name__ == "__main__":
     ratio_stats = torch.zeros(stats_shape, device=device)
     model.train()
     for update in range(1, args.ppo.num_updates + 1):
-        global_step += 1 * args.ppo.batch_size
+        global_step += 1 * args.batch_size
         frac = 1.0 - (update - 1.0) / args.ppo.num_updates
-        lrnow = frac * args.ppo.lr
+        lrnow = frac * args.lr
         optimizer.param_groups[0]["lr"] = lrnow
         data = next(iter_dataloader)
         with torch.no_grad():
@@ -790,7 +662,8 @@ if __name__ == "__main__":
                             wandb.log(
                                 {"samples/query_responses": wandb.Table(dataframe=all_sample_validation_df)}, step=update
                             )
-                    print_rich_table("stuff", all_sample_validation_df[:4], console)
+                        else:
+                            print_rich_table(f"Sample Output at Step {update}", all_sample_validation_df[:1], console)
 
                 except Exception as e:
                     print(e)
@@ -830,15 +703,15 @@ if __name__ == "__main__":
             # breakpoint()
         # Do multiple epochs of PPO training, with a fresh random shuffle in each epoch
         for ppo_epoch_idx in range(args.ppo.noptepochs):
-            b_inds = np.random.permutation(args.ppo.local_batch_size)
+            b_inds = np.random.permutation(args.local_batch_size)
             minibatch_idx = 0
-            for mini_batch_start in range(0, args.ppo.local_batch_size, args.ppo.local_mini_batch_size):
-                mini_batch_end = mini_batch_start + args.ppo.local_mini_batch_size
+            for mini_batch_start in range(0, args.local_batch_size, args.local_mini_batch_size):
+                mini_batch_end = mini_batch_start + args.local_mini_batch_size
                 mini_batch_inds = b_inds[mini_batch_start:mini_batch_end]
                 gradient_accumulation_idx = 0
-                for micro_batch_start in range(0, args.ppo.local_mini_batch_size, args.ppo.local_micro_batch_size):
+                for micro_batch_start in range(0, args.local_mini_batch_size, args.local_micro_batch_size):
                     with accelerator.accumulate(policy):
-                        micro_batch_end = micro_batch_start + args.ppo.local_micro_batch_size
+                        micro_batch_end = micro_batch_start + args.local_micro_batch_size
                         micro_batch_inds = mini_batch_inds[micro_batch_start:micro_batch_end]
                         mb_return = returns[micro_batch_inds]
                         mb_advantage = advantages[micro_batch_inds]
@@ -964,20 +837,36 @@ if __name__ == "__main__":
             writer.add_scalar("ppo/val/num_eos_tokens", (responses == tokenizer.eos_token_id).sum().item(), update)
             writer.add_scalar("ppo/lr", lrnow, update)
             writer.add_scalar("ppo/episode", global_step, update)
-            if args.rewards.use_adaptive_kl:
-                kl_ctl.update(mean_kl.item(), args.ppo.batch_size)
+            if args.reward.use_adaptive_kl:
+                kl_ctl.update(mean_kl.item(), args.batch_size)
             del kl, mean_kl, mean_entropy, mean_non_score_reward, scores
 
     # save model
-    if args.save_path:
-        os.makedirs(os.path.dirname(args.save_path), exist_ok=True)
-        accelerator.save_model(policy, args.save_path, max_shard_size="1000GB")
+    if args.output_dir and args.num_train_epochs > 0:
+        os.makedirs(os.path.dirname(args.output_dir), exist_ok=True)
+        time_tensor = torch.tensor([int(time.time())], device=device)
+        time_int = accelerator.gather(time_tensor)[0].item()  # avoid different timestamps across processes
+        repo_name = f"{args.base_model.replace('/', '_')}__{args.exp_name}__tldr"
+        repo_id = f"{args.hf_entity}/{repo_name}" if args.hf_entity else repo_name
 
-        if args.upload_model and accelerator.is_main_process:
-            repo_name = f"{args.exp_name}__{args.rewards.label_dataset}__seed{args.seed}__{int(time.time())}"
-            repo_id = f"{args.hf_entity}/{repo_name}" if args.hf_entity else repo_name
-            policy.save_pretrained(repo_id, safe_serialization=True, push_to_hub=True)
-            tokenizer.save_pretrained(repo_id, push_to_hub=True)
+        if accelerator.is_main_process:
+            tokenizer.save_pretrained(args.output_dir, repo_id=repo_id)
+            if args.push_to_hub:
+                tokenizer.push_to_hub(repo_id, revision=f"seed{args.seed}_{str(time_int)}")
+
+        unwrapped: PreTrainedModel = accelerator.unwrap_model(policy)
+        accelerator.wait_for_everyone()
+        if accelerator.is_main_process:
+            unwrapped.save_pretrained(
+                args.output_dir,
+                is_main_process=accelerator.is_main_process,
+                save_function=accelerator.save,
+                state_dict=accelerator.get_state_dict(policy),
+                safe_serialization=False,
+                repo_id=repo_id,
+            )
+            if args.push_to_hub:
+                unwrapped.push_to_hub(repo_id, revision=f"seed{args.seed}_{str(time_int)}", safe_serialization=False)
 
 # if __name__ == "__main__":
 #     args = tyro.cli(Args)

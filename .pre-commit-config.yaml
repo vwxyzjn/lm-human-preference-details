@@ -35,5 +35,5 @@ repos:
     hooks:
       - id: codespell
         args:
-          - --ignore-words-list=nd,reacher,thist,ths,magent,ba,rouge
+          - --ignore-words-list=nd,reacher,thist,ths,magent,ba,rouge,hist
           - --skip=docs/css/termynal.css,docs/js/termynal.js
