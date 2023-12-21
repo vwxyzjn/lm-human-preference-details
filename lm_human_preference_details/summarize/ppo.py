@@ -44,7 +44,6 @@ class AdaptiveKLParams:
 class RewardHParams:
     use_adaptive_kl: bool = False
     adaptive_kl: Optional[AdaptiveKLParams] = field(default_factory=AdaptiveKLParams)
-    dataset_mean: float = 0.0
     dataset_std: float = 1.0
     kl_coef: float = 0.05
 
@@ -590,22 +589,10 @@ if __name__ == "__main__":
 
             # 2. run reward model on the truncated responses
             postprocessed_query_responses = torch.cat((queries, postprocessed_responses), 1)
-            # sequence_lengths = first_true_indices(postprocessed_responses == tokenizer.pad_token_id) - 1
-            # actual_start = torch.arange(postprocessed_responses.size(0), device=postprocessed_responses.device)
-            # actual_end = sequence_lengths
-            # padding_mask = postprocessed_responses == tokenizer.pad_token_id
             sequence_lengths = first_true_indices(postprocessed_responses == tokenizer.pad_token_id) - 1
-
             full_values, _, _ = get_reward(accelerator.unwrap_model(model).critic, query_responses, tokenizer)
             values = full_values[:, context_length - 1 : -1].squeeze(-1)
-            # values_mask = postprocessed_responses != args.task.truncate_token_id
-            # values = torch.masked_fill(values, values_mask, 0)
-            # values = torch.masked_fill(values, padding_mask, 0)
-
-            # logprobs = torch.masked_fill(logprobs, padding_mask, INVALID_LOGPROB)
-            # ref_logprobs = torch.masked_fill(ref_logprobs, padding_mask, INVALID_LOGPROB)
             _, scores, _ = get_reward(reward_model, postprocessed_query_responses, tokenizer)
-
             _, validation_score, _ = get_reward(reward_model, postprocessed_sample_validation_query_responses, tokenizer)
 
             # 3. filter response. Ensure that the sample contains truncate_token_id
@@ -614,16 +601,11 @@ if __name__ == "__main__":
             contain_pad_token = torch.any(postprocessed_responses == tokenizer.pad_token_id, dim=-1)
             scores = torch.where(contain_pad_token, scores, torch.full_like(scores, args.task.penalty_reward_value))
 
-            # TODO: do we need to deal with penalty values?
-            # penalty_values = torch.full_like(values, 0)
-            # penalty_values[:,-1] += args.task.penalty_reward_value
-            # values = torch.where(contain_pad_token, values, penalty_values)
             accelerator.print(f"{scores=}, {(contain_pad_token.sum() / len(contain_pad_token))=}")
             # torch.cuda.empty_cache()
 
             # 4. compute rewards
             kl = logprobs - ref_logprobs
-            # kl = torch.masked_fill(kl, padding_mask, 0)
             non_score_reward = -kl_ctl.value * kl
             rewards = non_score_reward.clone()
             actual_start = torch.arange(rewards.size(0), device=rewards.device)
@@ -673,8 +655,8 @@ if __name__ == "__main__":
                     all_sample_validation_reference_responses,
                     all_sample_validation_df,
                 )
-            # del postprocessed_query_responses
-            # torch.cuda.empty_cache()
+            del postprocessed_query_responses
+            torch.cuda.empty_cache()
 
             # 6. compute advantages and returns
             lastgaelam = 0
@@ -694,13 +676,7 @@ if __name__ == "__main__":
             writer.add_histogram("advantages", advantages[0].float(), global_step)
             accelerator.print("rewards====", rewards[0])
             accelerator.print("advantages====", advantages[0])
-            # raise
-            # pprint({
-            #     "rewards": rewards,
-            #     "returns": returns,
-            #     "advantages": advantages,
-            # })
-            # breakpoint()
+
         # Do multiple epochs of PPO training, with a fresh random shuffle in each epoch
         for ppo_epoch_idx in range(args.ppo.noptepochs):
             b_inds = np.random.permutation(args.local_batch_size)
@@ -725,10 +701,7 @@ if __name__ == "__main__":
                         logits /= args.task.temperature + 1e-7
                         new_all_logprobs = F.log_softmax(logits, dim=-1)
                         new_logprobs = torch.gather(new_all_logprobs, 2, mb_responses.unsqueeze(-1)).squeeze(-1)
-                        # new_logprobs = torch.masked_fill(new_logprobs, padding_mask[micro_batch_inds], INVALID_LOGPROB)
                         vpred = vpred_temp[:, context_length - 1 : -1].squeeze(-1)
-                        # vpred = torch.masked_fill(vpred, padding_mask[micro_batch_inds], 0)
-                        # vpred = torch.masked_fill(vpred, values_mask[micro_batch_inds], 0)
                         vpredclipped = torch.clamp(
                             vpred,
                             mb_values - args.ppo.cliprange_value,
@@ -794,8 +767,6 @@ if __name__ == "__main__":
                         "ratio",
                         ratio_stats[: ppo_epoch_idx + 1].mean().item(),
                     )
-        # raise
-        # breakpoint()
         with torch.no_grad():
             if not args.deepspeed:  # for some reason there is a OOM with the `writer.add_histogram`
                 writer.add_histogram("ppo/val/ratio_hist", ratio, update)
@@ -854,14 +825,14 @@ if __name__ == "__main__":
             if args.push_to_hub:
                 tokenizer.push_to_hub(repo_id, revision=f"seed{args.seed}_{str(time_int)}")
 
-        unwrapped: PreTrainedModel = accelerator.unwrap_model(policy)
+        unwrapped: PreTrainedModel = accelerator.unwrap_model(model).policy
         accelerator.wait_for_everyone()
         if accelerator.is_main_process:
             unwrapped.save_pretrained(
                 args.output_dir,
                 is_main_process=accelerator.is_main_process,
                 save_function=accelerator.save,
-                state_dict=accelerator.get_state_dict(policy),
+                state_dict=accelerator.get_state_dict(unwrapped),
                 safe_serialization=False,
                 repo_id=repo_id,
             )

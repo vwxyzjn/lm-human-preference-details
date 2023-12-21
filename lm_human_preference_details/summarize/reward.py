@@ -295,7 +295,7 @@ if __name__ == "__main__":
     accelerator.print("The number of samples in dataset", len(dataset))
     accelerator.print("The number of samples in validation_dataset", len(validation_dataset))
     args.total_episodes = len(dataset)
-    args.num_updates = args.total_episodes // args.local_batch_size
+    args.num_updates = args.total_episodes // args.batch_size
 
     console = Console(force_terminal=True)
     run_name = f"{args.exp_name}__{args.seed}__{int(time.time())}"
@@ -358,7 +358,6 @@ if __name__ == "__main__":
         deepspeed_states.deepspeed_config["train_micro_batch_size_per_gpu"] = args.local_micro_batch_size
 
     model, optimizer, dataloader = accelerator.prepare(model, optimizer, dataloader)
-    # scheduler = accelerator.prepare(scheduler) # breaks with accelerate@0.25.0
     validation_dataloader = accelerator.prepare(validation_dataloader)
 
     accelerator.print("===training model===")
@@ -393,13 +392,13 @@ if __name__ == "__main__":
                 accelerator.backward(loss)
                 optimizer.step()
                 optimizer.zero_grad()
-                scheduler.step()
             losses[gradient_accumulation_idx] = loss
             accuracies[gradient_accumulation_idx] = accuracy
             reward_preferreds[gradient_accumulation_idx] = reward_preferred.mean()
             reward_rejecteds[gradient_accumulation_idx] = reward_rejected.mean()
             gradient_accumulation_idx = (gradient_accumulation_idx + 1) % args.gradient_accumulation_steps
             if update > 1 and (update - 1) % args.gradient_accumulation_steps == 0:
+                scheduler.step()
                 train_accuracy = accelerator.gather(accuracies).mean().item()
                 writer.add_scalar("train/rm/loss", accelerator.gather(losses).mean().item(), global_step)
                 writer.add_scalar("train/rm/accuracy", train_accuracy, global_step)

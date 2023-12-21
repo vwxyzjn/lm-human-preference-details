@@ -13,6 +13,8 @@ import torch
 import torch.optim as optim
 import tyro
 from accelerate import Accelerator
+from accelerate.state import AcceleratorState
+from accelerate.utils import gather_object
 from datasets import load_dataset
 from rich.console import Console
 from rich.pretty import pprint
@@ -181,10 +183,10 @@ def evaluate(args: Args, accelerator, tokenizer, model, dataloader, generation_c
     model.eval()
     rouge_scores = collections.defaultdict(list)
     all_decode_queries = []
-    all_decode_query_responses = []
     all_decode_responses = []
     all_decode_reference_responses = []
     all_losses = []
+    unwrapped = accelerator.unwrap_model(model)
     for _, data in tqdm(enumerate(dataloader)):
         with torch.no_grad():
             reference_responses = data["reference_response_token"]
@@ -206,28 +208,28 @@ def evaluate(args: Args, accelerator, tokenizer, model, dataloader, generation_c
             all_losses.append(loss)
 
             generated_responses = generate(
-                accelerator.unwrap_model(model),
+                unwrapped,
                 queries,
                 tokenizer,
                 generation_config,
             )
-            decode_queries = tokenizer.batch_decode(accelerator.gather(queries))
-            decode_query_responses = tokenizer.batch_decode(accelerator.gather(generated_responses))
+            decode_queries = tokenizer.batch_decode(queries)
             decode_reference_responses = tokenizer.batch_decode(
-                accelerator.gather(reference_responses),
+                reference_responses,
                 skip_special_tokens=True,
             )
             decode_responses = tokenizer.batch_decode(
-                accelerator.gather(generated_responses[:, -args.task.response_length :]),
+                generated_responses[:, -args.task.response_length :],
                 skip_special_tokens=True,
             )
             rouge_score = rouge.compute(predictions=decode_responses, references=decode_reference_responses)
-            rouge_scores["rouge1"].append(rouge_score["rouge1"])
-            rouge_scores["rouge2"].append(rouge_score["rouge2"])
-            rouge_scores["rougeL"].append(rouge_score["rougeL"])
-
+            decode_queries = gather_object(decode_queries)
+            decode_responses = gather_object(decode_responses)
+            decode_reference_responses = gather_object(decode_reference_responses)
+            rouge_scores["rouge1"].append(np.mean(gather_object([rouge_score["rouge1"]])))
+            rouge_scores["rouge2"].append(np.mean(gather_object([rouge_score["rouge2"]])))
+            rouge_scores["rougeL"].append(np.mean(gather_object([rouge_score["rougeL"]])))
             all_decode_queries.extend(decode_queries)
-            all_decode_query_responses.extend(decode_query_responses)
             all_decode_responses.extend(decode_responses)
             all_decode_reference_responses.extend(decode_reference_responses)
     return (
@@ -264,7 +266,7 @@ if __name__ == "__main__":
     accelerator.print("The number of samples in dataset", len(dataset))
     accelerator.print("The number of samples in validation_dataset", len(validation_dataset))
     args.total_episodes = len(dataset)
-    args.num_updates = args.total_episodes // args.local_batch_size
+    args.num_updates = args.total_episodes // args.batch_size
 
     console = Console(force_terminal=True)
     run_name = f"{args.exp_name}__{args.seed}__{int(time.time())}"
@@ -303,8 +305,6 @@ if __name__ == "__main__":
     tokenizer.add_special_tokens({"pad_token": "[PAD]"})
     model_config = AutoConfig.from_pretrained(args.base_model)
     configure_dropout(model_config, args.dropout_layer_keys, 0.0)  # disable dropout
-    if accelerator.is_main_process:
-        pprint(model_config)
     model: PreTrainedModel = AutoModelForCausalLM.from_pretrained(
         args.base_model,
         config=model_config,
@@ -312,6 +312,8 @@ if __name__ == "__main__":
     )
     model.generation_config.eos_token_id = None  # disable `pad_token_id` and `eos_token_id` because we just want to
     model.generation_config.pad_token_id = None  # generate tokens without truncation / padding
+    if accelerator.is_main_process:
+        pprint(model_config)
     if args.optimizer == "adam":
         optimizer = optim.Adam(model.parameters(), lr=args.lr, eps=args.eps)
     elif args.optimizer == "adamw":
@@ -323,8 +325,11 @@ if __name__ == "__main__":
         num_training_steps=args.num_updates * args.num_train_epochs,
     )
 
+    if args.deepspeed:
+        deepspeed_states = AcceleratorState().deepspeed_plugin
+        deepspeed_states.deepspeed_config["train_micro_batch_size_per_gpu"] = args.local_micro_batch_size
+
     model, optimizer, dataloader = accelerator.prepare(model, optimizer, dataloader)
-    # scheduler = accelerator.prepare(scheduler) # breaks with accelerate@0.25.0
     validation_dataloader = accelerator.prepare(validation_dataloader)
     # WARNING: even with `max_new_tokens` and `min_new_tokens` set to the same value, the number of tokens generated
     # may not be the same. TODO: investigate further, we just want to generate a fixed number of tokens
@@ -364,17 +369,17 @@ if __name__ == "__main__":
                 accelerator.backward(loss)
                 optimizer.step()
                 optimizer.zero_grad()
-                scheduler.step()
             loss_stats[gradient_accumulation_idx] = loss
             gradient_accumulation_idx = (gradient_accumulation_idx + 1) % args.gradient_accumulation_steps
             if update > 1 and (update - 1) % args.gradient_accumulation_steps == 0:
+                scheduler.step()
                 writer.add_scalar("train/sft/loss", accelerator.gather(loss_stats).mean().item(), update)
                 writer.add_scalar("train/sft/lr", scheduler.get_last_lr()[0], update)
                 accelerator.print(f"{loss.item()=}, {scheduler.get_last_lr()=}, {update=}")
 
     if args.run_eval:
         evaluate_df, rouge_scores, all_validation_losses = evaluate(
-            args, accelerator, tokenizer, model, dataloader, generation_config
+            args, accelerator, tokenizer, model, validation_dataloader, generation_config
         )
         if accelerator.is_main_process and args.track:
             wandb.log({"samples/query_responses": wandb.Table(dataframe=evaluate_df)}, step=update)
