@@ -170,6 +170,8 @@ class Args:
     # other args
     base_model: str = "EleutherAI/pythia-160m"
     """the name of the pretrained model to use"""
+    offload: bool = False
+    """Whether to offload ref policy and reward model to CPU"""
     reward_model_path: str = ""
     """the name of the pretrained model to use"""
     sft_model_path: str = "EleutherAI/pythia-160m"
@@ -460,17 +462,16 @@ if __name__ == "__main__":
         import deepspeed
 
         deepspeed_states = AcceleratorState().deepspeed_plugin
-        # deepspeed_states.deepspeed_config["train_micro_batch_size_per_gpu"] = args.local_micro_batch_size
-        # deepspeed_states.deepspeed_config["checkpoint"] = {"use_node_local_storage": True}
+        deepspeed_states.deepspeed_config["train_micro_batch_size_per_gpu"] = args.local_micro_batch_size
 
-        offload = False
         eval_ds_config = {
             "train_micro_batch_size_per_gpu": deepspeed_states.deepspeed_config["train_micro_batch_size_per_gpu"],
             "bf16": {"enabled": True},
             "prescale_gradients": False,
             "wall_clock_breakdown": False,
         }
-        if offload:
+        if args.offload:
+            deepspeed_states.deepspeed_config["checkpoint"] = {"use_node_local_storage": True}
             eval_ds_config["zero_optimization"] = {
                 "stage": 3,
                 "stage3_param_persistence_threshold": 1e4,
