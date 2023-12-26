@@ -272,7 +272,17 @@ if __name__ == "__main__":
     dataset = dataset.shuffle(seed=local_seed)
     dataset = dataset.select(range(args.label.num_train))
     dataset = dataset.with_format(
-        "torch", columns=["query_token", "choice", "response0_token", "query_response0_token", "response1_token", "query_response1_token", "batch", "split"]
+        "torch",
+        columns=[
+            "query_token",
+            "choice",
+            "response0_token",
+            "query_response0_token",
+            "response1_token",
+            "query_response1_token",
+            "batch",
+            "split",
+        ],
     )
     dataloader = DataLoader(dataset, batch_size=args.local_micro_batch_size)
     validation_dataset = load_dataset(args.label_dataset, "comparisons", split="validation").flatten()
@@ -374,7 +384,9 @@ if __name__ == "__main__":
         for data in dataloader:
             update += 1
             global_step += args.micro_batch_size
-            query_responses = torch.cat([data['query_response0_token'].unsqueeze(1), data['query_response1_token'].unsqueeze(1)], dim=1).flatten(0, 1)
+            query_responses = torch.cat(
+                [data["query_response0_token"].unsqueeze(1), data["query_response1_token"].unsqueeze(1)], dim=1
+            ).flatten(0, 1)
             mb_best = data["choice"]
             # mb_query = data["query_token"]
             # mb_responses = torch.cat([data[f"response0_token"].unsqueeze(1), data[f"response1_token"].unsqueeze(1)], dim=1)
@@ -408,7 +420,9 @@ if __name__ == "__main__":
                 )
                 writer.add_scalar("train/rm/reward_rejected", accelerator.gather(reward_rejecteds).mean().item(), global_step)
                 writer.add_scalar("train/rm/lr", scheduler.get_last_lr()[0], global_step)
-                accelerator.print(f"{train_accuracy=}, {scheduler.get_last_lr()=}, {optimizer.param_groups[0]['lr']=}, {update=}")
+                accelerator.print(
+                    f"{train_accuracy=}, {scheduler.get_last_lr()=}, {optimizer.param_groups[0]['lr']=}, {update=}"
+                )
 
         if args.run_eval:
             evaluate_df = evaluate(args, accelerator, tokenizer, model, validation_dataloader)

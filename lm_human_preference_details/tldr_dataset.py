@@ -1,6 +1,7 @@
 import multiprocessing
 import os
 from dataclasses import dataclass
+from pprint import pformat
 from typing import Dict, Optional
 
 import matplotlib.pyplot as plt
@@ -8,11 +9,9 @@ import pandas as pd
 import tyro
 from datasets import load_dataset
 from huggingface_hub import HfApi
+from huggingface_hub.repocard import RepoCard
 from rich.pretty import pprint
 from transformers import AutoTokenizer
-from huggingface_hub.repocard import RepoCard
-from pprint import pformat
-
 
 api = HfApi()
 
@@ -38,9 +37,9 @@ poetry run python lm_human_preference_details/tldr_dataset.py \
 class Args:
     base_model: str = "gpt2"  # EleutherAI/pythia-160m
     max_sft_response_length: int = 48  # 53
-    max_sft_query_response_length: int = 512 + 48 # 565
+    max_sft_query_response_length: int = 512 + 48  # 565
     max_rm_response_length: int = 153  # 169
-    max_rm_query_response_length: int = 512 + 153 # 665
+    max_rm_query_response_length: int = 512 + 153  # 665
     hf_entity: str = None
 
 
@@ -166,7 +165,10 @@ if __name__ == "__main__":
     sft_ds.push_to_hub(
         f"{args.hf_entity}/summarize_from_feedback_tldr_3_filtered_oai_preprocessing_{args.base_model.split('/')[-1]}_{args.max_sft_response_length}"
     )
-    sft_card = RepoCard.load(f"{args.hf_entity}/summarize_from_feedback_tldr_3_filtered_oai_preprocessing_{args.base_model.split('/')[-1]}_{args.max_sft_response_length}", repo_type="dataset")
+    sft_card = RepoCard.load(
+        f"{args.hf_entity}/summarize_from_feedback_tldr_3_filtered_oai_preprocessing_{args.base_model.split('/')[-1]}_{args.max_sft_response_length}",
+        repo_type="dataset",
+    )
     sft_card.text = f"""\
 # TL;DR SFT Dataset for OpenAI's [Summarize from Feedback](https://openai.com/blog/summarization/) task
 
@@ -258,7 +260,9 @@ These columns are added by this preprocessing script:
         axs[j].hist(df["reference_response_token_len"], bins=100)
         axs[j].set_title(f"{key} split: reference response token length\nmax_length={max(df['reference_response_token_len'])}")
         axs[j + 1].hist(df["query_reference_response_token_len"], bins=100)
-        axs[j + 1].set_title(f"{key} split: query.strip() + reference response token length\nmax_length={max(df['query_reference_response_token_len'])}")
+        axs[j + 1].set_title(
+            f"{key} split: query.strip() + reference response token length\nmax_length={max(df['query_reference_response_token_len'])}"
+        )
         j += 2
     offset = len(sft_ds)
     for _, key in enumerate(label_ds.keys()):
@@ -268,9 +272,13 @@ These columns are added by this preprocessing script:
         axs[j + 1].hist(df["response1_token_len"], bins=100)
         axs[j + 1].set_title(f"{key} split: response1 token length\nmax_length={max(df['response1_token_len'])}")
         axs[j + 2].hist(df["query_response0_token_len"], bins=100)
-        axs[j + 2].set_title(f"{key} split: query.strip() + response0 token length\nmax_length={max(df['query_response0_token_len'])}")
+        axs[j + 2].set_title(
+            f"{key} split: query.strip() + response0 token length\nmax_length={max(df['query_response0_token_len'])}"
+        )
         axs[j + 3].hist(df["query_response1_token_len"], bins=100)
-        axs[j + 3].set_title(f"{key} split: query.strip() + response1 token length\nmax_length={max(df['query_response1_token_len'])}")
+        axs[j + 3].set_title(
+            f"{key} split: query.strip() + response1 token length\nmax_length={max(df['query_response1_token_len'])}"
+        )
         j += 4
     fig.suptitle(f"{args.base_model} Tokenizer: Token length distribution")
     fig.tight_layout()
