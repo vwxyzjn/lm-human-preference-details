@@ -258,7 +258,7 @@ if __name__ == "__main__":
     # load dataset
     dataset = load_dataset(args.task.query_dataset, split="train")
     dataset = dataset.shuffle(seed=local_seed)
-    dataset = dataset.with_format("torch", columns=["query_token", "reference_response_token"])
+    dataset = dataset.with_format("torch", columns=["query_reference_response_token"])
     dataloader = DataLoader(dataset, batch_size=args.local_micro_batch_size)
     validation_dataset = load_dataset(args.task.query_dataset, split="validation")
     validation_dataset = validation_dataset.with_format("torch", columns=["query_token", "reference_response_token"])
@@ -353,9 +353,9 @@ if __name__ == "__main__":
         for data in dataloader:
             update += 1
             global_step += args.micro_batch_size
-            reference_responses = data["reference_response_token"].to(device, non_blocking=True)
-            queries = data["query_token"].to(device, non_blocking=True)
-            query_responses = torch.cat((queries, reference_responses), dim=1)
+            # reference_responses = data["reference_response_token"].to(device, non_blocking=True)
+            # queries = data["query_token"].to(device, non_blocking=True)
+            query_responses = data["query_reference_response_token"]
             with accelerator.accumulate(model):
                 output = forward(model, query_responses, tokenizer)
                 # mask out gradient effects on response padding tokens
@@ -375,7 +375,7 @@ if __name__ == "__main__":
                 scheduler.step()
                 writer.add_scalar("train/sft/loss", accelerator.gather(loss_stats).mean().item(), update)
                 writer.add_scalar("train/sft/lr", scheduler.get_last_lr()[0], update)
-                accelerator.print(f"{loss.item()=}, {scheduler.get_last_lr()=}, {update=}")
+                accelerator.print(f"{loss.item()=}, {scheduler.get_last_lr()=}, {optimizer.param_groups[0]['lr']=}, {update=}")
 
     if args.run_eval:
         evaluate_df, rouge_scores, all_validation_losses = evaluate(

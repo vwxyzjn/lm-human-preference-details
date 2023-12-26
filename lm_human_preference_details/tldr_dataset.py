@@ -10,6 +10,9 @@ from datasets import load_dataset
 from huggingface_hub import HfApi
 from rich.pretty import pprint
 from transformers import AutoTokenizer
+from huggingface_hub.repocard import RepoCard
+from pprint import pformat
+
 
 api = HfApi()
 
@@ -17,9 +20,17 @@ api = HfApi()
 """
 poetry run python lm_human_preference_details/tldr_dataset.py
 poetry run python lm_human_preference_details/tldr_dataset.py \
-    --base-model=EleutherAI/pythia-160m \
-    --max-sft-response-length=53 \
-    --max-rm-response-length=169
+    --base_model=EleutherAI/pythia-160m \
+    --max_sft_response_length=53 \
+    --max_sft_query_response_length=562 \
+    --max-rm-response-length=169 \
+    --max_rm_query_response_length=638
+poetry run python lm_human_preference_details/tldr_dataset.py \
+    --base_model=EleutherAI/pythia-160m \
+    --max_sft_response_length=48 \
+    --max_sft_query_response_length=560 \
+    --max-rm-response-length=48 \
+    --max_rm_query_response_length=560
 """
 
 
@@ -27,7 +38,9 @@ poetry run python lm_human_preference_details/tldr_dataset.py \
 class Args:
     base_model: str = "gpt2"  # EleutherAI/pythia-160m
     max_sft_response_length: int = 48  # 53
+    max_sft_query_response_length: int = 512 + 48 # 565
     max_rm_response_length: int = 153  # 169
+    max_rm_query_response_length: int = 512 + 153 # 665
     hf_entity: str = None
 
 
@@ -128,7 +141,7 @@ if __name__ == "__main__":
         # DOES NOT HAVE a leading space so we are adding the leading space and
         # `<|endoftext|>` token
         reference_response = f" {x['summary']}<|endoftext|>"
-        return {
+        y = {
             **process_query(x, encoder=tokenizer, hparams=oai_h),
             "reference_response": reference_response,
             "reference_response_token": tokenizer.encode(
@@ -139,10 +152,55 @@ if __name__ == "__main__":
             ),
             "reference_response_token_len": len(tokenizer.encode(reference_response)),
         }
+        y["query_reference_response"] = y["query"].strip() + y["reference_response"]
+        y["query_reference_response_token"] = tokenizer.encode(
+            y["query_reference_response"],
+            padding="max_length",
+            max_length=args.max_sft_query_response_length,
+            truncation=True,
+        )
+        y["query_reference_response_token_len"] = len(tokenizer.encode(y["query_reference_response"]))
+        return y
 
     sft_ds = sft_ds.map(process_query_data, load_from_cache_file=False, num_proc=multiprocessing.cpu_count())
     sft_ds.push_to_hub(
         f"{args.hf_entity}/summarize_from_feedback_tldr_3_filtered_oai_preprocessing_{args.base_model.split('/')[-1]}_{args.max_sft_response_length}"
+    )
+    sft_card = RepoCard.load(f"{args.hf_entity}/summarize_from_feedback_tldr_3_filtered_oai_preprocessing_{args.base_model.split('/')[-1]}_{args.max_sft_response_length}", repo_type="dataset")
+    sft_card.text = f"""\
+# TL;DR SFT Dataset for OpenAI's [Summarize from Feedback](https://openai.com/blog/summarization/) task
+
+The dataset is directly taken from https://github.com/openai/summarize-from-feedback/tree/700967448d10004279f138666442bf1497d0e705#reddit-tldr-dataset
+
+These columns are taken directly from the aforementioned dataset:
+
+* **id**: unique identifier for the post
+* **subreddit**: subreddit the post was taken from
+* **title**: title of the post
+* **post**: body of the post
+* **summary**: summary of the post
+* **reference_response**: reference response for the post
+
+These columns are added by this preprocessing script:
+* **query**: length-limited query for summarization: OAI pre-processes the main text (title + subreddit + post), ensuring it has only 512 tokens; if the main text is too long, then it tries to truncate at the last `\n`. If it's too short it pads the main text ([summarize_from_feedback/tasks.py#L98-L165](https://github.com/openai/summarize-from-feedback/blob/700967448d10004279f138666442bf1497d0e705/summarize_from_feedback/tasks.py#L98-L165)). Padding is either space or `[PAD]` token (see Args below).
+* **query_token**: tokenized version of `query`
+* **reference_response_token**: tokenized version of `reference_response`
+* **reference_response_token_len**: length of `reference_response_token`
+* **query_reference_response**: concatenation of `query.strip()` and `reference_response`
+* **query_reference_response_token**: tokenized version of `query_reference_response`, up to `max_sft_query_response_length` tokens
+* **query_reference_response_token_len**: length of `query_reference_response_token`
+
+
+# Args
+
+```python
+{pformat(vars(args))}
+{pformat(vars(oai_h))}
+```
+"""
+    sft_card.push_to_hub(
+        f"{args.hf_entity}/summarize_from_feedback_tldr_3_filtered_oai_preprocessing_{args.base_model.split('/')[-1]}_{args.max_sft_response_length}",
+        repo_type="dataset",
     )
 
     label_ds = load_dataset("openai/summarize_from_feedback", "comparisons")
@@ -155,7 +213,7 @@ if __name__ == "__main__":
         response0_policy = x["summaries"][0]["policy"]
         response1_policy = x["summaries"][1]["policy"]
         policies = "--".join(sorted([response0_policy, response1_policy]))
-        return {
+        y = {
             **process_query(x["info"], encoder=tokenizer, hparams=oai_h),
             "response0": response0,
             "response0_token": tokenizer.encode(
@@ -171,6 +229,17 @@ if __name__ == "__main__":
             "response1_policy": response1_policy,
             "policies": policies,
         }
+        y["query_response0"] = y["query"].strip() + y["response0"]
+        y["query_response0_token"] = tokenizer.encode(
+            y["query_response0"], padding="max_length", max_length=args.max_rm_query_response_length, truncation=True
+        )
+        y["query_response0_token_len"] = len(tokenizer.encode(y["query_response0"]))
+        y["query_response1"] = y["query"].strip() + y["response1"]
+        y["query_response1_token"] = tokenizer.encode(
+            y["query_response1"], padding="max_length", max_length=args.max_rm_query_response_length, truncation=True
+        )
+        y["query_response1_token_len"] = len(tokenizer.encode(y["query_response1"]))
+        return y
 
     label_ds = label_ds.map(process_response_data, load_from_cache_file=False, num_proc=multiprocessing.cpu_count())
     label_ds.push_to_hub(
@@ -179,21 +248,30 @@ if __name__ == "__main__":
 
     os.makedirs("dataset_visuals", exist_ok=True)
     # visualize token length distribution
-    num_subplots = len(sft_ds) + len(label_ds) * 2
+    num_subplots = len(sft_ds) * 2 + len(label_ds) * 4
     print(f"{num_subplots=}")
-    fig, axs = plt.subplots(3, 3, figsize=(16, 16))
+    fig, axs = plt.subplots(5, 3, figsize=(16, 16))
     axs = axs.flatten()
-    for i, key in enumerate(sft_ds.keys()):
+    j = 0
+    for _, key in enumerate(sft_ds.keys()):
         df = sft_ds[key].to_pandas()
-        axs[i].hist(df["reference_response_token_len"], bins=100)
-        axs[i].set_title(f"{key} split: reference response token length\nmax_length={max(df['reference_response_token_len'])}")
+        axs[j].hist(df["reference_response_token_len"], bins=100)
+        axs[j].set_title(f"{key} split: reference response token length\nmax_length={max(df['reference_response_token_len'])}")
+        axs[j + 1].hist(df["query_reference_response_token_len"], bins=100)
+        axs[j + 1].set_title(f"{key} split: query.strip() + reference response token length\nmax_length={max(df['query_reference_response_token_len'])}")
+        j += 2
     offset = len(sft_ds)
-    for i, key in enumerate(label_ds.keys()):
+    for _, key in enumerate(label_ds.keys()):
         df = label_ds[key].to_pandas()
-        axs[2 * i + offset].hist(df["response0_token_len"], bins=100)
-        axs[2 * i + offset].set_title(f"{key} split: response0 token length\nmax_length={max(df['response0_token_len'])}")
-        axs[2 * i + offset + 1].hist(df["response1_token_len"], bins=100)
-        axs[2 * i + offset + 1].set_title(f"{key} split: response1 token length\nmax_length={max(df['response1_token_len'])}")
+        axs[j].hist(df["response0_token_len"], bins=100)
+        axs[j].set_title(f"{key} split: response0 token length\nmax_length={max(df['response0_token_len'])}")
+        axs[j + 1].hist(df["response1_token_len"], bins=100)
+        axs[j + 1].set_title(f"{key} split: response1 token length\nmax_length={max(df['response1_token_len'])}")
+        axs[j + 2].hist(df["query_response0_token_len"], bins=100)
+        axs[j + 2].set_title(f"{key} split: query.strip() + response0 token length\nmax_length={max(df['query_response0_token_len'])}")
+        axs[j + 3].hist(df["query_response1_token_len"], bins=100)
+        axs[j + 3].set_title(f"{key} split: query.strip() + response1 token length\nmax_length={max(df['query_response1_token_len'])}")
+        j += 4
     fig.suptitle(f"{args.base_model} Tokenizer: Token length distribution")
     fig.tight_layout()
     fig.savefig("dataset_visuals/token_len.png")
