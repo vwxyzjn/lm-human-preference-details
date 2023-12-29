@@ -13,6 +13,7 @@ import torch.nn.functional as F
 import torch.optim as optim
 import tyro
 from accelerate import Accelerator
+from accelerate.utils import gather_object
 from accelerate.state import AcceleratorState
 from datasets import load_dataset
 from rich.console import Console
@@ -30,6 +31,8 @@ from transformers import (
     PretrainedConfig,
     PreTrainedModel,
 )
+from tqdm import tqdm
+
 
 INVALID_LOGPROB = 1.0
 
@@ -125,8 +128,8 @@ class Args:
     """Whether to use deepspeed to train the model"""
     print_sample_output_freq: int = 220
     """How often to print sample output"""
-    # run_eval: bool = False
-    # """Whether to run evaluation"""
+    run_eval: bool = False
+    """Whether to run evaluation"""
 
     # optimizer args
     eps: float = 1e-5
@@ -354,6 +357,65 @@ def forward(model, query_responses, tokenizer):
     )
 
 
+@dataclass
+class EvalStorage:
+    query_token: List[str] = field(default_factory=list)
+    postprocessed_response_token: List[str] = field(default_factory=list)
+    reference_response_token: List[str] = field(default_factory=list)
+    score: List[float] = field(default_factory=list)
+    reference_score: List[float] = field(default_factory=list)
+    
+    query: List[str] = field(default_factory=list)
+    postprocessed_response: List[str] = field(default_factory=list)
+    reference_response: List[str] = field(default_factory=list)
+    
+
+def evaluate(args: Args, reward_model, policy, tokenizer, dataloader, generation_config, sampling=True):
+    eval_storage = EvalStorage()
+    with torch.no_grad():
+        for data in tqdm(dataloader):
+            queries = data["query_token"]
+            reference_response_token = data["reference_response_token"]
+            query_reference_responses = torch.cat((data["query_token"], data["reference_response_token"]), dim=1)
+            _, reference_score, _ = get_reward(reward_model, query_reference_responses, tokenizer)
+
+            context_length = queries.shape[1]
+            query_responses = generate(
+                policy,
+                queries,
+                tokenizer,
+                generation_config,
+            )
+            responses = query_responses[:, context_length:]
+            postprocessed_responses = truncate_response(args, tokenizer, responses)
+            postprocessed_query_responses = torch.cat((queries, postprocessed_responses), 1)
+            _, score, _ = get_reward(reward_model, postprocessed_query_responses, tokenizer)
+
+            eval_storage.query_token.extend(queries)
+            eval_storage.reference_response_token.extend(reference_response_token)
+            eval_storage.reference_score.append(reference_score)
+            eval_storage.postprocessed_response_token.extend(postprocessed_responses)
+            eval_storage.score.append(score)
+            if sampling:
+                break
+
+    eval_storage.query = tokenizer.batch_decode(eval_storage.query_token, skip_special_tokens=True)
+    eval_storage.reference_response = tokenizer.batch_decode(eval_storage.reference_response_token)
+    eval_storage.postprocessed_response = tokenizer.batch_decode(eval_storage.postprocessed_response_token, skip_special_tokens=True)
+    eval_score = torch.cat(eval_storage.score).cpu().numpy().tolist()
+    eval_reference_score = torch.cat(eval_storage.reference_score).cpu().numpy().tolist()
+    eval_df = pd.DataFrame(
+        {
+            "query": gather_object(eval_storage.query),
+            "postprocessed_response": gather_object(eval_storage.postprocessed_response),
+            "reference_responses": gather_object(eval_storage.reference_response),
+            "scores": gather_object(eval_score),
+            "reference_scores": gather_object(eval_reference_score),
+        }
+    )
+    return eval_storage, eval_df
+
+
 # def train(args: Args):
 if __name__ == "__main__":
     args = tyro.cli(Args)
@@ -455,7 +517,7 @@ if __name__ == "__main__":
     dataset = dataset.shuffle(seed=local_seed)
     dataloader = DataLoader(dataset, batch_size=args.local_batch_size)
     validation_dataset = validation_dataset.with_format("torch", columns=["query_token", "reference_response_token"])
-    validation_dataloader = DataLoader(validation_dataset, batch_size=args.local_batch_size)
+    validation_dataloader = DataLoader(validation_dataset, batch_size=args.local_eval_batch_size)
     model, optimizer, dataloader = accelerator.prepare(model, optimizer, dataloader)
     validation_dataloader = accelerator.prepare(validation_dataloader)
     if args.deepspeed:
@@ -489,19 +551,6 @@ if __name__ == "__main__":
     def repeat_generator():  # TODO: ideally we shuffle the dataloader as well
         while True:
             yield from dataloader
-
-    sample_validation_inds = np.arange(args.batch_size)
-    local_sample_validation_inds = sample_validation_inds[accelerator.process_index :: accelerator.num_processes]
-    sample_validation = validation_dataset[local_sample_validation_inds]
-    sample_validation_queries = torch.Tensor(sample_validation["query_token"]).to(device)
-    with torch.no_grad():
-        sample_validation_reference_response = torch.Tensor(sample_validation["reference_response_token"]).to(device)
-        sample_validation_query_reference_responses = torch.cat(
-            (sample_validation_queries, sample_validation_reference_response), dim=1
-        )
-        _, sample_validation_reference_scores, _ = get_reward(
-            reward_model, sample_validation_query_reference_responses, tokenizer
-        )
 
     iter_dataloader = iter(repeat_generator())
     kl_ctl = AdaptiveKLController(args.reward.kl_coef, hparams=args.reward.adaptive_kl)
@@ -553,18 +602,21 @@ if __name__ == "__main__":
             context_length = queries.shape[1]
             responses = query_responses[:, context_length:]
 
-            # validation
-            sample_validation_query_responses = generate(
-                accelerator.unwrap_model(model).policy,
-                sample_validation_queries,
-                tokenizer,
-                validation_generation_config,
-            )
-            sample_validation_responses = sample_validation_query_responses[:, context_length:]
-            postprocessed_sample_validation_responses = truncate_response(args, tokenizer, sample_validation_responses)
-            postprocessed_sample_validation_query_responses = torch.cat(
-                (sample_validation_queries, postprocessed_sample_validation_responses), 1
-            )
+            eval_storage, eval_df = evaluate(args, reward_model, accelerator.unwrap_model(model).policy, tokenizer, validation_dataloader, validation_generation_config)
+            validation_score = eval_storage.score[0]
+            if args.print_sample_output_freq > 0 and (update - 1) % args.print_sample_output_freq == 0:
+                if accelerator.is_main_process:
+                    eval_df.to_csv(f"runs/{run_name}_{global_step}/table.csv")
+                    if args.track:
+                        wandb.log(
+                            {"samples/query_responses": wandb.Table(dataframe=eval_df)}, step=update
+                        )
+                    else:
+                        try:
+                            print_rich_table(f"Sample Output at Step {update}", eval_df[:1], console)
+                        except Exception as e:
+                            print(e)
+            del eval_storage, eval_df
             torch.cuda.empty_cache()
 
             # TODO: do I do this with query response or post-processed query response?
@@ -594,14 +646,12 @@ if __name__ == "__main__":
             full_values, _, _ = get_reward(accelerator.unwrap_model(model).critic, query_responses, tokenizer)
             values = full_values[:, context_length - 1 : -1].squeeze(-1)
             _, scores, _ = get_reward(reward_model, postprocessed_query_responses, tokenizer)
-            _, validation_score, _ = get_reward(reward_model, postprocessed_sample_validation_query_responses, tokenizer)
 
             # 3. filter response. Ensure that the sample contains truncate_token_id
             # responses not passing that filter will receive a low (fixed) score
             # only query humans on responses that pass that filter
             contain_pad_token = torch.any(postprocessed_responses == tokenizer.pad_token_id, dim=-1)
             scores = torch.where(contain_pad_token, scores, torch.full_like(scores, args.task.penalty_reward_value))
-
             accelerator.print(f"{scores=}, {(contain_pad_token.sum() / len(contain_pad_token))=}")
             # torch.cuda.empty_cache()
 
@@ -616,48 +666,6 @@ if __name__ == "__main__":
             # 5. whiten rewards
             if args.ppo.whiten_rewards:
                 rewards = whiten(rewards, shift_mean=False)
-
-            if args.print_sample_output_freq > 0 and (update - 1) % args.print_sample_output_freq == 0:
-                try:
-                    all_decode_validation_queries = tokenizer.batch_decode(sample_validation_queries, skip_special_tokens=True)
-                    all_sample_validation_responses = tokenizer.batch_decode(sample_validation_responses)
-                    all_sample_validation_query_responses_postprocessed = tokenizer.batch_decode(
-                        postprocessed_sample_validation_query_responses, skip_special_tokens=True
-                    )
-                    all_sample_validation_postprocessed_responses = [
-                        x[len(y) :]
-                        for x, y in zip(all_sample_validation_query_responses_postprocessed, all_decode_validation_queries)
-                    ]
-                    all_sample_validation_reference_responses = tokenizer.batch_decode(sample_validation_reference_response)
-                    all_sample_validation_df = pd.DataFrame(
-                        {
-                            "query": all_decode_validation_queries,
-                            "response": all_sample_validation_responses,
-                            "postprocessed_response": all_sample_validation_postprocessed_responses,
-                            "reference_responses": all_sample_validation_reference_responses,
-                            "scores": validation_score.float().cpu().numpy(),
-                            "reference_scores": sample_validation_reference_scores.float().cpu().numpy(),
-                        }
-                    )
-                    if accelerator.is_main_process:
-                        all_sample_validation_df.to_json(f"runs/{run_name}/table.json")
-                        if args.track:
-                            wandb.log(
-                                {"samples/query_responses": wandb.Table(dataframe=all_sample_validation_df)}, step=update
-                            )
-                        else:
-                            print_rich_table(f"Sample Output at Step {update}", all_sample_validation_df[:1], console)
-
-                except Exception as e:
-                    print(e)
-                del (
-                    all_decode_validation_queries,
-                    all_sample_validation_responses,
-                    all_sample_validation_reference_responses,
-                    all_sample_validation_df,
-                )
-            del postprocessed_query_responses
-            torch.cuda.empty_cache()
 
             # 6. compute advantages and returns
             lastgaelam = 0
@@ -812,6 +820,14 @@ if __name__ == "__main__":
             if args.reward.use_adaptive_kl:
                 kl_ctl.update(mean_kl.item(), args.batch_size)
             del kl, mean_kl, mean_entropy, mean_non_score_reward, scores
+
+    if args.run_eval:
+        eval_storage, eval_df = evaluate(args, reward_model, accelerator.unwrap_model(model).policy, tokenizer, validation_dataloader, validation_generation_config, sampling=False)
+        eval_df.to_csv(f"runs/{run_name}/table.csv")
+        if accelerator.is_main_process and args.track:
+            wandb.log(
+                {"eval/query_responses": wandb.Table(dataframe=eval_df)}, step=update
+            )
 
     # save model
     if args.output_dir and args.num_train_epochs > 0:
