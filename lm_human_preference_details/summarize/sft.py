@@ -52,7 +52,8 @@ class TaskHParams:
     response_length: int = 53
 
     # Truncate response after the first occurrence of this token at or after index after when sampling.
-    truncate_token: int = 50256  # EOS token
+    truncate_token: Literal["eos"] = "eos"
+    truncate_token_id: Optional[int] = None
     truncate_after: int = 16
     penalty_reward_value: int = -1
 
@@ -169,6 +170,26 @@ def generate(lm_backbone, queries, tokenizer, generation_config):
     return torch.cat((queries, output.sequences[:, context_length:]), dim=1)
 
 
+def first_true_indices(bools, dtype=torch.long):
+    """
+    Takes an N-dimensional bool tensor and returns an (N-1)-dimensional tensor of integers giving
+    the position of the first True in each "row".
+
+    Returns the length of the rows (bools.size(-1)) if no element is True in a given row.
+    """
+    row_len = bools.size(-1)
+    zero_or_index = row_len * (~bools).type(dtype) + torch.arange(row_len, dtype=dtype, device=bools.device)
+    return torch.min(zero_or_index, dim=-1).values
+
+
+def truncate_response(args, tokenizer, responses):
+    trunc_idxs = first_true_indices(responses == args.task.truncate_token_id).unsqueeze(-1)
+    new_size = [1] * (len(responses.size()) - 1) + [args.task.response_length]
+    idxs = torch.arange(args.task.response_length, device=responses.device).view(*new_size)
+    postprocessed_responses = torch.masked_fill(responses, idxs > trunc_idxs, tokenizer.pad_token_id)
+    return postprocessed_responses
+
+
 def forward(model, query_responses, tokenizer):
     attention_mask = query_responses != tokenizer.pad_token_id
     input_ids = torch.masked_fill(query_responses, ~attention_mask, 0)
@@ -189,8 +210,9 @@ def evaluate(args: Args, accelerator, tokenizer, model, dataloader, generation_c
     unwrapped = accelerator.unwrap_model(model)
     for _, data in tqdm(enumerate(dataloader)):
         with torch.no_grad():
-            reference_responses = data["reference_response_token"]
             queries = data["query_token"]
+            reference_responses = data["reference_response_token"]
+            context_length = queries.shape[1]
             query_reference_responses = torch.cat((queries, reference_responses), dim=1)
             output = forward(model, query_reference_responses, tokenizer)
             labels = query_reference_responses.masked_fill(query_reference_responses == tokenizer.pad_token_id, -1)
@@ -213,13 +235,15 @@ def evaluate(args: Args, accelerator, tokenizer, model, dataloader, generation_c
                 tokenizer,
                 generation_config,
             )
+            responses = generated_responses[:, context_length:]
+            postprocessed_responses = truncate_response(args, tokenizer, responses)
             decode_queries = tokenizer.batch_decode(queries)
             decode_reference_responses = tokenizer.batch_decode(
                 reference_responses,
                 skip_special_tokens=True,
             )
             decode_responses = tokenizer.batch_decode(
-                generated_responses[:, -args.task.response_length :],
+                postprocessed_responses,
                 skip_special_tokens=True,
             )
             rouge_score = rouge.compute(predictions=decode_responses, references=decode_reference_responses)
@@ -268,6 +292,16 @@ if __name__ == "__main__":
     args.total_episodes = len(dataset)
     args.num_updates = args.total_episodes // args.batch_size
 
+    tokenizer = AutoTokenizer.from_pretrained(
+        args.base_model,
+        padding_side="right",
+        trust_remote_code=True,
+    )
+    # we use the padding token manually but do not resize the token embedding of the model
+    tokenizer.add_special_tokens({"pad_token": "[PAD]"})
+    if args.task.truncate_token == "eos":
+        args.task.truncate_token_id = tokenizer.eos_token_id
+
     console = Console(force_terminal=True)
     run_name = f"{args.exp_name}__{args.seed}__{int(time.time())}"
     writer = SimpleNamespace()  # dummy writer
@@ -296,13 +330,7 @@ if __name__ == "__main__":
     np.random.seed(local_seed)
     torch.manual_seed(local_seed)
     torch.backends.cudnn.deterministic = True
-    tokenizer = AutoTokenizer.from_pretrained(
-        args.base_model,
-        padding_side="right",
-        trust_remote_code=True,
-    )
-    # we use the padding token manually but do not resize the token embedding of the model
-    tokenizer.add_special_tokens({"pad_token": "[PAD]"})
+
     model_config = AutoConfig.from_pretrained(args.base_model)
     configure_dropout(model_config, args.dropout_layer_keys, 0.0)  # disable dropout
     model: PreTrainedModel = AutoModelForCausalLM.from_pretrained(

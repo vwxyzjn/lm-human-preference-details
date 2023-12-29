@@ -13,8 +13,8 @@ import torch.nn.functional as F
 import torch.optim as optim
 import tyro
 from accelerate import Accelerator
-from accelerate.utils import gather_object
 from accelerate.state import AcceleratorState
+from accelerate.utils import gather_object
 from datasets import load_dataset
 from rich.console import Console
 from rich.pretty import pprint
@@ -22,6 +22,7 @@ from rich.table import Table
 from torch import optim
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
+from tqdm import tqdm
 from transformers import (
     AutoConfig,
     AutoModel,
@@ -31,8 +32,6 @@ from transformers import (
     PretrainedConfig,
     PreTrainedModel,
 )
-from tqdm import tqdm
-
 
 INVALID_LOGPROB = 1.0
 
@@ -364,11 +363,11 @@ class EvalStorage:
     reference_response_token: List[str] = field(default_factory=list)
     score: List[float] = field(default_factory=list)
     reference_score: List[float] = field(default_factory=list)
-    
+
     query: List[str] = field(default_factory=list)
     postprocessed_response: List[str] = field(default_factory=list)
     reference_response: List[str] = field(default_factory=list)
-    
+
 
 def evaluate(args: Args, reward_model, policy, tokenizer, dataloader, generation_config, sampling=True):
     eval_storage = EvalStorage()
@@ -376,10 +375,10 @@ def evaluate(args: Args, reward_model, policy, tokenizer, dataloader, generation
         for data in tqdm(dataloader):
             queries = data["query_token"]
             reference_response_token = data["reference_response_token"]
+            context_length = queries.shape[1]
             query_reference_responses = torch.cat((data["query_token"], data["reference_response_token"]), dim=1)
             _, reference_score, _ = get_reward(reward_model, query_reference_responses, tokenizer)
 
-            context_length = queries.shape[1]
             query_responses = generate(
                 policy,
                 queries,
@@ -401,9 +400,11 @@ def evaluate(args: Args, reward_model, policy, tokenizer, dataloader, generation
 
     eval_storage.query = tokenizer.batch_decode(eval_storage.query_token, skip_special_tokens=True)
     eval_storage.reference_response = tokenizer.batch_decode(eval_storage.reference_response_token)
-    eval_storage.postprocessed_response = tokenizer.batch_decode(eval_storage.postprocessed_response_token, skip_special_tokens=True)
-    eval_score = torch.cat(eval_storage.score).cpu().numpy().tolist()
-    eval_reference_score = torch.cat(eval_storage.reference_score).cpu().numpy().tolist()
+    eval_storage.postprocessed_response = tokenizer.batch_decode(
+        eval_storage.postprocessed_response_token, skip_special_tokens=True
+    )
+    eval_score = torch.cat(eval_storage.score).float().cpu().numpy().tolist()
+    eval_reference_score = torch.cat(eval_storage.reference_score).float().cpu().numpy().tolist()
     eval_df = pd.DataFrame(
         {
             "query": gather_object(eval_storage.query),
@@ -514,11 +515,21 @@ if __name__ == "__main__":
     dataset = load_dataset(args.task.query_dataset, split="train")
     validation_dataset = load_dataset(args.task.query_dataset, split="validation")
     dataset = dataset.with_format("torch", columns=["query_token", "reference_response_token"])
-    dataset = dataset.shuffle(seed=local_seed)
-    dataloader = DataLoader(dataset, batch_size=args.local_batch_size)
+    dataloader = DataLoader(dataset, batch_size=args.local_batch_size, shuffle=True)
     validation_dataset = validation_dataset.with_format("torch", columns=["query_token", "reference_response_token"])
     validation_dataloader = DataLoader(validation_dataset, batch_size=args.local_eval_batch_size)
+
+    # sync random states for DataLoader(shuffle=True) before `accelerator.prepare`
+    # see https://gist.github.com/vwxyzjn/2581bff1e48e185e0b85b6dfe1def79c
+    torch.manual_seed(args.seed)
     model, optimizer, dataloader = accelerator.prepare(model, optimizer, dataloader)
+    torch.manual_seed(local_seed)  # reset the local seed again
+
+    def repeat_generator():
+        while True:
+            yield from dataloader
+
+    iter_dataloader = iter(repeat_generator())
     validation_dataloader = accelerator.prepare(validation_dataloader)
     if args.deepspeed:
         import deepspeed
@@ -548,11 +559,6 @@ if __name__ == "__main__":
         ref_policy = ref_policy.to(device)
         reward_model = reward_model.to(device)
 
-    def repeat_generator():  # TODO: ideally we shuffle the dataloader as well
-        while True:
-            yield from dataloader
-
-    iter_dataloader = iter(repeat_generator())
     kl_ctl = AdaptiveKLController(args.reward.kl_coef, hparams=args.reward.adaptive_kl)
     # WARNING: even with `max_new_tokens` and `min_new_tokens` set to the same value, the number of tokens generated
     # may not be the same. TODO: investigate further, we just want to generate a fixed number of tokens
@@ -602,15 +608,20 @@ if __name__ == "__main__":
             context_length = queries.shape[1]
             responses = query_responses[:, context_length:]
 
-            eval_storage, eval_df = evaluate(args, reward_model, accelerator.unwrap_model(model).policy, tokenizer, validation_dataloader, validation_generation_config)
+            eval_storage, eval_df = evaluate(
+                args,
+                reward_model,
+                accelerator.unwrap_model(model).policy,
+                tokenizer,
+                validation_dataloader,
+                validation_generation_config,
+            )
             validation_score = eval_storage.score[0]
             if args.print_sample_output_freq > 0 and (update - 1) % args.print_sample_output_freq == 0:
                 if accelerator.is_main_process:
-                    eval_df.to_csv(f"runs/{run_name}_{global_step}/table.csv")
+                    eval_df.to_csv(f"runs/{run_name}/table_{global_step}.csv")
                     if args.track:
-                        wandb.log(
-                            {"samples/query_responses": wandb.Table(dataframe=eval_df)}, step=update
-                        )
+                        wandb.log({"samples/query_responses": wandb.Table(dataframe=eval_df)}, step=update)
                     else:
                         try:
                             print_rich_table(f"Sample Output at Step {update}", eval_df[:1], console)
@@ -619,7 +630,6 @@ if __name__ == "__main__":
             del eval_storage, eval_df
             torch.cuda.empty_cache()
 
-            # TODO: do I do this with query response or post-processed query response?
             output = forward(accelerator.unwrap_model(model).policy, query_responses, tokenizer)
             logits = output.logits[:, context_length - 1 : -1]
             logits /= args.task.temperature + 1e-7
@@ -822,12 +832,18 @@ if __name__ == "__main__":
             del kl, mean_kl, mean_entropy, mean_non_score_reward, scores
 
     if args.run_eval:
-        eval_storage, eval_df = evaluate(args, reward_model, accelerator.unwrap_model(model).policy, tokenizer, validation_dataloader, validation_generation_config, sampling=False)
+        eval_storage, eval_df = evaluate(
+            args,
+            reward_model,
+            accelerator.unwrap_model(model).policy,
+            tokenizer,
+            validation_dataloader,
+            validation_generation_config,
+            sampling=False,
+        )
         eval_df.to_csv(f"runs/{run_name}/table.csv")
         if accelerator.is_main_process and args.track:
-            wandb.log(
-                {"eval/query_responses": wandb.Table(dataframe=eval_df)}, step=update
-            )
+            wandb.log({"eval/query_responses": wandb.Table(dataframe=eval_df)}, step=update)
 
     # save model
     if args.output_dir and args.num_train_epochs > 0:

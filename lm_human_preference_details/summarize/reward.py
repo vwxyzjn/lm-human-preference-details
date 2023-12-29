@@ -229,12 +229,14 @@ def evaluate(args: Args, accelerator, tokenizer, model, dataloader):
     with torch.no_grad():
         items = defaultdict(list)
         for data in tqdm(dataloader):
-            mb_query = data["query_token"]
-            mb_responses = torch.cat([data[f"response0_token"].unsqueeze(1), data[f"response1_token"].unsqueeze(1)], dim=1)
+            query_responses = torch.cat(
+                [data["query_response0_token"].unsqueeze(1), data["query_response1_token"].unsqueeze(1)], dim=1
+            ).flatten(0, 1)
             mb_best = data["choice"]
-            mb_query_tiled = mb_query.unsqueeze(1).repeat(1, args.label.num_labels, 1)
-            query_responses = torch.cat([mb_query_tiled, mb_responses], dim=2).flatten(0, 1)
-            # query_responses = left_padding_to_right_padding(query_responses, tokenizer.pad_token_id)
+            # mb_query = data["query_token"]
+            # mb_responses = torch.cat([data[f"response0_token"].unsqueeze(1), data[f"response1_token"].unsqueeze(1)], dim=1)
+            # mb_query_tiled = mb_query.unsqueeze(1).repeat(1, args.label.num_labels, 1)
+            # query_responses = torch.cat([mb_query_tiled, mb_responses], dim=2).flatten(0, 1)
             predicted_reward = get_reward(model, query_responses, tokenizer)
             predicted_reward = predicted_reward.view(-1, args.label.num_labels)
             accuracy = (predicted_reward.argmax(1) == mb_best).float()
@@ -292,7 +294,9 @@ if __name__ == "__main__":
             "query_token",
             "choice",
             "response0_token",
+            "query_response0_token",
             "response1_token",
+            "query_response1_token",
             "batch",
             "split",
             "extra.confidence",
