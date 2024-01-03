@@ -678,19 +678,8 @@ if __name__ == "__main__":
             values = torch.cat(values, 0)
             sequence_lengths = torch.cat(sequence_lengths, 0)
             scores = torch.cat(scores, 0)
-            del (
-                output,
-                logits,
-                all_logprob,
-                logprob,
-                ref_output,
-                ref_logits,
-                ref_all_logprob,
-                ref_logprob,
-                full_value,
-                value,
-                score,
-            )
+            del (output, logits, all_logprob, logprob, ref_output)
+            del (ref_logits, ref_all_logprob, ref_logprob, full_value, value, score)
             torch.cuda.empty_cache()
 
             # Response Processing 3. filter response. Ensure that the sample contains truncate_token_id
