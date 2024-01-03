@@ -1,6 +1,7 @@
 import multiprocessing
 import os
-from dataclasses import dataclass
+import time
+from dataclasses import dataclass, field
 from pprint import pformat
 from typing import Dict, Optional
 
@@ -30,17 +31,25 @@ poetry run python lm_human_preference_details/tldr_dataset.py \
     --max_sft_query_response_length=560 \
     --max-rm-response-length=48 \
     --max_rm_query_response_length=560
+
+poetry run python lm_human_preference_details/tldr_dataset.py \
+    --base_model=EleutherAI/pythia-160m \
+    --max_sft_response_length=53 \
+    --max_sft_query_response_length=562 \
+    --max-rm-response-length=169 \
+    --max_rm_query_response_length=638 \
+    --hf_entity=cleanrl \
+    --push_to_hub \
+    --oai_params.padding=""
+poetry run python lm_human_preference_details/tldr_dataset.py \
+    --base_model=EleutherAI/pythia-160m \
+    --max_sft_response_length=48 \
+    --max_sft_query_response_length=560 \
+    --max-rm-response-length=48 \
+    --max_rm_query_response_length=560 \
+    --push_to_hub \
+    --oai_params.padding=""
 """
-
-
-@dataclass
-class Args:
-    base_model: str = "gpt2"  # EleutherAI/pythia-160m
-    max_sft_response_length: int = 48  # 53
-    max_sft_query_response_length: int = 512 + 48  # 565
-    max_rm_response_length: int = 153  # 169
-    max_rm_query_response_length: int = 512 + 153  # 665
-    hf_entity: str = None
 
 
 @dataclass
@@ -53,6 +62,18 @@ class TaskQueryHParams:
     truncate_text: Optional[str] = "\n"
     padding: Optional[str] = " "  # empty spaces
     pad_side: Optional[str] = "left"
+
+
+@dataclass
+class Args:
+    base_model: str = "gpt2"  # EleutherAI/pythia-160m
+    max_sft_response_length: int = 48  # 53
+    max_sft_query_response_length: int = 512 + 48  # 565
+    max_rm_response_length: int = 153  # 169
+    max_rm_query_response_length: int = 512 + 153  # 665
+    hf_entity: str = None
+    push_to_hub: bool = False
+    oai_params: TaskQueryHParams = field(default_factory=TaskQueryHParams)
 
 
 def _ensure_length(toks, l, pad_sequence=None, pad_side=None, truncate_side=None):
@@ -113,7 +134,7 @@ def process_query(query_info: Dict[str, str], *, encoder, hparams: TaskQueryHPar
         query_tokens = encoder.encode(format_str.format(**query_info))
 
     query_token = _ensure_length(query_tokens, hparams.length, pad_side=hparams.pad_side, pad_sequence=pad_sequence)
-    query = encoder.decode(query_token).lstrip()
+    query = encoder.decode(query_token, skip_special_tokens=True).lstrip()
     return dict(
         query_token=query_token,
         query=query,
@@ -127,12 +148,12 @@ if __name__ == "__main__":
         assert isinstance(args.hf_entity, str)
     tokenizer = AutoTokenizer.from_pretrained(args.base_model)
     tokenizer.add_special_tokens({"pad_token": "[PAD]"})
-    oai_h = TaskQueryHParams()
-    if isinstance(oai_h.padding, str):
-        oai_h.padding = tokenizer.encode(oai_h.padding)
+    if len(args.oai_params.padding) > 0:
+        args.oai_params.padding = tokenizer.encode(args.oai_params.padding)
     else:
-        oai_h.padding = tokenizer.pad_token_id
-    pprint(oai_h)
+        args.oai_params.padding = [tokenizer.pad_token_id]
+    pprint(args.oai_params)
+    timestamp = int(time.time())
     sft_ds = load_dataset("vwxyzjn/summarize_from_feedback_tldr_3_filtered")
 
     def process_query_data(x):
@@ -141,7 +162,7 @@ if __name__ == "__main__":
         # `<|endoftext|>` token
         reference_response = f" {x['summary']}<|endoftext|>"
         y = {
-            **process_query(x, encoder=tokenizer, hparams=oai_h),
+            **process_query(x, encoder=tokenizer, hparams=args.oai_params),
             "reference_response": reference_response,
             "reference_response_token": tokenizer.encode(
                 reference_response,
@@ -162,14 +183,13 @@ if __name__ == "__main__":
         return y
 
     sft_ds = sft_ds.map(process_query_data, load_from_cache_file=False, num_proc=multiprocessing.cpu_count())
-    sft_ds.push_to_hub(
-        f"{args.hf_entity}/summarize_from_feedback_tldr_3_filtered_oai_preprocessing_{args.base_model.split('/')[-1]}_{args.max_sft_response_length}"
-    )
-    sft_card = RepoCard.load(
-        f"{args.hf_entity}/summarize_from_feedback_tldr_3_filtered_oai_preprocessing_{args.base_model.split('/')[-1]}_{args.max_sft_response_length}",
-        repo_type="dataset",
-    )
-    sft_card.text = f"""\
+    if args.push_to_hub:
+        sft_ds.push_to_hub(f"{args.hf_entity}/summarize_from_feedback_tldr_3_filtered_oai_preprocessing_{timestamp}")
+        sft_card = RepoCard.load(
+            f"{args.hf_entity}/summarize_from_feedback_tldr_3_filtered_oai_preprocessing_{timestamp}",
+            repo_type="dataset",
+        )
+        sft_card.text = f"""\
 # TL;DR SFT Dataset for OpenAI's [Summarize from Feedback](https://openai.com/blog/summarization/) task
 
 The dataset is directly taken from https://github.com/openai/summarize-from-feedback/tree/700967448d10004279f138666442bf1497d0e705#reddit-tldr-dataset
@@ -197,13 +217,13 @@ These columns are added by this preprocessing script:
 
 ```python
 {pformat(vars(args))}
-{pformat(vars(oai_h))}
+{pformat(vars(args.oai_params))}
 ```
 """
-    sft_card.push_to_hub(
-        f"{args.hf_entity}/summarize_from_feedback_tldr_3_filtered_oai_preprocessing_{args.base_model.split('/')[-1]}_{args.max_sft_response_length}",
-        repo_type="dataset",
-    )
+        sft_card.push_to_hub(
+            f"{args.hf_entity}/summarize_from_feedback_tldr_3_filtered_oai_preprocessing_{timestamp}",
+            repo_type="dataset",
+        )
 
     label_ds = load_dataset("openai/summarize_from_feedback", "comparisons")
 
@@ -216,7 +236,7 @@ These columns are added by this preprocessing script:
         response1_policy = x["summaries"][1]["policy"]
         policies = "--".join(sorted([response0_policy, response1_policy]))
         y = {
-            **process_query(x["info"], encoder=tokenizer, hparams=oai_h),
+            **process_query(x["info"], encoder=tokenizer, hparams=args.oai_params),
             "response0": response0,
             "response0_token": tokenizer.encode(
                 response0, padding="max_length", max_length=args.max_rm_response_length, truncation=True
@@ -244,9 +264,8 @@ These columns are added by this preprocessing script:
         return y
 
     label_ds = label_ds.map(process_response_data, load_from_cache_file=False, num_proc=multiprocessing.cpu_count())
-    label_ds.push_to_hub(
-        f"{args.hf_entity}/summarize_from_feedback_oai_preprocessing_{args.base_model.split('/')[-1]}_{args.max_rm_response_length}"
-    )
+    if args.push_to_hub:
+        label_ds.push_to_hub(f"{args.hf_entity}/summarize_from_feedback_oai_preprocessing_{timestamp}")
 
     os.makedirs("dataset_visuals", exist_ok=True)
     # visualize token length distribution
@@ -321,19 +340,19 @@ These columns are added by this preprocessing script:
     fig.tight_layout()
     fig.savefig("dataset_visuals/policy_comparisons.png")
 
-    # upload the `dataset_visuals`
-
-    api.upload_folder(
-        folder_path="dataset_visuals",
-        path_in_repo="dataset_visuals",
-        repo_id=f"{args.hf_entity}/summarize_from_feedback_oai_preprocessing_{args.base_model.split('/')[-1]}_{args.max_rm_response_length}",
-        repo_type="dataset",
-    )
-    # upload current file
-    print(f"{__file__=}")
-    api.upload_file(
-        path_or_fileobj=__file__,
-        path_in_repo="create_dataset.py",
-        repo_id=f"{args.hf_entity}/summarize_from_feedback_oai_preprocessing_{args.base_model.split('/')[-1]}_{args.max_rm_response_length}",
-        repo_type="dataset",
-    )
+    if args.push_to_hub:
+        # upload the `dataset_visuals`
+        api.upload_folder(
+            folder_path="dataset_visuals",
+            path_in_repo="dataset_visuals",
+            repo_id=f"{args.hf_entity}/summarize_from_feedback_oai_preprocessing_{timestamp}",
+            repo_type="dataset",
+        )
+        # upload current file
+        print(f"{__file__=}")
+        api.upload_file(
+            path_or_fileobj=__file__,
+            path_in_repo="create_dataset.py",
+            repo_id=f"{args.hf_entity}/summarize_from_feedback_oai_preprocessing_{timestamp}",
+            repo_type="dataset",
+        )

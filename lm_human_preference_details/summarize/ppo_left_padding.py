@@ -166,7 +166,7 @@ class Args:
     """the mini batch size per GPU"""
     mini_batch_size: Optional[int] = None
     """the mini batch size across GPUs"""
-    local_eval_batch_size: int = 8
+    local_eval_batch_size: int = 2
     """per rank eval batch size"""
 
     # other args
@@ -275,34 +275,16 @@ class ScalarModel(PreTrainedModel):
 
 def get_reward(model, query_responses, tokenizer, context_length):
     attention_mask = query_responses != tokenizer.pad_token_id
-    position_ids = attention_mask.cumsum(1) - attention_mask.long()  # exclusive cumsum
+    # position_ids = attention_mask.cumsum(1) - attention_mask.long()  # exclusive cumsum
     input_ids = torch.masked_fill(query_responses, ~attention_mask, 0)
     reward_logits = model(
         input_ids=input_ids,
         attention_mask=attention_mask,
-        position_ids=position_ids,
+        # position_ids=position_ids,
         return_dict=True,
         output_hidden_states=True,
     )
     sequence_lengths = first_true_indices(query_responses[:, context_length:] == tokenizer.pad_token_id) - 1 + context_length
-    # https://github.com/huggingface/transformers/blob/dc68a39c8111217683bf49a4912d0c9018bab33d/src/transformers/models/gpt2/modeling_gpt2.py#L1454
-    return (
-        reward_logits,
-        reward_logits[torch.arange(reward_logits.size(0), device=reward_logits.device), sequence_lengths].squeeze(-1),
-        sequence_lengths,
-    )
-
-
-def get_value(model, query_responses, tokenizer):
-    attention_mask = query_responses != tokenizer.pad_token_id
-    input_ids = torch.masked_fill(query_responses, ~attention_mask, 0)
-    reward_logits = model(
-        input_ids=input_ids,
-        attention_mask=attention_mask,
-        return_dict=True,
-        output_hidden_states=True,
-    )
-    sequence_lengths = first_true_indices(query_responses == tokenizer.pad_token_id) - 1
     # https://github.com/huggingface/transformers/blob/dc68a39c8111217683bf49a4912d0c9018bab33d/src/transformers/models/gpt2/modeling_gpt2.py#L1454
     return (
         reward_logits,
@@ -620,16 +602,6 @@ if __name__ == "__main__":
         optimizer.param_groups[0]["lr"] = lrnow
         data = next(iter_dataloader)
         with torch.no_grad():
-            queries = data["query_token"].to(device)
-            query_responses = generate(
-                accelerator.unwrap_model(model).policy,
-                queries,
-                tokenizer,
-                generation_config,
-            )
-            context_length = queries.shape[1]
-            responses = query_responses[:, context_length:]
-
             eval_storage, eval_df = evaluate(
                 args,
                 reward_model,
@@ -652,40 +624,73 @@ if __name__ == "__main__":
             del eval_storage, eval_df
             torch.cuda.empty_cache()
 
-            output = forward(accelerator.unwrap_model(model).policy, query_responses, tokenizer)
-            logits = output.logits[:, context_length - 1 : -1]
-            logits /= args.task.temperature + 1e-7
-            all_logprobs = F.log_softmax(logits, dim=-1)
-            logprobs = torch.gather(all_logprobs, 2, responses.unsqueeze(-1)).squeeze(-1)
-            del output, logits, all_logprobs
-            torch.cuda.empty_cache()
+            queries = data["query_token"].to(device)
+            context_length = queries.shape[1]
+            query_responses = []
+            responses = []
+            postprocessed_responses = []
+            logprobs = []
+            ref_logprobs = []
+            values = []
+            scores = []
+            sequence_lengths = []
+            for i in range(0, queries.shape[0], args.local_eval_batch_size):
+                query = queries[i : i + args.local_eval_batch_size]
+                query_response = generate(
+                    accelerator.unwrap_model(model).policy,
+                    query,
+                    tokenizer,
+                    generation_config,
+                )
+                response = query_response[:, context_length:]
 
-            ref_output = forward(ref_policy, query_responses, tokenizer)
-            ref_logits = ref_output.logits[:, context_length - 1 : -1]
-            ref_logits /= args.task.temperature + 1e-7
-            ref_all_logprobs = F.log_softmax(ref_logits, dim=-1)
-            ref_logprobs = torch.gather(ref_all_logprobs, 2, responses.unsqueeze(-1)).squeeze(-1)
-            del ref_output, ref_logits, ref_all_logprobs
-            torch.cuda.empty_cache()
+                output = forward(accelerator.unwrap_model(model).policy, query_response, tokenizer)
+                logits = output.logits[:, context_length - 1 : -1]
+                logits /= args.task.temperature + 1e-7
+                all_logprob = F.log_softmax(logits, dim=-1)
+                logprob = torch.gather(all_logprob, 2, response.unsqueeze(-1)).squeeze(-1)
 
-            # **Response Processing**
-            postprocessed_responses = truncate_response(args, tokenizer, responses)
-            torch.cuda.empty_cache()
+                ref_output = forward(ref_policy, query_response, tokenizer)
+                ref_logits = ref_output.logits[:, context_length - 1 : -1]
+                ref_logits /= args.task.temperature + 1e-7
+                ref_all_logprob = F.log_softmax(ref_logits, dim=-1)
+                ref_logprob = torch.gather(ref_all_logprob, 2, response.unsqueeze(-1)).squeeze(-1)
 
-            # 2. run reward model on the truncated responses
-            postprocessed_query_responses = torch.cat((queries, postprocessed_responses), 1)
-            sequence_lengths = first_true_indices(postprocessed_responses == tokenizer.pad_token_id) - 1
-            full_values, _, _ = get_value(accelerator.unwrap_model(model).critic, query_responses, tokenizer)
-            values = full_values[:, context_length - 1 : -1].squeeze(-1)
-            scores_logits, scores, _ = get_reward(reward_model, postprocessed_query_responses, tokenizer, queries.shape[1])
+                # Response Processing 1. truncate response after the first occurrence of `truncate_token_id`
+                postprocessed_response = truncate_response(args, tokenizer, response)
 
-            # 3. filter response. Ensure that the sample contains truncate_token_id
+                # Response Processing 2. run reward model on the truncated responses
+                postprocessed_query_response = torch.cat((query, postprocessed_response), 1)
+                sequence_length = first_true_indices(postprocessed_response == tokenizer.pad_token_id) - 1
+                full_value, _, _ = get_reward(
+                    accelerator.unwrap_model(model).critic, query_response, tokenizer, context_length
+                )
+                value = full_value[:, context_length - 1 : -1].squeeze(-1)
+                _, score, _ = get_reward(reward_model, postprocessed_query_response, tokenizer, context_length)
+
+                query_responses.append(query_response)
+                responses.append(response)
+                postprocessed_responses.append(postprocessed_response)
+                logprobs.append(logprob)
+                ref_logprobs.append(ref_logprob)
+                values.append(value)
+                sequence_lengths.append(sequence_length)
+                scores.append(score)
+            query_responses = torch.cat(query_responses, 0)
+            responses = torch.cat(responses, 0)
+            postprocessed_responses = torch.cat(postprocessed_responses, 0)
+            logprobs = torch.cat(logprobs, 0)
+            ref_logprobs = torch.cat(ref_logprobs, 0)
+            values = torch.cat(values, 0)
+            sequence_lengths = torch.cat(sequence_lengths, 0)
+            scores = torch.cat(scores, 0)
+
+            # Response Processing 3. filter response. Ensure that the sample contains truncate_token_id
             # responses not passing that filter will receive a low (fixed) score
             # only query humans on responses that pass that filter
             contain_pad_token = torch.any(postprocessed_responses == tokenizer.pad_token_id, dim=-1)
             scores = torch.where(contain_pad_token, scores, torch.full_like(scores, args.task.penalty_reward_value))
             accelerator.print(f"{scores=}, {(contain_pad_token.sum() / len(contain_pad_token))=}")
-            # torch.cuda.empty_cache()
 
             # 4. compute rewards
             kl = logprobs - ref_logprobs
@@ -717,6 +722,7 @@ if __name__ == "__main__":
             writer.add_histogram("advantages", advantages[0].float(), global_step)
             accelerator.print("rewards====", rewards[0])
             accelerator.print("advantages====", advantages[0])
+            torch.cuda.empty_cache()
 
         # Do multiple epochs of PPO training, with a fresh random shuffle in each epoch
         for ppo_epoch_idx in range(args.ppo.noptepochs):
