@@ -318,7 +318,8 @@ if __name__ == "__main__":
                 name=run_name,
                 save_code=True,
             )
-            wandb.run.log_code(".")
+            file_extensions = [".toml", ".lock", ".py", ".sh", ".yaml"]
+            wandb.run.log_code(".", include_fn=lambda path: any([path.endswith(ext) for ext in file_extensions]))
         writer = SummaryWriter(f"runs/{run_name}")
         writer.add_text(
             "hyperparameters",
