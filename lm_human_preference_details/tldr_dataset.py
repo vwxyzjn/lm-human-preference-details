@@ -3,7 +3,7 @@ import os
 import time
 from dataclasses import dataclass, field
 from pprint import pformat
-from typing import Dict, Optional
+from typing import Dict, Literal, Optional
 
 import matplotlib.pyplot as plt
 import pandas as pd
@@ -20,60 +20,74 @@ api = HfApi()
 """
 poetry run python lm_human_preference_details/tldr_dataset.py
 poetry run python lm_human_preference_details/tldr_dataset.py \
-    --base_model=EleutherAI/pythia-160m \
+    --base_model=EleutherAI/pythia-1b-deduped \
     --max_sft_response_length=53 \
     --max_sft_query_response_length=562 \
-    --max-rm-response-length=169 \
+    --max_rm_response_length=169 \
     --max_rm_query_response_length=638
-poetry run python lm_human_preference_details/tldr_dataset.py \
-    --base_model=EleutherAI/pythia-160m \
-    --max_sft_response_length=48 \
-    --max_sft_query_response_length=560 \
-    --max-rm-response-length=48 \
-    --max_rm_query_response_length=560
 
-poetry run python lm_human_preference_details/tldr_dataset.py \
-    --base_model=EleutherAI/pythia-160m \
-    --max_sft_response_length=53 \
-    --max_sft_query_response_length=562 \
-    --max-rm-response-length=169 \
-    --max_rm_query_response_length=638 \
+poetry run python -i lm_human_preference_details/tldr_dataset.py \
+    --base_model=EleutherAI/pythia-1b-deduped \
+    --tldr_params.max_sft_response_length=53 \
+    --tldr_params.max_sft_query_response_length=562 \
+    --tldr_params.max_rm_response_length=169 \
+    --tldr_params.max_rm_query_response_length=638 \
+    --cnndm_params.max_rm_response_length=155 \
+    --cnndm_params.max_rm_query_response_length=2021 \
     --hf_entity=cleanrl \
     --push_to_hub \
-    --oai_params.padding=""
-poetry run python lm_human_preference_details/tldr_dataset.py \
-    --base_model=EleutherAI/pythia-160m \
-    --max_sft_response_length=48 \
-    --max_sft_query_response_length=560 \
-    --max-rm-response-length=48 \
-    --max_rm_query_response_length=560 \
-    --push_to_hub \
-    --oai_params.padding=""
+    --tldr_params.padding="pad_token" \
+    --cnndm_params.padding="pad_token" \
 """
 
 
 @dataclass
 class TaskQueryHParams:
-    length: int = 512
-    format_str: Optional[
-        str
-    ] = "SUBREDDIT: r/{subreddit}\n\nTITLE: {title}\n\nPOST: {post}\n\nTL;DR:"  # if underlying dataset yields dicts, can format arbitrarily
-    truncate_field: Optional[str] = "post"
-    truncate_text: Optional[str] = "\n"
-    padding: Optional[str] = " "  # empty spaces
-    pad_side: Optional[str] = "left"
+    length: Optional[int] = None
+    format_str: Optional[str] = None
+    truncate_field: Optional[str] = None
+    truncate_text: Optional[str] = None
+    padding: Optional[Literal["empty_space", "pad_token"]] = None
+    pad_token: Optional[str] = None
+    pad_side: Optional[str] = None
+    max_sft_response_length: Optional[int] = None
+    max_sft_query_response_length: Optional[int] = None
+    max_rm_response_length: Optional[int] = None
+    max_rm_query_response_length: Optional[int] = None
 
 
 @dataclass
 class Args:
-    base_model: str = "gpt2"  # EleutherAI/pythia-160m
-    max_sft_response_length: int = 48  # 53
-    max_sft_query_response_length: int = 512 + 48  # 565
-    max_rm_response_length: int = 153  # 169
-    max_rm_query_response_length: int = 512 + 153  # 665
+    base_model: str = "EleutherAI/pythia-1b-deduped"  #  "gpt2"
     hf_entity: str = None
     push_to_hub: bool = False
-    oai_params: TaskQueryHParams = field(default_factory=TaskQueryHParams)
+    check_length_correctness: bool = True
+    tldr_params: TaskQueryHParams = field(
+        default_factory=lambda: TaskQueryHParams(
+            length=512,
+            format_str="SUBREDDIT: r/{subreddit}\n\nTITLE: {title}\n\nPOST: {post}\n\nTL;DR:",
+            truncate_field="post",
+            truncate_text="\n",
+            padding="empty_space",
+            pad_side="left",
+            max_sft_response_length=53,  # 48
+            max_sft_query_response_length=562,  # 512 + 48
+            max_rm_response_length=169,  # 153
+            max_rm_query_response_length=638,  #  512 + 153
+        )
+    )
+    cnndm_params: TaskQueryHParams = field(
+        default_factory=lambda: TaskQueryHParams(
+            length=2047 - 128,
+            format_str="Article:\n{article}\n\nTL;DR:\n",
+            truncate_field="article",
+            truncate_text="\n",
+            padding="empty_space",
+            pad_side="left",
+            max_rm_response_length=155,  # 153
+            max_rm_query_response_length=2021,  #  512 + 153
+        )
+    )
 
 
 def _ensure_length(toks, l, pad_sequence=None, pad_side=None, truncate_side=None):
@@ -102,7 +116,7 @@ def _ensure_length(toks, l, pad_sequence=None, pad_side=None, truncate_side=None
 
 
 def _get_query_padding_for_task(encoder, hparams: TaskQueryHParams):
-    return hparams.padding * hparams.length
+    return hparams.pad_token * hparams.length
 
 
 def process_query(query_info: Dict[str, str], *, encoder, hparams: TaskQueryHParams, pad_sequence=None):
@@ -141,6 +155,10 @@ def process_query(query_info: Dict[str, str], *, encoder, hparams: TaskQueryHPar
     )
 
 
+def ceil_div(a, b):
+    return (a - 1) // b + 1
+
+
 if __name__ == "__main__":
     args = tyro.cli(Args)
     if args.hf_entity is None:
@@ -148,11 +166,17 @@ if __name__ == "__main__":
         assert isinstance(args.hf_entity, str)
     tokenizer = AutoTokenizer.from_pretrained(args.base_model)
     tokenizer.add_special_tokens({"pad_token": "[PAD]"})
-    if len(args.oai_params.padding) > 0:
-        args.oai_params.padding = tokenizer.encode(args.oai_params.padding)
+
+    # post init
+    if args.tldr_params.padding == "empty_space":
+        args.tldr_params.pad_token = tokenizer.encode(" ")
     else:
-        args.oai_params.padding = [tokenizer.pad_token_id]
-    pprint(args.oai_params)
+        args.tldr_params.pad_token = [tokenizer.pad_token_id]
+    if args.cnndm_params.padding == "empty_space":
+        args.cnndm_params.pad_token = tokenizer.encode(" ")
+    else:
+        args.cnndm_params.pad_token = [tokenizer.pad_token_id]
+    pprint(args)
     timestamp = int(time.time())
     sft_ds = load_dataset("vwxyzjn/summarize_from_feedback_tldr_3_filtered")
 
@@ -162,23 +186,27 @@ if __name__ == "__main__":
         # `<|endoftext|>` token
         reference_response = f" {x['summary']}<|endoftext|>"
         y = {
-            **process_query(x, encoder=tokenizer, hparams=args.oai_params),
+            **process_query(x, encoder=tokenizer, hparams=args.tldr_params),
             "reference_response": reference_response,
             "reference_response_token": tokenizer.encode(
                 reference_response,
                 padding="max_length",
-                max_length=args.max_sft_response_length,
+                max_length=args.tldr_params.max_sft_response_length,
                 truncation=True,
             ),
             "reference_response_token_len": len(tokenizer.encode(reference_response)),
         }
         y["query_reference_response"] = y["query"].strip() + y["reference_response"]
-        y["query_reference_response_token"] = tokenizer.encode(
-            y["query_reference_response"],
-            padding="max_length",
-            max_length=args.max_sft_query_response_length,
-            truncation=True,
-        )
+        # if padding is space, then we can just concatenate the tokens
+        if args.tldr_params.padding == "empty_space":
+            y["query_reference_response_token"] = y["query_token"] + y["reference_response_token"]
+        else:
+            y["query_reference_response_token"] = tokenizer.encode(
+                y["query_reference_response"],
+                padding="max_length",
+                max_length=args.max_sft_query_response_length,
+                truncation=True,
+            )
         y["query_reference_response_token_len"] = len(tokenizer.encode(y["query_reference_response"]))
         return y
 
@@ -217,7 +245,6 @@ These columns are added by this preprocessing script:
 
 ```python
 {pformat(vars(args))}
-{pformat(vars(args.oai_params))}
 ```
 """
         sft_card.push_to_hub(
@@ -225,7 +252,10 @@ These columns are added by this preprocessing script:
             repo_type="dataset",
         )
 
+    cnndm_batches = ["batch0_cnndm", "cnndm0", "cnndm2"]
     label_ds = load_dataset("openai/summarize_from_feedback", "comparisons")
+    label_ds["validation_cnndm"] = label_ds["validation"].filter(lambda x: x["batch"] in cnndm_batches)
+    label_ds["validation"] = label_ds["validation"].filter(lambda x: x["batch"] not in cnndm_batches)
 
     def process_response_data(x):
         # the `x['summaries'][0]['text']` in `openai/summarize_from_feedback` `comaprisons`
@@ -235,16 +265,27 @@ These columns are added by this preprocessing script:
         response0_policy = x["summaries"][0]["policy"]
         response1_policy = x["summaries"][1]["policy"]
         policies = "--".join(sorted([response0_policy, response1_policy]))
+        format_params = args.cnndm_params if x["batch"] in cnndm_batches else args.tldr_params
+        max_rm_response_length = (
+            args.cnndm_params.max_rm_response_length
+            if x["batch"] in cnndm_batches
+            else args.tldr_params.max_rm_response_length
+        )
+        max_rm_query_response_length = (
+            args.cnndm_params.max_rm_query_response_length
+            if x["batch"] in cnndm_batches
+            else args.tldr_params.max_rm_query_response_length
+        )
         y = {
-            **process_query(x["info"], encoder=tokenizer, hparams=args.oai_params),
+            **process_query(x["info"], encoder=tokenizer, hparams=format_params),
             "response0": response0,
             "response0_token": tokenizer.encode(
-                response0, padding="max_length", max_length=args.max_rm_response_length, truncation=True
+                response0, padding="max_length", max_length=max_rm_response_length, truncation=True
             ),
             "response0_token_len": len(tokenizer.encode(response0)),
             "response1": response1,
             "response1_token": tokenizer.encode(
-                response1, padding="max_length", max_length=args.max_rm_response_length, truncation=True
+                response1, padding="max_length", max_length=max_rm_response_length, truncation=True
             ),
             "response1_token_len": len(tokenizer.encode(response1)),
             "response0_policy": response0_policy,
@@ -252,26 +293,50 @@ These columns are added by this preprocessing script:
             "policies": policies,
         }
         y["query_response0"] = y["query"].strip() + y["response0"]
-        y["query_response0_token"] = tokenizer.encode(
-            y["query_response0"], padding="max_length", max_length=args.max_rm_query_response_length, truncation=True
-        )
+        # if padding is space, then we can just concatenate the tokens
+        if args.tldr_params.padding == "empty_space":
+            y["query_response0_token"] = y["query_token"] + y["response0_token"]
+        else:
+            y["query_response0_token"] = tokenizer.encode(
+                y["query_response0"], padding="max_length", max_length=max_rm_query_response_length, truncation=True
+            )
         y["query_response0_token_len"] = len(tokenizer.encode(y["query_response0"]))
         y["query_response1"] = y["query"].strip() + y["response1"]
-        y["query_response1_token"] = tokenizer.encode(
-            y["query_response1"], padding="max_length", max_length=args.max_rm_query_response_length, truncation=True
-        )
+        if args.tldr_params.padding == "empty_space":
+            y["query_response1_token"] = y["query_token"] + y["response1_token"]
+        else:
+            y["query_response1_token"] = tokenizer.encode(
+                y["query_response1"], padding="max_length", max_length=max_rm_query_response_length, truncation=True
+            )
         y["query_response1_token_len"] = len(tokenizer.encode(y["query_response1"]))
+        y["query_token_len"] = len(tokenizer.encode(y["query"]))
         return y
 
     label_ds = label_ds.map(process_response_data, load_from_cache_file=False, num_proc=multiprocessing.cpu_count())
     if args.push_to_hub:
         label_ds.push_to_hub(f"{args.hf_entity}/summarize_from_feedback_oai_preprocessing_{timestamp}")
 
-    os.makedirs("dataset_visuals", exist_ok=True)
+    ####################################
     # visualize token length distribution
-    num_subplots = len(sft_ds) * 2 + len(label_ds) * 4
+    ####################################
+    calculated_tldr_params = TaskQueryHParams(
+        max_sft_query_response_length=0,
+        max_sft_response_length=0,
+        max_rm_response_length=0,
+        max_rm_query_response_length=0,
+    )
+    calculated_cnndm_params = TaskQueryHParams(
+        max_rm_query_response_length=0,
+        max_rm_response_length=0,
+    )
+
+    os.makedirs("dataset_visuals", exist_ok=True)
+    num_sft_visuals = 2
+    num_label_visuals = 5
+    num_subplots = len(sft_ds) * num_sft_visuals + len(label_ds) * num_label_visuals
+    num_cols = 3
     print(f"{num_subplots=}")
-    fig, axs = plt.subplots(5, 3, figsize=(16, 16))
+    fig, axs = plt.subplots(ceil_div(num_subplots, num_cols), num_cols, figsize=(16, 16))
     axs = axs.flatten()
     j = 0
     for _, key in enumerate(sft_ds.keys()):
@@ -282,35 +347,74 @@ These columns are added by this preprocessing script:
         axs[j + 1].set_title(
             f"{key} split: query.strip() + reference response token length\nmax_length={max(df['query_reference_response_token_len'])}"
         )
-        j += 2
+        calculated_tldr_params.max_sft_response_length = max(
+            calculated_tldr_params.max_sft_response_length, max(df["reference_response_token_len"])
+        )
+        calculated_tldr_params.max_sft_query_response_length = max(
+            calculated_tldr_params.max_sft_query_response_length, max(df["query_reference_response_token_len"])
+        )
+        j += num_sft_visuals
     offset = len(sft_ds)
-    for _, key in enumerate(label_ds.keys()):
-        df = label_ds[key].to_pandas()
+    for _, split in enumerate(label_ds.keys()):
+        df = label_ds[split].to_pandas()
         axs[j].hist(df["response0_token_len"], bins=100)
-        axs[j].set_title(f"{key} split: response0 token length\nmax_length={max(df['response0_token_len'])}")
+        axs[j].set_title(f"{split} split: response0 token length\nmax_length={max(df['response0_token_len'])}")
         axs[j + 1].hist(df["response1_token_len"], bins=100)
-        axs[j + 1].set_title(f"{key} split: response1 token length\nmax_length={max(df['response1_token_len'])}")
+        axs[j + 1].set_title(f"{split} split: response1 token length\nmax_length={max(df['response1_token_len'])}")
         axs[j + 2].hist(df["query_response0_token_len"], bins=100)
         axs[j + 2].set_title(
-            f"{key} split: query.strip() + response0 token length\nmax_length={max(df['query_response0_token_len'])}"
+            f"{split} split: query.strip() + response0 token length\nmax_length={max(df['query_response0_token_len'])}"
         )
         axs[j + 3].hist(df["query_response1_token_len"], bins=100)
         axs[j + 3].set_title(
-            f"{key} split: query.strip() + response1 token length\nmax_length={max(df['query_response1_token_len'])}"
+            f"{split} split: query.strip() + response1 token length\nmax_length={max(df['query_response1_token_len'])}"
         )
-        j += 4
+        axs[j + 4].hist(df["query_token_len"], bins=100)
+        axs[j + 4].set_title(f"{split} split: query token length\nmax_length={max(df['query_token_len'])}")
+        if split in ["train", "validation"]:
+            calculated_tldr_params.max_rm_response_length = max(
+                calculated_tldr_params.max_rm_response_length, max(df["response0_token_len"]), max(df["response1_token_len"])
+            )
+            calculated_tldr_params.max_rm_query_response_length = max(
+                calculated_tldr_params.max_rm_query_response_length,
+                max(df["query_response0_token_len"]),
+                max(df["query_response1_token_len"]),
+            )
+        elif split == "validation_cnndm":
+            calculated_cnndm_params.max_rm_response_length = max(
+                calculated_cnndm_params.max_rm_response_length, max(df["response0_token_len"]), max(df["response1_token_len"])
+            )
+            calculated_cnndm_params.max_rm_query_response_length = max(
+                calculated_cnndm_params.max_rm_query_response_length,
+                max(df["query_response0_token_len"]),
+                max(df["query_response1_token_len"]),
+            )
+        else:
+            raise ValueError(f"Unknown dataset split: {split}")
+        j += num_label_visuals
     fig.suptitle(f"{args.base_model} Tokenizer: Token length distribution")
     fig.tight_layout()
     fig.savefig("dataset_visuals/token_len.png")
+
+    pprint({"calculated_tldr_params": calculated_tldr_params})
+    pprint({"calculated_cnndm_params": calculated_cnndm_params})
+    if args.check_length_correctness:
+        assert calculated_tldr_params.max_sft_response_length == args.tldr_params.max_sft_response_length
+        assert calculated_tldr_params.max_sft_query_response_length == args.tldr_params.max_sft_query_response_length
+        assert calculated_tldr_params.max_rm_response_length == args.tldr_params.max_rm_response_length
+        assert calculated_tldr_params.max_rm_query_response_length == args.tldr_params.max_rm_query_response_length
+        assert calculated_cnndm_params.max_rm_response_length == args.cnndm_params.max_rm_response_length
+        assert calculated_cnndm_params.max_rm_query_response_length == args.cnndm_params.max_rm_query_response_length
+        print("✨ calculated lenghts are ok!")
 
     # visualize confidence distribution
     fig, axs = plt.subplots(len(label_ds), 1, figsize=(8, 8))
     axs = axs.flatten()
     label_ds = label_ds.flatten()
-    for i, key in enumerate(label_ds.keys()):
-        df = label_ds[key].to_pandas()
+    for i, split in enumerate(label_ds.keys()):
+        df = label_ds[split].to_pandas()
         axs[i].hist(df["extra.confidence"])
-        axs[i].set_title(f"{key} split: confidence distribution")
+        axs[i].set_title(f"{split} split: confidence distribution")
     fig.suptitle("Confidence distribution")
     fig.tight_layout()
     fig.savefig("dataset_visuals/confidence.png")
@@ -319,11 +423,11 @@ These columns are added by this preprocessing script:
     fig, axs = plt.subplots(1, len(label_ds), figsize=(8, 12))
     axs = axs.flatten()
     label_ds = label_ds.flatten()
-    for i, key in enumerate(label_ds.keys()):
-        df = label_ds[key].to_pandas()
+    for i, split in enumerate(label_ds.keys()):
+        df = label_ds[split].to_pandas()
         cat = pd.concat([df["response0_policy"], df["response1_policy"]], axis=0)
         cat.hist(ax=axs[i], xrot=90, orientation="horizontal")
-        axs[i].set_title(f"{key} split: policy distribution")
+        axs[i].set_title(f"{split} split: policy distribution")
     fig.suptitle("Policy distribution")
     fig.tight_layout()
     fig.savefig("dataset_visuals/policies.png")
@@ -332,10 +436,10 @@ These columns are added by this preprocessing script:
     fig, axs = plt.subplots(1, len(label_ds), figsize=(24, 30))
     axs = axs.flatten()
     label_ds = label_ds.flatten()
-    for i, key in enumerate(label_ds.keys()):
-        df = label_ds[key].to_pandas()
+    for i, split in enumerate(label_ds.keys()):
+        df = label_ds[split].to_pandas()
         df["policies"].hist(ax=axs[i], xrot=90, orientation="horizontal")
-        axs[i].set_title(f"{key} split: policy comparison distribution")
+        axs[i].set_title(f"{split} split: policy comparison distribution")
     fig.suptitle("Policy comparison distribution")
     fig.tight_layout()
     fig.savefig("dataset_visuals/policy_comparisons.png")
