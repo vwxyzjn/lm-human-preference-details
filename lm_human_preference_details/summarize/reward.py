@@ -127,7 +127,7 @@ class Args:
     """The batch size per GPU (HF's `per_device_train_batch_size` * `gradient_accumulation_steps`)"""
     batch_size: Optional[int] = None
     """The batch size across devices (HF's `per_device_train_batch_size` * `world_size` * `gradient_accumulation_steps`)"""
-    local_eval_batch_size: int = 8
+    local_eval_batch_size: int = 1
     """per rank eval batch size"""
 
     # other args
@@ -459,6 +459,7 @@ if __name__ == "__main__":
                 evaluate_df.to_csv(f"eval_tables/{run_name}/eval_{eval_split}_{update}.csv")
                 if args.track:
                     wandb.log({f"samples/{eval_split}/query_responses": wandb.Table(dataframe=evaluate_df)}, step=update)
+            del evaluate_df
             torch.cuda.empty_cache()
 
     norm_dataset = load_dataset(args.task.query_dataset, split="train")

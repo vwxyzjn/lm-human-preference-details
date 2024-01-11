@@ -168,6 +168,8 @@ class Args:
     """the mini batch size across GPUs"""
     local_eval_batch_size: int = 2
     """per rank eval batch size"""
+    local_rollout_forward_batch_size: int = 64
+    """per rank no grad forward pass in the rollout phase"""
 
     # other args
     base_model: str = "EleutherAI/pythia-160m"
@@ -462,7 +464,8 @@ if __name__ == "__main__":
                 name=run_name,
                 save_code=True,
             )
-            wandb.run.log_code(".")
+            file_extensions = [".toml", ".lock", ".py", ".sh", ".yaml"]
+            wandb.run.log_code(".", include_fn=lambda path: any([path.endswith(ext) for ext in file_extensions]))
         writer = SummaryWriter(f"runs/{run_name}")
         writer.add_text(
             "hyperparameters",
@@ -582,6 +585,7 @@ if __name__ == "__main__":
 
     accelerator.print("===training policy===")
     global_step = 0
+    start_time = time.time()
     stats_shape = (args.ppo.noptepochs, args.nminibatches, args.gradient_accumulation_steps)
     approxkl_stats = torch.zeros(stats_shape, device=device)
     pg_clipfrac_stats = torch.zeros(stats_shape, device=device)
@@ -630,8 +634,8 @@ if __name__ == "__main__":
             values = []
             scores = []
             sequence_lengths = []
-            for i in range(0, queries.shape[0], args.local_eval_batch_size):
-                query = queries[i : i + args.local_eval_batch_size]
+            for i in range(0, queries.shape[0], args.local_rollout_forward_batch_size):
+                query = queries[i : i + args.local_rollout_forward_batch_size]
                 query_response = generate(
                     accelerator.unwrap_model(model).policy,
                     query,
@@ -645,12 +649,16 @@ if __name__ == "__main__":
                 logits /= args.task.temperature + 1e-7
                 all_logprob = F.log_softmax(logits, dim=-1)
                 logprob = torch.gather(all_logprob, 2, response.unsqueeze(-1)).squeeze(-1)
+                del output, logits, all_logprob
+                torch.cuda.empty_cache()
 
                 ref_output = forward(ref_policy, query_response, tokenizer)
                 ref_logits = ref_output.logits[:, context_length - 1 : -1]
                 ref_logits /= args.task.temperature + 1e-7
                 ref_all_logprob = F.log_softmax(ref_logits, dim=-1)
                 ref_logprob = torch.gather(ref_all_logprob, 2, response.unsqueeze(-1)).squeeze(-1)
+                del ref_output, ref_logits, ref_all_logprob
+                torch.cuda.empty_cache()
 
                 # Response Processing 1. truncate response after the first occurrence of `truncate_token_id`
                 postprocessed_response = truncate_response(args, tokenizer, response)
@@ -678,8 +686,7 @@ if __name__ == "__main__":
             values = torch.cat(values, 0)
             sequence_lengths = torch.cat(sequence_lengths, 0)
             scores = torch.cat(scores, 0)
-            del (output, logits, all_logprob, logprob, ref_output)
-            del (ref_logits, ref_all_logprob, ref_logprob, full_value, value, score)
+            del (logprob, ref_logprob, full_value, value, score)
             torch.cuda.empty_cache()
 
             # Response Processing 3. filter response. Ensure that the sample contains truncate_token_id
@@ -760,14 +767,22 @@ if __name__ == "__main__":
                         pg_losses = -mb_advantage * ratio
                         pg_losses2 = -mb_advantage * torch.clamp(ratio, 1.0 - args.ppo.cliprange, 1.0 + args.ppo.cliprange)
                         pg_loss = torch.max(pg_losses, pg_losses2).mean()
-                        pg_clipfrac = (pg_losses2 > pg_losses).float().mean()
                         loss = pg_loss + args.ppo.vf_coef * vf_loss
                         accelerator.backward(loss)
                         optimizer.step()
                         optimizer.zero_grad()
-                        prob_dist = torch.nn.functional.softmax(logits, dim=-1)
-                        entropy = torch.logsumexp(logits, dim=-1) - torch.sum(prob_dist * logits, dim=-1)
-                        approxkl = 0.5 * (logprobs_diff**2).mean()
+                        with torch.no_grad():
+                            pg_clipfrac = (pg_losses2 > pg_losses).float().mean()
+                            prob_dist = torch.nn.functional.softmax(logits, dim=-1)
+                            entropy = torch.logsumexp(logits, dim=-1) - torch.sum(prob_dist * logits, dim=-1)
+                            approxkl = 0.5 * (logprobs_diff**2).mean()
+                            approxkl_stats[ppo_epoch_idx, minibatch_idx, gradient_accumulation_idx] = approxkl
+                            pg_clipfrac_stats[ppo_epoch_idx, minibatch_idx, gradient_accumulation_idx] = pg_clipfrac
+                            pg_loss_stats[ppo_epoch_idx, minibatch_idx, gradient_accumulation_idx] = pg_loss
+                            vf_loss_stats[ppo_epoch_idx, minibatch_idx, gradient_accumulation_idx] = vf_loss
+                            vf_clipfrac_stats[ppo_epoch_idx, minibatch_idx, gradient_accumulation_idx] = vf_clipfrac
+                            entropy_stats[ppo_epoch_idx, minibatch_idx, gradient_accumulation_idx] = entropy.mean()
+                            ratio_stats[ppo_epoch_idx, minibatch_idx, gradient_accumulation_idx] = ratio.mean()
                         # if ppo_epoch_idx == 0 and micro_batch_start == 0:
                         #     torch.testing.assert_close(ratio, torch.zeros_like(ratio) + 1, atol=1e-4, rtol=1e-4)
                         # if ppo_epoch_idx == 0:
@@ -788,14 +803,6 @@ if __name__ == "__main__":
                         #         # "entropy": masked_mean(entropy, ~padding_mask[micro_batch_inds]),
                         #     })
                         #     breakpoint()
-                        with torch.no_grad():
-                            approxkl_stats[ppo_epoch_idx, minibatch_idx, gradient_accumulation_idx] = approxkl
-                            pg_clipfrac_stats[ppo_epoch_idx, minibatch_idx, gradient_accumulation_idx] = pg_clipfrac
-                            pg_loss_stats[ppo_epoch_idx, minibatch_idx, gradient_accumulation_idx] = pg_loss
-                            vf_loss_stats[ppo_epoch_idx, minibatch_idx, gradient_accumulation_idx] = vf_loss
-                            vf_clipfrac_stats[ppo_epoch_idx, minibatch_idx, gradient_accumulation_idx] = vf_clipfrac
-                            entropy_stats[ppo_epoch_idx, minibatch_idx, gradient_accumulation_idx] = entropy.mean()
-                            ratio_stats[ppo_epoch_idx, minibatch_idx, gradient_accumulation_idx] = ratio.mean()
                     gradient_accumulation_idx += 1
                 minibatch_idx += 1
                 if accelerator.is_main_process:
@@ -852,9 +859,13 @@ if __name__ == "__main__":
             writer.add_scalar("ppo/val/num_eos_tokens", (responses == tokenizer.eos_token_id).sum().item(), update)
             writer.add_scalar("ppo/lr", lrnow, update)
             writer.add_scalar("ppo/episode", global_step, update)
+            eps = int(global_step / (time.time() - start_time))
+            writer.add_scalar("ppo/eps", eps, update)
+            accelerator.print("ppo/eps", eps, update)
             if args.reward.use_adaptive_kl:
                 kl_ctl.update(mean_kl.item(), args.batch_size)
             del kl, mean_kl, mean_entropy, mean_non_score_reward, scores
+            torch.cuda.empty_cache()
 
     if args.run_eval:
         eval_storage, eval_df = evaluate(
@@ -866,9 +877,10 @@ if __name__ == "__main__":
             validation_generation_config,
             sampling=False,
         )
-        eval_df.to_csv(f"runs/{run_name}/table.csv")
-        if accelerator.is_main_process and args.track:
-            wandb.log({"eval/query_responses": wandb.Table(dataframe=eval_df)}, step=update)
+        if accelerator.is_main_process:
+            eval_df.to_csv(f"runs/{run_name}/table.csv")
+            if args.track:
+                wandb.log({"eval/query_responses": wandb.Table(dataframe=eval_df)}, step=update)
 
     # save model
     if args.output_dir and args.num_train_epochs > 0:

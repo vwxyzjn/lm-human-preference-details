@@ -589,6 +589,7 @@ if __name__ == "__main__":
 
     accelerator.print("===training policy===")
     global_step = 0
+    start_time = time.time()
     stats_shape = (args.ppo.noptepochs, args.nminibatches, args.gradient_accumulation_steps)
     approxkl_stats = torch.zeros(stats_shape, device=device)
     pg_clipfrac_stats = torch.zeros(stats_shape, device=device)
@@ -864,6 +865,9 @@ if __name__ == "__main__":
             writer.add_scalar("ppo/val/num_eos_tokens", (responses == tokenizer.eos_token_id).sum().item(), update)
             writer.add_scalar("ppo/lr", lrnow, update)
             writer.add_scalar("ppo/episode", global_step, update)
+            eps = int(global_step / (time.time() - start_time))
+            writer.add_scalar("ppo/eps", eps, update)
+            accelerator.print("ppo/eps", eps, update)
             if args.reward.use_adaptive_kl:
                 kl_ctl.update(mean_kl.item(), args.batch_size)
             del kl, mean_kl, mean_entropy, mean_non_score_reward, scores
@@ -879,9 +883,10 @@ if __name__ == "__main__":
             validation_generation_config,
             sampling=False,
         )
-        eval_df.to_csv(f"runs/{run_name}/table.csv")
-        if accelerator.is_main_process and args.track:
-            wandb.log({"eval/query_responses": wandb.Table(dataframe=eval_df)}, step=update)
+        if accelerator.is_main_process:
+            eval_df.to_csv(f"runs/{run_name}/table.csv")
+            if args.track:
+                wandb.log({"eval/query_responses": wandb.Table(dataframe=eval_df)}, step=update)
 
     # save model
     if args.output_dir and args.num_train_epochs > 0:
