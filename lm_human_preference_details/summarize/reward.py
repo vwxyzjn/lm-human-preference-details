@@ -269,6 +269,13 @@ if __name__ == "__main__":
     args.local_batch_size = args.local_micro_batch_size * args.gradient_accumulation_steps
     args.micro_batch_size = int(args.local_micro_batch_size * args.world_size)
     args.batch_size = int(args.local_batch_size * args.world_size)
+    tokenizer = AutoTokenizer.from_pretrained(
+        args.base_model,
+        padding_side="right",
+        trust_remote_code=True,
+    )
+    # we use the padding token manually but do not resize the token embedding of the model
+    tokenizer.add_special_tokens({"pad_token": "[PAD]"})
 
     # load dataset
     dataset = load_dataset(args.label_dataset, split="train")
@@ -288,7 +295,6 @@ if __name__ == "__main__":
         ],
     )
     dataloader = DataLoader(dataset, batch_size=args.local_micro_batch_size)
-    eval_datasets = []
     eval_dataloaders = {}
     for split in ["validation", "validation_cnndm"]:
         validation_dataset = load_dataset(args.label_dataset, split=split).flatten()
@@ -309,7 +315,6 @@ if __name__ == "__main__":
                 "policies",
             ],
         )
-        eval_datasets.append(validation_dataset)
         eval_dataloaders[split] = DataLoader(validation_dataset, batch_size=args.local_eval_batch_size)
         accelerator.print("The number of samples in validation_dataset", len(validation_dataset))
     accelerator.print("The number of samples in dataset", len(dataset))
@@ -345,13 +350,7 @@ if __name__ == "__main__":
     np.random.seed(local_seed)
     torch.manual_seed(local_seed)
     torch.backends.cudnn.deterministic = True
-    tokenizer = AutoTokenizer.from_pretrained(
-        args.base_model,
-        padding_side="right",
-        trust_remote_code=True,
-    )
-    # we use the padding token manually but do not resize the token embedding of the model
-    tokenizer.add_special_tokens({"pad_token": "[PAD]"})
+
     model_config = AutoConfig.from_pretrained(args.base_model)
     configure_dropout(model_config, args.dropout_layer_keys, 0.0)  # disable dropout
     scalar_model_config = ScalarModelConfig(
