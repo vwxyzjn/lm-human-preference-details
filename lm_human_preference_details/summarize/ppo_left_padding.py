@@ -489,7 +489,7 @@ if __name__ == "__main__":
         base_config=model_config,
         hidden_size=model_config.hidden_size,
     )
-    if not args.reward_model_path:
+    if len(args.reward_model_path) == 0:
         critic: PreTrainedModel = ScalarModel(scalar_model_config)
         reward_model: PreTrainedModel = ScalarModel(scalar_model_config)
     else:
@@ -523,21 +523,24 @@ if __name__ == "__main__":
     validation_dataset = load_dataset(args.task.query_dataset, split="validation")
     dataset = dataset.with_format("torch", columns=["query_token", "reference_response_token"])
     dataloader = DataLoader(dataset, batch_size=args.local_batch_size, shuffle=True)
-    validation_dataset = validation_dataset.with_format("torch", columns=["query_token", "reference_response_token"])
-    validation_dataloader = DataLoader(validation_dataset, batch_size=args.local_eval_batch_size)
+    eval_dataloaders = {}
+    for split in ["validation", "test"]:
+        eval_dataset = load_dataset(args.task.query_dataset, split=split)
+        eval_dataset = eval_dataset.with_format("torch", columns=["query_token", "reference_response_token"])
+        eval_dataloaders[split] = DataLoader(eval_dataset, batch_size=args.local_eval_batch_size)
 
     # sync random states for DataLoader(shuffle=True) before `accelerator.prepare`
     # see https://gist.github.com/vwxyzjn/2581bff1e48e185e0b85b6dfe1def79c
     torch.manual_seed(args.seed)
     model, optimizer, dataloader = accelerator.prepare(model, optimizer, dataloader)
     torch.manual_seed(local_seed)  # reset the local seed again
+    eval_dataloaders = {split: accelerator.prepare(eval_dataloader) for split, eval_dataloader in eval_dataloaders.items()}
 
     def repeat_generator():
         while True:
             yield from dataloader
 
     iter_dataloader = iter(repeat_generator())
-    validation_dataloader = accelerator.prepare(validation_dataloader)
     if args.deepspeed:
         import deepspeed
 
@@ -590,6 +593,7 @@ if __name__ == "__main__":
     accelerator.print("===training policy===")
     global_step = 0
     start_time = time.time()
+    eval_split = "validation"
     stats_shape = (args.ppo.noptepochs, args.nminibatches, args.gradient_accumulation_steps)
     approxkl_stats = torch.zeros(stats_shape, device=device)
     pg_clipfrac_stats = torch.zeros(stats_shape, device=device)
@@ -611,15 +615,15 @@ if __name__ == "__main__":
                 reward_model,
                 accelerator.unwrap_model(model).policy,
                 tokenizer,
-                validation_dataloader,
+                eval_dataloaders[eval_split],
                 validation_generation_config,
             )
             validation_score = eval_storage.score[0]
             if args.print_sample_output_freq > 0 and (update - 1) % args.print_sample_output_freq == 0:
                 if accelerator.is_main_process:
-                    eval_df.to_csv(f"runs/{run_name}/table_{global_step}.csv")
+                    eval_df.to_csv(f"runs/{run_name}/{eval_split}_table_{global_step}.csv")
                     if args.track:
-                        wandb.log({"samples/query_responses": wandb.Table(dataframe=eval_df)}, step=update)
+                        wandb.log({f"samples/{eval_split}_query_responses": wandb.Table(dataframe=eval_df)}, step=update)
                     else:
                         try:
                             print_rich_table(f"Sample Output at Step {update}", eval_df[:1], console)
@@ -874,19 +878,20 @@ if __name__ == "__main__":
             torch.cuda.empty_cache()
 
     if args.run_eval:
-        eval_storage, eval_df = evaluate(
-            args,
-            reward_model,
-            accelerator.unwrap_model(model).policy,
-            tokenizer,
-            validation_dataloader,
-            validation_generation_config,
-            sampling=False,
-        )
-        if accelerator.is_main_process:
-            eval_df.to_csv(f"runs/{run_name}/table.csv")
-            if args.track:
-                wandb.log({"eval/query_responses": wandb.Table(dataframe=eval_df)}, step=update)
+        for eval_split in eval_dataloaders:
+            eval_storage, eval_df = evaluate(
+                args,
+                reward_model,
+                accelerator.unwrap_model(model).policy,
+                tokenizer,
+                eval_dataloaders[eval_split],
+                validation_generation_config,
+                sampling=False,
+            )
+            if accelerator.is_main_process:
+                eval_df.to_csv(f"runs/{run_name}/{eval_split}_table.csv")
+                if args.track:
+                    wandb.log({f"eval/{eval_split}_query_responses": wandb.Table(dataframe=eval_df)}, step=update)
 
     # save model
     if args.output_dir and args.num_train_epochs > 0:
